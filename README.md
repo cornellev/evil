@@ -1,2 +1,1 @@
-# evil
-Electric Vehicle Intelligence Layer
+# Electric Vehicle Intelligence Layer (EVIL)
