@@ -1,0 +1,24 @@
+# Real ROS2 image for the live compiler only -- mcp-server and upload use
+# the lighter python:3.12-slim Dockerfile since they never import
+# evil.ingestion.ros2_source (rclpy import is deferred to that module, see
+# scripts/run_live_compiler.py's main()). Base image ships /ros_entrypoint.sh,
+# which sources /opt/ros/humble/setup.bash before exec'ing CMD -- don't
+# override ENTRYPOINT or that sourcing is lost.
+#
+# No apt-get/pip install here on purpose: the live compiler's whole import
+# chain (db, classifiers, ingest, ros2_source) is stdlib + rclpy/std_msgs,
+# both already provided by ros-base -- requirements.txt (mcp/fastapi/uvicorn)
+# is only for mcp_server.py/upload_server.py, which this image never runs.
+FROM ros:humble-ros-base
+
+WORKDIR /app
+
+COPY schema/ schema/
+COPY src/ src/
+
+ENV PYTHONPATH=/app/src
+ENV EVIL_DB_PATH=/data/evil.db
+
+VOLUME ["/data"]
+
+CMD ["python3", "-m", "evil.scripts.run_live_compiler", "race-day-1"]

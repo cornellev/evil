@@ -1,0 +1,7 @@
+mcp>=2.2,<2.3
+
+# Only needed by upload_server.py, not mcp_server.py -- that's why they're
+# two separate services/images-from-one-image rather than one server.
+fastapi>=0.141,<0.142
+uvicorn[standard]>=0.52,<0.53
+python-multipart>=0.0.20,<0.1
