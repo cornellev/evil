@@ -1,0 +1,9 @@
+[project]
+name = "evil"
+version = "0.1.0"
+description = "Electric Vehicle Intelligence Layer: raw + derived telemetry storage for CEV"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

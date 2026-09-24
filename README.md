@@ -1,1 +1,208 @@
 # Electric Vehicle Intelligence Layer (EVIL)
+
+Raw + derived telemetry storage for CEV. Plain Python (stdlib `sqlite3`, no ORM)
+and plain SQL. Runs on an edge device, reached over Tailscale. Exposes its
+read-only tools over MCP (Streamable HTTP) for any client on the tailnet --
+`tern-llm`'s own harness, a CEV member's own Claude client, or `evil-ui`'s
+backend -- not just one fixed consumer.
+
+Full design rationale (and the alternatives that were rejected) lives in
+`inference-agent/4.md` in this same working directory. This README is the
+"how it's built," that doc is the "why."
+
+## Getting started
+
+```bash
+# 1. Load static reference data ONCE per track (skip if evil.db already has it)
+docker compose run --rm mcp-server python -m evil.scripts.seed_reference_data turn "Turn 1" 42.0 -76.0 30
+docker compose run --rm mcp-server python -m evil.scripts.seed_reference_data start-finish 42.0 -76.0 30
+
+# 2. Run the MCP server -- what tern-llm, evil-ui, and CEV members' own
+#    Claude clients all connect to. Binds 0.0.0.0:8765, reachable over
+#    Tailscale automatically once the device is on the tailnet.
+docker compose up --build
+
+# 3. Separately: the live compiler against the real ROS2 topic. Builds from
+#    Dockerfile.ros2 (ros:humble-ros-base), not this repo's default
+#    python:3.12-slim Dockerfile -- see the note below.
+docker compose --profile live up
+
+# Or, offline / after a race: bulk-load a recorded session instead of step 3.
+docker compose run --rm mcp-server python -m evil.scripts.ingest_recording <recording.csv-or-.db3> <run-id>
+
+# And separately: register a NAS recording against a run, so a derived row
+# can be joined back to the exact clip that covers it (find_nas_files).
+docker compose run --rm mcp-server python -m evil.scripts.register_nas_file <run-id> <path-on-nas> <kind> <start-ts> <end-ts>
+
+# Or upload a recording from a UI: `upload` (also started by the bare
+# `docker compose up` above) exposes a write-only HTTP endpoint on :8766,
+# kept off the mcp-server port on purpose -- evil-ui's backend proxies to
+# this, or POST directly: curl -F run_id=<id> -F file=@recording.db3 http://<host>:8766/upload
+```
+
+All of the above share the same `evil-data` volume (see `docker-compose.yml`),
+so the CLI commands and the running `mcp-server`/`upload` services see the
+same database.
+
+`live-compiler` builds from `Dockerfile.ros2` (`ros:humble-ros-base`), not
+this repo's default `Dockerfile` -- `mcp-server`/`upload` stay on the lighter
+`python:3.12-slim` image since they never import `evil.ingestion.ros2_source`
+(the only module here that needs `rclpy`). It runs with `network_mode: host`
+since ROS2's default DDS discovery relies on multicast, which isn't reliable
+across an isolated docker bridge network. Real `rclpy` verification used a
+separate mock publisher, see `../mock-daq` -- confirmed working: `mock-daq`'s
+containerized publisher genuinely publishes over rclpy, and this image
+genuinely builds, starts, imports `Ros2Source`, and writes `evil.db` to the
+mounted `/data` volume (not the ephemeral container filesystem -- this
+surfaced and fixed a real bug where `run_live_compiler.py`'s `--db` default
+never read `EVIL_DB_PATH`, so the volume mount was silently a no-op).
+Publisher and compiler haven't yet been run against each other in the same
+session to confirm cross-container ROS2 discovery specifically.
+
+`docker compose` (the v2 plugin) is installed and confirmed working in this
+environment now -- `mcp-server`, `upload`, and `live-compiler` have each been
+built and started for real via `docker compose up`, not just syntax-checked.
+
+## Layout
+
+```
+schema/                 SQL DDL, applied in filename order, idempotent
+src/evil/
+  db.py                       connect() / connect_readonly() / apply_schema()
+  models.py                   RawSample -- the transport-independent tick shape
+  ingest.py                   writes a RawSample into raw tables + main_snapshot
+  geo.py                      haversine distance helper
+  registered_classifiers.py   ALL_CLASSIFIERS -- the one list ingestion and the live compiler both use
+  ingestion/
+    base.py                IngestionSource protocol (the ROS2/Zenoh seam)
+    normalize.py           shared flatten + alias-match: every source routes through this
+    replay_source.py       list-backed source, used by tests and offline replay
+    ros2_source.py         today's live transport: rclpy subscriber on /spi_data
+    csv_file_source.py     bulk historical ingestion from a CSV export
+    rosbag_file_source.py  bulk historical ingestion from a rosbag2 .db3 file
+  classifiers/
+    base.py             Classifier protocol + ClassifierSpec
+    registry.py         topological sort by depends_on
+    runner.py           incremental tick(): per-classifier cursor + margin
+    metrics.py          shared energy/avg-speed helpers used by laps.py and straights.py
+    turns.py            example classifier: GPS geofence turn segmentation
+    laps.py             depends_on=["turns"]: energy, avg speed, turn count per lap
+    straights.py        depends_on=["turns"]: the complement of turns, no open-state needed
+  tools/
+    get_turn.py                 "how was I in turn X"
+    compare_turn_instances.py   "what could I have done better" (this turn, across attempts)
+    compare_laps.py             same, across two laps (energy, avg speed, turn count, duration)
+    turn_name_matching.py       digit-normalized fallback so "3" also resolves to "Turn 3"
+    list_runs.py, list_turns.py, list_laps.py, list_straights.py
+                                 browsing-shaped (paginated, no lookup needed) -- for evil-ui
+    nas_index.py                register_nas_file() (write, CLI-only) + find_nas_files() (read, MCP tool)
+    read_only_sql.py            constrained fallback: SELECT/WITH-only, row cap, step budget
+    registry.py                 binds tools to a connection, Ollama-shaped schemas (used by tests)
+  mcp_server.py             exposes the tools above over MCP / Streamable HTTP
+  upload_server.py          write-only HTTP /upload -- separate from mcp_server.py on purpose
+  scripts/
+    seed_reference_data.py  load track_geometry / start_finish_line rows
+    ingest_recording.py     bulk-load a recorded CSV or rosbag .db3 as historical data
+    register_nas_file.py    register one NAS recording against a run
+    run_live_compiler.py    the production entry point: live Ros2Source + ALL_CLASSIFIERS
+tests/                  pytest, one file per module above
+tests/e2e/              bash scripts exercising the real running server, see below
+```
+
+## Why a cursor per classifier, not one shared one
+
+Called a cursor here, not the industry-standard "watermark" (Spark/Flink's
+term for the same concept) -- this project also has an LLM harness, and
+"watermark" collides with LLM output-watermarking (SynthID and similar). Same
+mechanism, different name.
+
+Each classifier declares its own `lookback_margin_s` (how long to wait before
+it's willing to call a row "final") and its own `depends_on` (raw data, or
+another classifier's name, forming a DAG). `laps`/`straights` depend on
+`turns` without the runner changing. A new classifier is one file plus one
+line in `registered_classifiers.py` -- see `classifiers/turns.py` for the
+pattern to copy. Details and the alternatives considered (CDC, broker
+offsets, dirty-flag columns) are in `inference-agent/4.md` section 4.
+
+## Ingestion, the generic normalizer, and a possible Zenoh migration
+
+`IngestionSource` is the seam between however data arrives and how it's
+stored. The actual wire format is JSON everywhere already -- `/spi_data` is
+a `std_msgs/String` carrying a JSON snapshot, a CSV row is a flat JSON-shaped
+object with string values, and a rosbag's recorded messages are the same
+JSON strings CDR-encoded. `ingestion/normalize.py` handles all of it once:
+flatten nested dicts to dotted keys, normalize casing/punctuation, alias-match
+against canonical fields. `Ros2Source`, `CsvFileSource`, and
+`RosbagFileSource` all route through it -- extending to a new field or a
+future Zenoh payload shape means editing one alias table, not writing a new
+per-format parser. If autonomy's Zenoh move stays inside ROS2 (`rmw_zenoh`),
+`Ros2Source` likely doesn't change at all; if it goes native, a new
+`ZenohSource` is one file that hands its JSON payload to the same
+normalizer. See `inference-agent/4.md` section 6.
+
+## MCP server: why it lives here, and the concurrency design
+
+The tool functions live here (not in `tern-llm` or `evil-ui`) because
+they're schema-coupled to these tables, and MCP colocated with EVIL on one
+device makes this code EVIL's public API. Each tool call in `mcp_server.py`
+opens its own short-lived `connect_readonly()` connection and runs the
+blocking query via a thread offload -- never a connection shared across
+calls, which wouldn't be safe for concurrent use. There is deliberately no
+single-in-flight lock here (unlike `tern-llm`'s `/ask` endpoint): that lock
+protects one scarce local LLM inference slot, which doesn't exist on this
+side, since external MCP clients run their own model inference elsewhere.
+SQLite's WAL mode (already set in `db.connect()`) lets any number of
+readers proceed alongside the single ingestion writer without blocking
+each other.
+
+Writes never go through MCP -- `register_nas_file` and bulk ingestion are
+CLI-only, same reasoning as why `read_only_sql` is generic-but-read-only:
+a bad write is a categorically worse failure than a bad read.
+
+## Running tests
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest                        # unit, in-process (no network)
+./tests/e2e/smoke_mcp_server.sh                   # real server, real MCP client, real HTTP
+./tests/e2e/smoke_mcp_server_tailscale.sh         # same, over this machine's real tailnet IP
+./tests/e2e/smoke_ingest_recording.sh             # real CLI subprocess, CSV
+./tests/e2e/smoke_ingest_recording_rosbag.sh      # same, rosbag .db3
+```
+
+The tailscale variant is a genuine reachability proof where `tailscale` is
+installed and connected (this dev machine is on CEV's real tailnet --
+`cev-nuc` is visible in `tailscale status`), not a simulation. It skips
+cleanly where tailscale isn't available. It proves the `0.0.0.0` bind serves
+an external interface, not just loopback -- it does **not** prove `cev-nuc`
+specifically can serve this, since that needs the server actually deployed
+there. Not done here on purpose: deploying to or otherwise touching
+`cev-nuc` is a real, shared team device, not something to do without it
+being asked for.
+
+## Not yet built
+
+- More classifiers beyond `turns`/`laps`/`straights` -- "events" turned out
+  to be a general term for whatever gets formulated next (voltage-sag /
+  current-spike / power-mismatch anomaly detection ported from
+  `Race-GPT/main.py`'s `precheck()` is the strongest concrete candidate,
+  since that logic is already proven, just never persisted as EVIL rows) --
+  deliberately left out of this pass.
+- Running `LiveCompiler` (`scripts/run_live_compiler.py`) against a real
+  `Ros2Source` in production. The service loop itself is built and tested
+  (event-driven wake, bounded fallback interval, incremental classification
+  proven via a delayed `ReplaySource` in `tests/test_run_live_compiler.py`).
+  A real mock publisher exists now (`../mock-daq`, matching
+  `uc26_sensor_reader`'s exact telemetry shape) to exercise the live
+  `rclpy` half specifically, but that round trip hasn't been run anywhere
+  yet -- it needs ROS2 Humble on a matching Ubuntu 22.04 environment,
+  see `mock-daq/README.md` for why (Humble targets Jammy, not this dev
+  machine's Noble).
+- A watcher that calls `register_nas_file` automatically once
+  `tailscale-ros-telemetry`'s rosbag service finishes a recording -- the
+  write path exists and is tested, but nothing triggers it yet besides a
+  human (or `RaceEngineerDashboard`) running the CLI by hand.
+- Deploying this server to `cev-nuc` and confirming a client elsewhere on
+  the tailnet can reach it -- verified here over this dev machine's own
+  tailnet interface only.

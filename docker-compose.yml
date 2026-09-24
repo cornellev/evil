@@ -1,0 +1,55 @@
+# mcp-server is what actually runs by default (`docker compose up`). It's
+# what tern-llm, CEV members' own Claude clients, and evil-ui all connect to.
+#
+# upload runs from the SAME image with a different command, exposing the
+# write-only /upload endpoint on its own port -- kept out of mcp-server on
+# purpose, MCP is the read interface, uploads are writes (see
+# upload_server.py's docstring).
+#
+# live-compiler is included so this file documents the full production
+# shape, but is NOT started by a bare `docker compose up` (see the "live"
+# profile below): it needs rclpy / a real ROS2 environment, so it builds
+# from Dockerfile.ros2 (ros:humble-ros-base) instead of this repo's default
+# python:3.12-slim Dockerfile. Uses host networking since ROS2's default DDS
+# discovery relies on multicast, which isn't reliable across an isolated
+# docker bridge network -- matches how it'd need to see the LAN/tailnet
+# directly on the real device anyway.
+services:
+  mcp-server:
+    build: .
+    ports:
+      - "8765:8765"
+    environment:
+      EVIL_DB_PATH: /data/evil.db
+      EVIL_MCP_HOST: "0.0.0.0"
+      EVIL_MCP_PORT: "8765"
+    volumes:
+      - evil-data:/data
+    restart: unless-stopped
+
+  upload:
+    build: .
+    ports:
+      - "8766:8766"
+    environment:
+      EVIL_DB_PATH: /data/evil.db
+    volumes:
+      - evil-data:/data
+    command: ["uvicorn", "evil.upload_server:app", "--host", "0.0.0.0", "--port", "8766"]
+    restart: unless-stopped
+
+  live-compiler:
+    build:
+      context: .
+      dockerfile: Dockerfile.ros2
+    profiles: ["live"] # only starts with `docker compose --profile live up`
+    network_mode: host
+    environment:
+      EVIL_DB_PATH: /data/evil.db
+    volumes:
+      - evil-data:/data
+    command: ["python3", "-m", "evil.scripts.run_live_compiler", "race-day-1"]
+    restart: unless-stopped
+
+volumes:
+  evil-data:
