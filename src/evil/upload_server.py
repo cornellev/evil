@@ -38,6 +38,11 @@ async def healthz() -> dict:
 
 @app.post("/upload")
 async def upload(run_id: str = Form(...), file: UploadFile = File(...)) -> dict:
+    """Saves the upload to a temp file and offloads to a thread: ingest_recording()
+    calls asyncio.run() internally, which raises if called from inside a route
+    handler's already-running event loop -- same reason tern-llm's api.py and
+    evil-ui's main.py offload their own sync calls to a thread instead of
+    calling them directly."""
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in SUPPORTED_SUFFIXES:
         raise HTTPException(
@@ -55,10 +60,6 @@ async def upload(run_id: str = Form(...), file: UploadFile = File(...)) -> dict:
             tmp.write(content)
             tmp_path = tmp.name
 
-        # ingest_recording() calls asyncio.run() internally, which raises if
-        # called from inside a route handler's already-running event loop --
-        # same reason tern-llm's api.py and evil-ui's main.py offload their
-        # own sync calls to a thread instead of calling them directly.
         result = await asyncio.to_thread(ingest_recording, tmp_path, run_id, DEFAULT_DB_PATH)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

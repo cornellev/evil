@@ -6,8 +6,8 @@ def test_resolves_exact_match(readonly_conn):
 
 
 def test_resolves_bare_number_from_a_real_model_tool_call(readonly_conn):
-    # confirmed empirically: asked "how was turn 3", gemma4:e4b called
-    # get_turn with turn_name="3", not the stored "Turn 3"
+    """Confirmed empirically: asked "how was turn 3", gemma4:e4b called
+    get_turn with turn_name="3", not the stored "Turn 3"."""
     assert resolve_turn_name(readonly_conn, "3") == "Turn 3"
 
 

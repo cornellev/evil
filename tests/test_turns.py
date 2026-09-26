@@ -40,14 +40,15 @@ def test_turn_closes_in_one_tick_once_safely_past_exit(conn):
 
 
 def test_turn_stays_open_until_exit_is_safely_visible(conn):
+    """now_ts=3.0 with a 2.0s lookback_margin_s gives cutoff ts<=1.0, so only
+    the entry sample (seq 1,2) is safe to process yet -- the exit sample at
+    ts=2.0 isn't, so the turn must stay open, not close early."""
     _seed_turn(conn)
     ingest_sample(conn, _gps_sample("run-1", 0.0, -76.01, speed=20.0))
     ingest_sample(conn, _gps_sample("run-1", 1.0, -76.0003, speed=8.0))
     ingest_sample(conn, _gps_sample("run-1", 2.0, -76.0000, speed=9.0))
 
-    # only entry is safely visible yet (cutoff ts <= 2.0 - 2.0 = 0.0, so nothing at all
-    # is processed here) -- bump now_ts just enough to make the entry point safe
-    tick(conn, "run-1", [TurnsClassifier()], now_ts=3.0)  # cutoff ts<=1.0 -> seq 1,2 safe
+    tick(conn, "run-1", [TurnsClassifier()], now_ts=3.0)
 
     assert conn.execute("SELECT COUNT(*) AS n FROM turns").fetchone()["n"] == 0
     open_state = conn.execute("SELECT * FROM turns_open_state WHERE run_id = 'run-1'").fetchone()

@@ -27,11 +27,11 @@ def _gps_sample(run_id, ts, lon, speed=None, joulemeter=None):
 
 
 def test_lap_stays_open_until_crossing_is_safely_visible(conn):
+    """laps depends_on "turns", so every tick() call must register both --
+    there's no track_geometry seeded here, so TurnsClassifier is a no-op."""
     _seed_start_finish(conn)
     ingest_sample(conn, _gps_sample("run-1", 0.0, -76.01))  # outside, initializes lap 1
 
-    # laps depends_on "turns", so every tick() call must register both --
-    # there's no track_geometry seeded here, so TurnsClassifier is a no-op.
     tick(conn, "run-1", [TurnsClassifier(), LapsClassifier()], now_ts=2.5)
 
     assert conn.execute("SELECT COUNT(*) AS n FROM laps").fetchone()["n"] == 0
@@ -61,7 +61,9 @@ def test_lap_closes_once_the_crossing_is_safely_visible(conn):
 def test_lap_counts_a_turn_committed_in_the_same_tick(conn):
     """The real DAG-ordering proof: turns and laps both process a batch of
     rows in one tick() call. If the runner didn't guarantee turns commits
-    before laps runs, this join would see an empty turns table."""
+    before laps runs, this join would see an empty turns table. Order passed
+    to tick() below is deliberately reversed -- the runner must sequence by
+    the DAG (turns before laps), not by list order."""
     _seed_start_finish(conn)
     conn.execute(
         "INSERT INTO track_geometry (turn_name, center_lat, center_lon, radius_m) VALUES ('T1', 42.0, -75.995, 30)"
@@ -75,8 +77,6 @@ def test_lap_counts_a_turn_committed_in_the_same_tick(conn):
     ingest_sample(conn, _gps_sample("run-1", 3.0, -75.990, speed=9.0, joulemeter=jm(3.0)))  # turn exit
     ingest_sample(conn, _gps_sample("run-1", 4.0, -76.000, speed=12.0, joulemeter=jm(4.0)))  # crossing: closes lap2
 
-    # order passed in deliberately reversed; the runner must sequence by the
-    # DAG (turns before laps), not by list order
     tick(conn, "run-1", [LapsClassifier(), TurnsClassifier()], now_ts=10.0)
 
     turn = conn.execute("SELECT * FROM turns WHERE run_id = 'run-1'").fetchone()

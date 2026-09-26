@@ -11,15 +11,19 @@ from typing import Protocol, Sequence
 
 @dataclass(frozen=True)
 class ClassifierSpec:
+    """Attributes:
+    depends_on: "main_snapshot" for a leaf classifier reading raw data, or
+        another classifier's `name` to sequence after its output (e.g.
+        laps -> turns).
+    lookback_margin_s: How far behind the latest ingested row this
+        classifier is allowed to look before it's willing to finalize a
+        row. Segmentation classifiers (turns) need enough margin to see a
+        segment close; a metric with no "did it end yet" question can use 0.
+    """
+
     name: str
     version: int
-    # "main_snapshot" for a leaf classifier reading raw data, or another
-    # classifier's `name` to sequence after its output (e.g. laps -> turns).
     depends_on: Sequence[str]
-    # Configurable per classifier: how far behind the latest ingested row
-    # this classifier is allowed to look before it's willing to finalize a
-    # row. Segmentation classifiers (turns) need enough margin to see a
-    # segment close; a metric with no "did it end yet" question can use 0.
     lookback_margin_s: float
 
 

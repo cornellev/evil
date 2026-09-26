@@ -66,12 +66,12 @@ def test_tick_advances_as_time_passes(conn):
 
 
 def test_dependent_classifier_waits_for_upstream_cursor(conn):
+    """Order passed in deliberately reversed -- the runner must still
+    sequence by dependency, not by list order."""
     _ingest_n(conn, "run-1", 5, start_ts=0.0, step=1.0)
     upstream = RecordingClassifier("turns", lookback_margin_s=2.0)
     downstream = RecordingClassifier("laps", depends_on=["turns"], lookback_margin_s=0.0)
 
-    # order passed in deliberately reversed -- the runner must still sequence
-    # by dependency, not by list order
     tick(conn, "run-1", [downstream, upstream], now_ts=4.0)
 
     assert upstream.calls == [(0, 3)]
