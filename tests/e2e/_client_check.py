@@ -13,6 +13,13 @@ url = sys.argv[1]
 
 
 async def main() -> int:
+    """The list_runs check below reads structured_content, not
+    content[0].text: the SDK gives one TextContent block PER LIST ITEM for a
+    list[dict]-returning tool, not one JSON array, so content[0].text alone
+    would silently only see the first run (and crash on zero runs).
+    structured_content reliably holds the full list regardless of item
+    count -- see MCPToolClient's fix in evil-ui/tern-llm for the
+    client-side version of this same gotcha."""
     async with streamable_http_client(url) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -46,12 +53,6 @@ async def main() -> int:
                 return 1
 
             runs_result = await session.call_tool("list_runs", {})
-            # list_runs returns list[dict]: the SDK gives one TextContent
-            # block PER LIST ITEM, not one JSON array, so content[0].text
-            # alone would silently only see the first run (and crash on
-            # zero runs). structured_content reliably holds the full list
-            # regardless of item count -- see MCPToolClient's fix in
-            # evil-ui/tern-llm for the client-side version of this.
             runs = (runs_result.structured_content or {}).get("result")
             if runs_result.is_error or runs != [
                 {"run_id": "run-1", "sample_count": 2, "start_ts": 0.0, "end_ts": 42.0}

@@ -36,8 +36,8 @@ def test_to_raw_sample_handles_nested_json_payload_with_explicit_ts():
 
 
 def test_to_raw_sample_ts_override_wins_over_payload_ts():
-    # Ros2Source's case: wall-clock receipt time is authoritative, not
-    # anything a sensor payload might also carry.
+    """Ros2Source's case: wall-clock receipt time is authoritative, not
+    anything a sensor payload might also carry."""
     payload = {"global_ts": 999.0, "gps": {"lat": 1.0, "long": 2.0}}
 
     sample = to_raw_sample("run-1", payload, ts=5.0)

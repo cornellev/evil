@@ -38,8 +38,8 @@ def test_parses_dotted_column_names(tmp_path):
 
 
 def test_dotted_and_flat_column_names_are_equivalent(tmp_path):
-    # RaceEngineerDashboard's own replay parser treats "gps.lat" and
-    # "gpslat" as the same column (punctuation stripped before matching).
+    """RaceEngineerDashboard's own replay parser treats "gps.lat" and
+    "gpslat" as the same column (punctuation stripped before matching)."""
     dotted = _write_csv(tmp_path, "global_ts,gps.lat,gps.long\n1.0,10.0,20.0\n")
     flat = _write_csv(tmp_path, "GlobalTS,GPS_LAT,GPS LONG\n1.0,10.0,20.0\n")
 

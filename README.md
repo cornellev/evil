@@ -56,8 +56,16 @@ genuinely builds, starts, imports `Ros2Source`, and writes `evil.db` to the
 mounted `/data` volume (not the ephemeral container filesystem -- this
 surfaced and fixed a real bug where `run_live_compiler.py`'s `--db` default
 never read `EVIL_DB_PATH`, so the volume mount was silently a no-op).
-Publisher and compiler haven't yet been run against each other in the same
-session to confirm cross-container ROS2 discovery specifically.
+Publisher and compiler now have a real automated cross-container test --
+`../mock-daq/tests/e2e/smoke_cross_container_round_trip.sh` builds both
+images, seeds a real db, runs both containers on the same topic, and checks
+for real ingested rows. It currently SKIPs (not fails) here: `mock-daq`'s
+own e2e test found this dev environment's DDS discovery doesn't work at
+all, even for a publisher and subscriber in the *same* container/network
+namespace (confirmed via the official `ros2 topic list` CLI hanging
+indefinitely there too). That's a WSL2 networking limitation, not something
+specific to crossing a container boundary -- expect this to behave
+differently on a real Linux host (the actual NUC).
 
 `docker compose` (the v2 plugin) is installed and confirmed working in this
 environment now -- `mcp-server`, `upload`, and `live-compiler` have each been
@@ -164,12 +172,29 @@ a bad write is a categorically worse failure than a bad read.
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest                        # unit, in-process (no network)
+.venv/bin/python -m pytest                        # unit, in-process (no network) -- includes a
+                                                   # Hypothesis fuzz test for read_only_sql
 ./tests/e2e/smoke_mcp_server.sh                   # real server, real MCP client, real HTTP
 ./tests/e2e/smoke_mcp_server_tailscale.sh         # same, over this machine's real tailnet IP
+./tests/e2e/smoke_mcp_server_concurrency.sh       # 15 real concurrent MCP clients against one server
 ./tests/e2e/smoke_ingest_recording.sh             # real CLI subprocess, CSV
 ./tests/e2e/smoke_ingest_recording_rosbag.sh      # same, rosbag .db3
 ```
+
+`tests/test_read_only_sql_fuzz.py` throws ~200 random/adversarial query
+strings per run at `read_only_sql` (a mix of pure noise and real SQL
+fragments -- `DROP TABLE`, `ATTACH DATABASE`, injection-shaped strings,
+etc.), asserting the one property that actually matters: no input, however
+malformed, ever changes a row. It still passes with the `_DISALLOWED`
+keyword regex removed entirely (checked by hand) -- the connection's own
+`mode=ro` backstops it at the SQLite driver level, genuine defense in depth,
+not a gap in the test.
+
+`smoke_mcp_server_concurrency.sh` fires 15 real, concurrent MCP client
+sessions (mixed `read_only_sql`/`list_runs`) at one real running server,
+proving the "each call opens its own connection, WAL mode lets readers
+proceed alongside each other" design actually holds under concurrent load,
+not just in isolation.
 
 The tailscale variant is a genuine reachability proof where `tailscale` is
 installed and connected (this dev machine is on CEV's real tailnet --

@@ -1,5 +1,6 @@
 -r requirements.txt
 pytest>=9.1,<10
+hypothesis>=6.168,<7
 
 # rclpy (for ros2_source.py) is not pip-installable -- it comes from a ROS2
 # distro install (apt), not PyPI. Not a test dependency: ros2_source.py is

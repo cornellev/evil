@@ -26,6 +26,12 @@ def _gps_sample(ts, lon, speed):
 
 
 def test_compiler_ticks_incrementally_while_samples_are_still_arriving(conn):
+    """Sleeps 0.35s, well after ~2 samples (entry included) have arrived but
+    before the 4th (exit) sample or the 10s fallback interval, then checks
+    mid-run state: the turn should already be open (proving classification
+    happened DURING the run, not only at shutdown) but not yet closed (since
+    nothing closes it until the exit sample). tick_count > 1 in that ~0.6s
+    run proves it was wake-driven, not the 10s fallback interval."""
     _seed_turn(conn)
     samples = [
         _gps_sample(0.0, -76.01, 20.0),  # outside
@@ -39,8 +45,6 @@ def test_compiler_ticks_incrementally_while_samples_are_still_arriving(conn):
     async def scenario():
         task = asyncio.create_task(compiler.run())
 
-        # after ~2 samples (entry included) have arrived, well before the
-        # 4th (exit) sample or the 10s fallback interval
         await asyncio.sleep(0.35)
         mid_run_open = conn.execute(
             "SELECT COUNT(*) AS n FROM turns_open_state WHERE run_id = 'run-1'"
@@ -54,12 +58,8 @@ def test_compiler_ticks_incrementally_while_samples_are_still_arriving(conn):
 
     mid_run_open, mid_run_closed = asyncio.run(scenario())
 
-    # proves classification happened DURING the run: the turn had opened by
-    # the midpoint even though nothing closes it until the exit sample
     assert mid_run_open == 1
     assert mid_run_closed == 0
-    # proves it was wake-driven, not the 10s fallback: multiple ticks fit
-    # inside this ~0.6s run
     assert compiler.tick_count > 1
 
     final_turn = conn.execute("SELECT * FROM turns WHERE run_id = 'run-1'").fetchone()
@@ -69,13 +69,13 @@ def test_compiler_ticks_incrementally_while_samples_are_still_arriving(conn):
 
 
 def test_final_tick_after_source_ends_catches_trailing_data(conn):
+    """No delay: both samples land before the compile loop's first wake
+    wait even starts, so only the shutdown tick can classify them."""
     _seed_turn(conn)
     samples = [
         _gps_sample(0.0, -76.0003, 8.0),  # entry
         _gps_sample(1.0, -75.999, 7.0),  # exit -- arrives right as the source ends
     ]
-    # no delay: both samples land before the compile loop's first wake wait
-    # even starts, so only the shutdown tick can classify them
     source = ReplaySource(samples, delay_s=0.0)
     compiler = LiveCompiler(conn, "run-1", source, [TurnsClassifier()], max_interval_s=10.0)
 

@@ -10,9 +10,9 @@ from evil.tools.list_turns import list_turns
 
 
 def test_list_runs_returns_every_run_with_counts_and_range(evil_db_path):
-    # list_runs reads main_snapshot, which the shared readonly_conn fixture
-    # never populates (it seeds turns/track_geometry directly) -- needs its
-    # own setup through the real ingest path.
+    """list_runs reads main_snapshot, which the shared readonly_conn fixture
+    never populates (it seeds turns/track_geometry directly) -- needs its
+    own setup through the real ingest path."""
     from evil import db
     from evil.ingest import ingest_sample
     from evil.models import RawSample

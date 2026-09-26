@@ -48,12 +48,12 @@ def test_get_turn_tool_returns_seeded_data(evil_db_path):
 
 
 def test_read_only_sql_tool_still_enforces_select_only_guard(evil_db_path):
+    """call_tool() bypasses the wire protocol's error translation, so the
+    guard's ValueError surfaces as this wrapper exception here -- a real
+    client over HTTP gets a proper MCP error result instead, see the e2e
+    smoke script."""
     server = create_server(db_path=evil_db_path)
 
-    # call_tool() bypasses the wire protocol's error translation, so the
-    # guard's ValueError surfaces as this wrapper exception here -- a real
-    # client over HTTP gets a proper MCP error result instead, see the e2e
-    # smoke script.
     with pytest.raises(UnexpectedToolError):
         asyncio.run(server.call_tool("read_only_sql", {"query": "DELETE FROM turns"}))
 

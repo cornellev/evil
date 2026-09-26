@@ -89,7 +89,7 @@ def test_read_only_sql_step_budget_guard_aborts_runaway_queries(readonly_conn):
 
 
 def test_read_only_sql_connection_cannot_write_even_if_the_check_were_bypassed(readonly_conn):
-    # defense in depth: the connection itself is opened mode=ro, independent
-    # of the keyword filter above
+    """Defense in depth: the connection itself is opened mode=ro, independent
+    of the keyword filter above."""
     with pytest.raises(sqlite3.OperationalError):
         readonly_conn.execute("DELETE FROM turns")
