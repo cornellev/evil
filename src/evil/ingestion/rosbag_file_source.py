@@ -56,9 +56,11 @@ class RosbagFileSource:
                 """SELECT m.timestamp, t.type, m.data
                    FROM messages AS m
                    JOIN topics AS t ON t.id = m.topic_id
-                   WHERE t.name = ?
+                   WHERE t.name IN (?, ?)
                    ORDER BY m.id""",
-                (self.topic,),
+                # Real bags store the topic with a leading slash ("/spi_data");
+                # accept both spellings.
+                (self.topic.lstrip("/"), "/" + self.topic.lstrip("/")),
             ).fetchall()
         finally:
             conn.close()
@@ -76,3 +78,26 @@ class RosbagFileSource:
 
             ts = timestamp_ns / 1e9
             yield to_raw_sample(self.run_id, payload, ts=ts)
+
+    def describe_no_rows(self) -> str:
+        """Why this file yielded nothing, naming the topics it does contain, so
+        an empty ingest is a diagnosable error instead of a silent success."""
+        try:
+            conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+            try:
+                found = conn.execute(
+                    """SELECT t.name, t.type, COUNT(m.id)
+                       FROM topics AS t LEFT JOIN messages AS m ON m.topic_id = t.id
+                       GROUP BY t.id ORDER BY t.name"""
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError as exc:
+            return f"no rows ingested: could not read {self.path.name} as a rosbag2 .db3 ({exc})"
+        if not found:
+            return f"no rows ingested: {self.path.name} contains no topics"
+        listing = ", ".join(f"{name} ({type_}, {count} msgs)" for name, type_, count in found)
+        return (
+            f"no rows ingested: no decodable telemetry JSON on topic {self.topic!r}. "
+            f"Topics in file: {listing}"
+        )
