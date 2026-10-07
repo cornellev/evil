@@ -67,7 +67,8 @@ def ingest_recording(recording_path: str, run_id: str, db_path: str) -> dict[str
 
     if count == 0:
         conn.close()
-        return {"rows_ingested": 0}
+        describe = getattr(source, "describe_no_rows", None)
+        raise ValueError(describe() if describe else f"no rows ingested from {Path(recording_path).name}")
 
     # No live edge left to wait behind: classify the whole run in one pass.
     backfill_now_ts = max_ts + 3600.0

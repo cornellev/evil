@@ -72,15 +72,14 @@ def test_ingest_recording_produces_rows_and_a_classified_turn(tmp_path):
         conn.close()
 
 
-def test_ingest_recording_handles_empty_csv(tmp_path):
+def test_ingest_recording_rejects_empty_csv(tmp_path):
     db_path = str(tmp_path / "evil.db")
     _seed_track_geometry(db_path)
     csv_path = tmp_path / "empty.csv"
     csv_path.write_text("global_ts,gps.lat,gps.long\n")
 
-    result = ingest_recording(str(csv_path), "hist-run-2", db_path)
-
-    assert result == {"rows_ingested": 0}
+    with pytest.raises(ValueError, match="no rows ingested"):
+        ingest_recording(str(csv_path), "hist-run-2", db_path)
 
 
 def test_ingest_recording_auto_detects_rosbag_format(tmp_path):
@@ -128,3 +127,18 @@ def test_main_cli_entry_point_parses_args_and_runs(tmp_path, capsys):
 
     assert exit_code == 0
     assert "rows_ingested" in capsys.readouterr().out
+
+
+def test_ingest_recording_zero_rows_from_bag_names_topics_found(tmp_path):
+    db_path = str(tmp_path / "evil.db")
+    _seed_track_geometry(db_path)
+    db3_path = tmp_path / "wrong_topic.db3"
+    conn = sqlite3.connect(db3_path)
+    conn.execute("CREATE TABLE topics (id INTEGER PRIMARY KEY, name TEXT, type TEXT)")
+    conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, topic_id INTEGER, timestamp INTEGER, data BLOB)")
+    conn.execute("INSERT INTO topics VALUES (1, '/camera/image', 'sensor_msgs/msg/Image')")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(ValueError, match=r"/camera/image .*sensor_msgs/msg/Image"):
+        ingest_recording(str(db3_path), "hist-run-3", db_path)

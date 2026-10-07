@@ -35,6 +35,8 @@ async def main() -> int:
                 "list_laps",
                 "list_straights",
                 "find_nas_files",
+                "list_recordings",
+                "describe_recording",
                 "read_only_sql",
             }
             if names != expected:
@@ -72,14 +74,10 @@ async def main() -> int:
                 print(f"FAIL: compare_laps returned unexpected result: {laps_text}")
                 return 1
 
-            nas_result = await session.call_tool(
-                "find_nas_files", {"run_id": "run-1", "start_ts": 5.0, "end_ts": 15.0}
-            )
-            nas_files = (nas_result.structured_content or {}).get("result")
-            if nas_result.is_error or nas_files != [
-                {"file_id": 1, "run_id": "run-1", "path": "/nas/run-1.bag", "kind": "rosbag", "start_ts": 0.0, "end_ts": 42.0}
-            ]:
-                print(f"FAIL: find_nas_files did not report the seeded recording: {nas_files}")
+            # No catalog.db exists in this smoke setup: the catalog tools answer empty, not error.
+            nas_result = await session.call_tool("find_nas_files", {"run_id": "run-1", "start_ts": 5.0, "end_ts": 15.0})
+            if nas_result.is_error or (nas_result.structured_content or {}).get("result") != []:
+                print(f"FAIL: find_nas_files should be empty without a catalog: {nas_result}")
                 return 1
 
             guarded = await session.call_tool("read_only_sql", {"query": "DELETE FROM turns"})

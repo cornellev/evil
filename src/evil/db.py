@@ -33,3 +33,18 @@ def apply_schema(conn: sqlite3.Connection, schema_dir: Path | None = None) -> No
     for sql_file in sorted(directory.glob("*.sql")):
         conn.executescript(sql_file.read_text())
     conn.commit()
+
+
+_RUN_TABLES_IN_DELETE_ORDER = (
+    # derived first, then the snapshot rows that point at raw rows, then raw rows
+    "turns", "turns_open_state", "laps", "laps_open_state", "straights", "classifier_cursor",
+    "main_snapshot",
+    "joulemeter", "steering", "rpm_front", "rpm_back", "gps", "motor", "local_planner",
+)
+
+
+def delete_run(conn: sqlite3.Connection, run_id: str) -> None:
+    """Remove everything stored for one run (raw, snapshots, derived, cursors),
+    so a re-parse is idempotent. The caller owns the transaction."""
+    for table in _RUN_TABLES_IN_DELETE_ORDER:
+        conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))

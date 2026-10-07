@@ -1,6 +1,13 @@
 # mcp-server is what actually runs by default (`docker compose up`). It's
 # what tern-llm, CEV members' own Claude clients, and evil-ui all connect to.
 #
+# Recording catalog (see recording-catalog-design.md): `upload` stores every
+# upload raw and cataloged and returns as soon as it is stored; `worker` scans
+# and parses off the catalog's job queue. All three share the evil-data volume:
+#   /data/catalog.db                      recording catalog + job queue
+#   /data/raw/...                         original files, as uploaded
+#   /data/parsed/uc26/evil_uc26.db        parsed telemetry (what MCP tools read)
+#
 # upload runs from the SAME image with a different command, exposing the
 # write-only /upload endpoint on its own port -- kept out of mcp-server on
 # purpose, MCP is the read interface, uploads are writes (see
@@ -20,7 +27,8 @@ services:
     ports:
       - "8765:8765"
     environment:
-      EVIL_DB_PATH: /data/evil.db
+      EVIL_DATA_ROOT: /data
+      EVIL_DB_PATH: /data/parsed/uc26/evil_uc26.db
       EVIL_MCP_HOST: "0.0.0.0"
       EVIL_MCP_PORT: "8765"
     volumes:
@@ -32,10 +40,52 @@ services:
     ports:
       - "8766:8766"
     environment:
-      EVIL_DB_PATH: /data/evil.db
+      EVIL_DATA_ROOT: /data
+      EVIL_DB_PATH: /data/parsed/uc26/evil_uc26.db
     volumes:
       - evil-data:/data
     command: ["uvicorn", "evil.upload_server:app", "--host", "0.0.0.0", "--port", "8766"]
+    restart: unless-stopped
+
+  # Free-form read-only SQL over stored recordings and the catalog, for power
+  # users and real agents (see mcp_raw_server.py). A separate service on its own
+  # port on purpose: tern-llm and evil-ui never connect to it, and a hostile or
+  # huge file can hang at most this container (memory/pid limits, read-only
+  # root filesystem). Queries also run in a sandboxed child process.
+  mcp-raw:
+    build: .
+    ports:
+      - "8767:8767"
+    environment:
+      EVIL_DATA_ROOT: /data
+      EVIL_RAW_PORT: "8767"
+    volumes:
+      - evil-data:/data
+    command: ["python", "-m", "evil.mcp_raw_server"]
+    mem_limit: 2g
+    pids_limit: 128
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  worker:
+    build: .
+    environment:
+      EVIL_DATA_ROOT: /data
+      EVIL_DB_PATH: /data/parsed/uc26/evil_uc26.db
+      # CAT's cache builder (its pyworker). Use the NUC's tailnet IP, not 127.0.0.1: inside this
+      # container loopback is the container itself. Without it, opening a bag in CAT cannot build.
+      EVIL_CAT_PYWORKER_URL: ${EVIL_CAT_PYWORKER_URL:-}
+      # EVIL_CACHE_MAX_BYTES: "21474836480"     # CAT cache size cap (default 20 GB)
+      # EVIL_CACHE_MAX_AGE_SEC: "604800"         # evict after this long unused (default 7 days)
+      # EVIL_PARSE_TIMEOUT_SEC: "7200"
+    volumes:
+      - evil-data:/data
+    command: ["python", "-m", "evil.worker"]
     restart: unless-stopped
 
   live-compiler:
@@ -45,7 +95,8 @@ services:
     profiles: ["live"] # only starts with `docker compose --profile live up`
     network_mode: host
     environment:
-      EVIL_DB_PATH: /data/evil.db
+      EVIL_DATA_ROOT: /data
+      EVIL_DB_PATH: /data/parsed/uc26/evil_uc26.db
     volumes:
       - evil-data:/data
     command: ["python3", "-m", "evil.scripts.run_live_compiler", "race-day-1"]
