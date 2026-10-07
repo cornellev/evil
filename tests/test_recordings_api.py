@@ -236,3 +236,22 @@ def test_reparse_status_and_locations_endpoints(client, tmp_path):
     assert [l["name"] for l in client.get("/locations").json()] == ["B-lot"]
     assert client.post("/locations", json={"name": "x"}).status_code == 400
     assert client.post("/locations", json={"name": "x", "lat": 99, "lon": 0, "radius_m": 5}).status_code == 400
+
+
+def test_locations_carry_a_default_category_and_recordings_can_be_edited_over_http(client):
+    rid = client.post("/recordings", files=[("files", ("a.csv", b"a,b\n1,2\n", "text/csv"))]).json()["recording_id"]
+
+    bad = client.post("/locations", json={"name": "B Lot", "lat": 42.4, "lon": -76.4, "radius_m": 100, "default_category": "blot"})
+    assert bad.status_code == 400
+    lid = client.post("/locations", json={"name": "B Lot", "lat": 42.4, "lon": -76.4, "radius_m": 100,
+                                          "default_category": "b_lot"}).json()["location_id"]
+    assert client.get("/locations").json()[0]["default_category"] == "b_lot"
+
+    edited = client.patch(f"/recordings/{rid}", json={"label": "garage", "category": "b_lot", "location_id": lid})
+    assert edited.status_code == 200
+    body = edited.json()
+    assert (body["label"], body["category"], body["category_method"], body["location_method"]) == ("garage", "b_lot", "manual", "manual")
+    assert client.patch(f"/recordings/{rid}", json={"category": "blot"}).status_code == 400
+    assert client.patch(f"/recordings/{rid}", json={"location_id": 999}).status_code == 400
+    cleared = client.patch(f"/recordings/{rid}", json={"category": None, "location_id": None}).json()
+    assert cleared["category"] is None and cleared["category_method"] is None and cleared["location_id"] is None

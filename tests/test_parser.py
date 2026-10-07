@@ -426,3 +426,22 @@ def test_run_date_uses_the_recorded_date_in_new_york(tmp_path, root, cat):
     rid = _upload(cat, root, {"b.db3": _bag(tmp_path, [(t + i * 0.02, payload(seq=2 + 2 * i)) for i in range(3)])})
     scan.scan_recording(root, rid)
     assert parser.parse_recording(root, rid).run_id.startswith("2026-04-09-")
+
+
+def test_a_parsed_recording_at_a_competition_location_is_categorised_automatically(tmp_path, root, cat):
+    catalog.add_location(cat, "IMS", 42.0, -76.0, 500, default_category="competition")
+    rid = _upload(cat, root, {"b.db3": _bag(tmp_path, _msgs(5))})
+
+    parser.parse_recording(root, rid)
+
+    rec = catalog.get_recording(cat, rid)
+    assert (rec["category"], rec["category_method"]) == ("competition", "auto")
+
+
+def test_a_category_chosen_at_upload_survives_the_parse(tmp_path, root, cat):
+    catalog.add_location(cat, "IMS", 42.0, -76.0, 500, default_category="competition")
+    rid = _upload(cat, root, {"b.db3": _bag(tmp_path, _msgs(5))}, category="testing")
+
+    parser.parse_recording(root, rid)
+
+    assert catalog.get_recording(cat, rid)["category"] == "testing"

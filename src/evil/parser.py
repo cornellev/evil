@@ -474,3 +474,4 @@ def _record_context(cat, rec, target: Path, first_ts, last_ts, gps: dict | None)
                 args.append(loc)
     with cat:
         cat.execute(f"UPDATE recordings SET {', '.join(sets)} WHERE recording_id = ?", [*args, rec["recording_id"]])
+    catalog.apply_auto_category(cat)       # a location with a default category (IMS -> competition) sets it

@@ -41,8 +41,8 @@ SPOOL_DIR = ".spool"
 BACKUPS_KEPT = 7
 
 SOURCES = ("telemetry", "autonomy", "other")
-CATEGORIES = ("competition", "testing", "bench", "sim", "other")
-EDITABLE_FIELDS = ("label", "notes", "category", "event", "car")
+CATEGORIES = ("competition", "testing", "bench", "sim", "b_lot", "other")
+EDITABLE_FIELDS = ("label", "notes", "category", "event", "car", "location_id")
 MAX_PATH_DEPTH = 6
 SQLITE_MAGIC = b"SQLite format 3\x00"
 
@@ -117,8 +117,35 @@ def data_root_from_env() -> DataRoot:
 # Columns added after a catalog.db may already exist (CREATE TABLE IF NOT EXISTS
 # does not add them). Idempotent.
 _ADDED_COLUMNS = {
-    "recordings": {"parse_stats_json": "TEXT"},
+    "recordings": {"parse_stats_json": "TEXT", "category_method": "TEXT"},   # category_method: 'manual' | 'auto'
+    "named_locations": {"default_category": "TEXT"},                         # recordings made here get this category
 }
+
+
+def _migrate_category_check(conn: sqlite3.Connection) -> None:
+    """SQLite cannot alter a CHECK, so a catalog created before a category was added has its recordings
+    table rebuilt once (SQLite's documented copy-and-rename procedure). Idempotent: skipped when the
+    stored definition already lists every current category."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'recordings'").fetchone()
+    if row is None or all(f"'{c}'" in row["sql"] for c in CATEGORIES):
+        return
+    old = "CHECK (category IN (" + ",".join(f"'{c}'" for c in CATEGORIES if c != "b_lot") + "))"
+    new = "CHECK (category IN (" + ",".join(f"'{c}'" for c in CATEGORIES) + "))"
+    if old not in row["sql"]:
+        raise CatalogError("recordings table has an unexpected category constraint; cannot migrate")
+    new_sql = row["sql"].replace(old, new, 1).replace("CREATE TABLE recordings", "CREATE TABLE recordings_new", 1)
+    new_sql = new_sql.replace('CREATE TABLE "recordings"', "CREATE TABLE recordings_new", 1)
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        with conn:
+            conn.execute(new_sql)
+            conn.execute("INSERT INTO recordings_new SELECT * FROM recordings")
+            conn.execute("DROP TABLE recordings")
+            conn.execute("ALTER TABLE recordings_new RENAME TO recordings")
+        conn.executescript((CATALOG_SCHEMA_DIR / "001_catalog.sql").read_text())    # recreate its indexes
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
 
 
 def _ensure_columns(conn: sqlite3.Connection) -> None:
@@ -138,6 +165,7 @@ def connect_catalog(root: DataRoot) -> sqlite3.Connection:
     for sql_file in sorted(CATALOG_SCHEMA_DIR.glob("*.sql")):
         conn.executescript(sql_file.read_text())
     _ensure_columns(conn)
+    _migrate_category_check(conn)
     conn.commit()
     return conn
 
@@ -372,9 +400,10 @@ def _insert_recording(conn: sqlite3.Connection, rec: dict, files: list[dict], ro
     rel_dir = final_dir.relative_to(root.raw).as_posix()
     with conn:
         conn.execute(
-            """INSERT INTO recordings (recording_id, source, container, car, category, event, label, notes,
-                   original_name, uploaded_at, uploader, storage_state, total_bytes, content_sha256, parse_status)
-               VALUES (:recording_id, :source, :container, :car, :category, :event, :label, :notes,
+            """INSERT INTO recordings (recording_id, source, container, car, category, category_method, event, label,
+                   notes, original_name, uploaded_at, uploader, storage_state, total_bytes, content_sha256, parse_status)
+               VALUES (:recording_id, :source, :container, :car, :category,
+                   CASE WHEN :category IS NULL THEN NULL ELSE 'manual' END, :event, :label, :notes,
                    :original_name, :uploaded_at, :uploader, 'stored', :total_bytes, :content_sha256, 'pending')""",
             rec,
         )
@@ -483,7 +512,11 @@ def raw_dir_of(conn: sqlite3.Connection, root: DataRoot, recording_id: str) -> P
 
 def update_recording(conn: sqlite3.Connection, root: DataRoot, recording_id: str, changes: dict) -> dict:
     """Edit the human-entered fields; rewrites the manifest so the raw tree
-    stays the source for rebuilding them."""
+    stays the source for rebuilding them.
+
+    A category or location you set is locked as 'manual' and never overwritten by the GPS-based
+    auto-labelling. Sending category or location_id as null/"" unlocks it and lets auto-labelling
+    decide again."""
     changes = {k: _clean(v) if isinstance(v, str) or v is None else v for k, v in changes.items() if k in EDITABLE_FIELDS}
     if not changes:
         raise CatalogError(f"nothing to update; editable fields: {', '.join(EDITABLE_FIELDS)}")
@@ -492,11 +525,25 @@ def update_recording(conn: sqlite3.Connection, root: DataRoot, recording_id: str
     existing = get_recording(conn, recording_id)
     if existing is None:
         raise KeyError(recording_id)
+    sets = dict(changes)
+    if "category" in changes:
+        sets["category_method"] = "manual" if changes["category"] is not None else None
+    if "location_id" in changes:
+        loc = changes["location_id"]
+        if loc is not None:
+            if isinstance(loc, bool) or not isinstance(loc, int) or conn.execute(
+                    "SELECT 1 FROM named_locations WHERE location_id = ?", (loc,)).fetchone() is None:
+                raise CatalogError("location_id must be the id of a named location")
+        sets["location_method"] = "manual" if loc is not None else None
     with conn:
         conn.execute(
-            f"UPDATE recordings SET {', '.join(f'{k} = ?' for k in changes)} WHERE recording_id = ?",
-            [*changes.values(), recording_id],
+            f"UPDATE recordings SET {', '.join(f'{k} = ?' for k in sets)} WHERE recording_id = ?",
+            [*sets.values(), recording_id],
         )
+    if "category" in changes or "location_id" in changes:
+        if "location_id" in changes and changes["location_id"] is None:
+            relabel_locations(conn)                      # unlocked: put the GPS match back
+        apply_auto_category(conn)
     updated = get_recording(conn, recording_id)
     directory = raw_dir_of(conn, root, recording_id)
     if directory is not None:
@@ -624,8 +671,10 @@ def request_reparse(conn: sqlite3.Connection, recording_id: str, rescan: bool = 
         return enqueue_job(conn, recording_id, "parse", "deep")
 
 
-def add_location(conn: sqlite3.Connection, name: str, lat: float, lon: float, radius_m: float) -> int:
-    """Create or update a named location (by name), then relabel recordings."""
+def add_location(conn: sqlite3.Connection, name: str, lat: float, lon: float, radius_m: float,
+                 default_category: str | None = None) -> int:
+    """Create or update a named location (by name), then relabel recordings. Recordings made here
+    that have no manual category get `default_category` (e.g. IMS -> competition)."""
     name = (name or "").strip()
     if not name:
         raise CatalogError("name is required")
@@ -633,12 +682,17 @@ def add_location(conn: sqlite3.Connection, name: str, lat: float, lon: float, ra
         raise CatalogError("lat/lon out of range")
     if radius_m <= 0:
         raise CatalogError("radius_m must be positive")
+    default_category = _clean(default_category) if isinstance(default_category, str) else default_category
+    if default_category is not None and default_category not in CATEGORIES:
+        raise CatalogError(f"default_category must be one of {', '.join(CATEGORIES)}")
     with conn:
         conn.execute(
-            """INSERT INTO named_locations (name, center_lat, center_lon, radius_m) VALUES (?, ?, ?, ?)
+            """INSERT INTO named_locations (name, center_lat, center_lon, radius_m, default_category)
+               VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(name) DO UPDATE SET center_lat = excluded.center_lat,
-                   center_lon = excluded.center_lon, radius_m = excluded.radius_m""",
-            (name, lat, lon, radius_m))
+                   center_lon = excluded.center_lon, radius_m = excluded.radius_m,
+                   default_category = excluded.default_category""",
+            (name, lat, lon, radius_m, default_category))
     relabel_locations(conn)
     return conn.execute("SELECT location_id FROM named_locations WHERE name = ?", (name,)).fetchone()["location_id"]
 
@@ -664,6 +718,29 @@ def relabel_locations(conn: sqlite3.Connection) -> int:
             if best != rec["location_id"]:
                 conn.execute("UPDATE recordings SET location_id = ?, location_method = ? WHERE recording_id = ?",
                              (best, "gps-match" if best is not None else None, rec["recording_id"]))
+                changed += 1
+    apply_auto_category(conn)
+    return changed
+
+
+def apply_auto_category(conn: sqlite3.Connection) -> int:
+    """Give every recording without a manual category the default category of the location it matched,
+    and withdraw an earlier automatic one when the location (or its default) no longer applies.
+    Returns how many recordings changed."""
+    changed = 0
+    with conn:
+        for rec in conn.execute(
+            """SELECT r.recording_id, r.category, r.category_method, l.default_category AS wanted
+               FROM recordings r LEFT JOIN named_locations l ON l.location_id = r.location_id
+               WHERE COALESCE(r.category_method, '') != 'manual'""").fetchall():
+            wanted = rec["wanted"]
+            if wanted is not None and (rec["category"] != wanted or rec["category_method"] != "auto"):
+                conn.execute("UPDATE recordings SET category = ?, category_method = 'auto' WHERE recording_id = ?",
+                             (wanted, rec["recording_id"]))
+                changed += 1
+            elif wanted is None and rec["category_method"] == "auto":
+                conn.execute("UPDATE recordings SET category = NULL, category_method = NULL WHERE recording_id = ?",
+                             (rec["recording_id"],))
                 changed += 1
     return changed
 
