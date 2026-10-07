@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 
 from evil import db
+from evil.classifiers import metrics
 from evil.classifiers.runner import tick
 from evil.ingest import ingest_sample
 from evil.ingestion.base import IngestionSource
@@ -73,6 +74,7 @@ def ingest_recording(recording_path: str, run_id: str, db_path: str) -> dict[str
     # No live edge left to wait behind: classify the whole run in one pass.
     backfill_now_ts = max_ts + 3600.0
     advanced = tick(conn, run_id, ALL_CLASSIFIERS, now_ts=backfill_now_ts)
+    metrics.store_run_summary(conn, run_id)
     conn.close()
 
     return {"rows_ingested": count, "classifiers_advanced_to_seq": advanced}

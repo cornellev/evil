@@ -23,6 +23,8 @@ def test_registers_expected_tools_with_schemas(evil_db_path):
     names = {t.name for t in tools}
     assert names == {
         "get_turn",
+        "get_straight",
+        "list_track_segments",
         "compare_turn_instances",
         "compare_laps",
         "list_runs",

@@ -30,13 +30,12 @@ def _write_rosbag(path: str, payloads: list[dict]) -> None:
 
 
 def _seed_track_geometry(db_path: str) -> None:
+    """A turn 100 m long (x = -50..50 m east of lat 42, lon -76), then a straight."""
+    from track_fixtures import seed_line
+
     conn = db.connect(db_path)
     db.apply_schema(conn)
-    conn.execute(
-        "INSERT INTO track_geometry (turn_name, center_lat, center_lon, radius_m) "
-        "VALUES ('T1', 42.0, -76.0, 50)"
-    )
-    conn.commit()
+    seed_line(conn, turn_from_x=-50.0, turn_to_x=50.0)
     conn.close()
 
 
@@ -47,10 +46,10 @@ def test_ingest_recording_produces_rows_and_a_classified_turn(tmp_path):
     csv_path = tmp_path / "recording.csv"
     csv_path.write_text(
         "global_ts,gps.lat,gps.long,speed\n"
-        "0.0,42.0,-76.01,20.0\n"
-        "1.0,42.0,-76.0003,8.0\n"
+        "0.0,42.0,-76.0012087,20.0\n"
+        "1.0,42.0,-76.0003022,8.0\n"
         "2.0,42.0,-76.0000,9.0\n"
-        "3.0,42.0,-75.999,7.0\n"
+        "3.0,42.0,-75.9990935,7.0\n"
     )
 
     result = ingest_recording(str(csv_path), "hist-run-1", db_path)

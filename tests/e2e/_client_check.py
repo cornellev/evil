@@ -28,6 +28,8 @@ async def main() -> int:
             names = {t.name for t in tools.tools}
             expected = {
                 "get_turn",
+                "get_straight",
+                "list_track_segments",
                 "compare_turn_instances",
                 "compare_laps",
                 "list_runs",
@@ -57,7 +59,8 @@ async def main() -> int:
             runs_result = await session.call_tool("list_runs", {})
             runs = (runs_result.structured_content or {}).get("result")
             if runs_result.is_error or runs != [
-                {"run_id": "run-1", "sample_count": 2, "start_ts": 0.0, "end_ts": 42.0}
+                {"run_id": "run-1", "sample_count": 2, "start_ts": 0.0, "end_ts": 42.0,
+                 "distance_m": None, "energy_wh": None, "efficiency_mi_per_kwh": None}
             ]:
                 print(f"FAIL: list_runs did not report the seeded run correctly: {runs}")
                 return 1
