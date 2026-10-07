@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS recordings (
     rows_duplicate  INTEGER,
     rows_rejected   INTEGER,
     reject_samples_json TEXT,
+    parse_stats_json TEXT,                       -- extra parse counters (e.g. seq conflicts)
     parse_error     TEXT
 );
 

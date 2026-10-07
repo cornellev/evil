@@ -140,6 +140,7 @@ def test_sweep_removes_only_stale_staging(root):
 def test_reconcile_adopts_orphan_folder_after_crash_before_insert(conn, root):
     result = _store(conn, root, [("run.csv", b"a,b\n1,2\n")], label="keep me")
     with conn:  # simulate a crash between rename and insert
+        conn.execute("DELETE FROM jobs")
         conn.execute("DELETE FROM recording_files")
         conn.execute("DELETE FROM recordings")
 
@@ -174,6 +175,7 @@ def test_reconcile_skips_folder_whose_files_do_not_match_manifest(conn, root):
     result = _store(conn, root, [("run.csv", b"a,b\n1,2\n")])
     rec = catalog.get_recording(conn, result.recording_id)
     with conn:
+        conn.execute("DELETE FROM jobs")
         conn.execute("DELETE FROM recording_files")
         conn.execute("DELETE FROM recordings")
     (root.raw / rec["files"][0]["rel_path"]).write_bytes(b"truncated")

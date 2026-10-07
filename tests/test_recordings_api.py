@@ -127,6 +127,7 @@ def test_startup_maintenance_adopts_orphans_and_backs_up(tmp_path, monkeypatch):
     root = _root(tmp_path)
     conn = catalog.connect_catalog(root)
     with conn:
+        conn.execute("DELETE FROM jobs")
         conn.execute("DELETE FROM recording_files")
         conn.execute("DELETE FROM recordings")
     conn.close()
@@ -214,3 +215,24 @@ def test_killed_connection_mid_upload_stores_nothing(tmp_path, monkeypatch):
     finally:
         server.should_exit = True
         thread.join(timeout=5)
+
+
+def test_reparse_status_and_locations_endpoints(client, tmp_path):
+    rec = client.post("/recordings", files=[("files", ("a.csv", b"a,b\n1,2\n", "text/csv"))]).json()
+    rid = rec["recording_id"]
+
+    status = client.get("/system/status").json()
+    assert status["jobs"]["counts"]["pending"] == 2          # the scan and the parse queued by the upload
+    assert {q["kind"] for q in status["jobs"]["queue"]} == {"scan", "parse"}
+    assert status["system"]["disk"]["free_bytes"] > 0
+
+    again = client.post(f"/recordings/{rid}/reparse")
+    assert again.status_code == 202 and again.json()["recording_id"] == rid
+    assert client.get("/system/status").json()["jobs"]["counts"]["pending"] == 2   # parse reused, not doubled
+    assert client.post("/recordings/missing/reparse").status_code == 404
+
+    created = client.post("/locations", json={"name": "B-lot", "lat": 42.0, "lon": -76.0, "radius_m": 200})
+    assert created.status_code == 201
+    assert [l["name"] for l in client.get("/locations").json()] == ["B-lot"]
+    assert client.post("/locations", json={"name": "x"}).status_code == 400
+    assert client.post("/locations", json={"name": "x", "lat": 99, "lon": 0, "radius_m": 5}).status_code == 400
