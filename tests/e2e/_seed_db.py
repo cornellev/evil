@@ -17,8 +17,8 @@ db.apply_schema(conn)
 ingest_sample(conn, RawSample(run_id="run-1", ts=0.0))
 ingest_sample(conn, RawSample(run_id="run-1", ts=42.0))
 conn.execute(
-    "INSERT INTO track_geometry (turn_def_id, turn_name, center_lat, center_lon, radius_m) "
-    "VALUES (1, 'Turn 3', 42.0, -76.0, 50)"
+    "INSERT INTO track_segments (segment_id, ordinal, kind, name, aliases, length_m, gate_lat1, gate_lon1, gate_lat2, gate_lon2) "
+    "VALUES (1, 0, 'turn', 'Turn 3', '3', 100.0, 42.0, -76.0, 42.001, -76.0)"
 )
 conn.executemany(
     """INSERT INTO turns

@@ -31,10 +31,12 @@ def compare_laps(conn: sqlite3.Connection, run_id: str, lap_a: int, lap_b: int) 
     def _summarize(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "lap_number": row["lap_number"],
-            "duration_s": row["end_ts"] - row["start_ts"],
+            "duration_s": row["duration_s"] if row["duration_s"] is not None else row["end_ts"] - row["start_ts"],
             "turn_count": row["turn_count"],
             "energy_wh": row["energy_wh"],
             "avg_speed": row["avg_speed"],
+            "distance_m": row["distance_m"],
+            "efficiency_mi_per_kwh": row["efficiency_mi_per_kwh"],
         }
 
     summary_a, summary_b = _summarize(row_a), _summarize(row_b)
@@ -47,5 +49,7 @@ def compare_laps(conn: sqlite3.Connection, run_id: str, lap_a: int, lap_b: int) 
             "duration_s": summary_b["duration_s"] - summary_a["duration_s"],
             "energy_wh": _delta(summary_a["energy_wh"], summary_b["energy_wh"]),
             "avg_speed": _delta(summary_a["avg_speed"], summary_b["avg_speed"]),
+            "distance_m": _delta(summary_a["distance_m"], summary_b["distance_m"]),
+            "efficiency_mi_per_kwh": _delta(summary_a["efficiency_mi_per_kwh"], summary_b["efficiency_mi_per_kwh"]),
         },
     }

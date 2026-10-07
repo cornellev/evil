@@ -14,7 +14,7 @@ Full design rationale (and the alternatives that were rejected) lives in
 
 ```bash
 # 1. Load static reference data ONCE per track (skip if evil.db already has it)
-docker compose run --rm mcp-server python -m evil.scripts.seed_reference_data turn "Turn 1" 42.0 -76.0 30
+docker compose run --rm mcp-server python -m evil.scripts.seed_reference_data track        # packaged IMS 2026 track: 13 turns + 4 straights
 docker compose run --rm mcp-server python -m evil.scripts.seed_reference_data start-finish 42.0 -76.0 30
 
 # 2. Run the MCP server -- what tern-llm, evil-ui, and CEV members' own
@@ -97,10 +97,9 @@ src/evil/
     base.py             Classifier protocol + ClassifierSpec
     registry.py         topological sort by depends_on
     runner.py           incremental tick(): per-classifier cursor + margin
-    metrics.py          shared energy/avg-speed helpers used by laps.py and straights.py
-    turns.py            example classifier: GPS geofence turn segmentation
-    laps.py             depends_on=["turns"]: energy, avg speed, turn count per lap
-    straights.py        depends_on=["turns"]: the complement of turns, no open-state needed
+    metrics.py          energy / distance / efficiency (ported from the Race Engineer Dashboard)
+    segments.py         gate-based segmentation: turns AND straights, each with duration/distance/energy/efficiency
+    laps.py             depends_on=["main_snapshot","segments"]: per-lap totals, turn count, efficiency
   tools/
     get_turn.py                 "how was I in turn X"
     compare_turn_instances.py   "what could I have done better" (this turn, across attempts)
@@ -120,7 +119,7 @@ src/evil/
   schemas/telemetry_v1.py   the strict evil.telemetry.v1 payload definition
   worker.py, parse_job.py   job queue worker (fast/deep lanes) and the isolated parse subprocess
   scripts/
-    seed_reference_data.py  load track_geometry / start_finish_line rows
+    seed_reference_data.py  load the track (track_segments) / start_finish_line; reclassify.py rebuilds derived tables
     ingest_recording.py     bulk-load a recorded CSV or rosbag .db3 as historical data
     migrate_reference_data.py  copy track geometry into the new parsed DB
     run_live_compiler.py    the production entry point: live Ros2Source + ALL_CLASSIFIERS
@@ -137,9 +136,9 @@ mechanism, different name.
 
 Each classifier declares its own `lookback_margin_s` (how long to wait before
 it's willing to call a row "final") and its own `depends_on` (raw data, or
-another classifier's name, forming a DAG). `laps`/`straights` depend on
-`turns` without the runner changing. A new classifier is one file plus one
-line in `registered_classifiers.py` -- see `classifiers/turns.py` for the
+another classifier's name, forming a DAG). `laps` depends on
+`segments` without the runner changing. A new classifier is one file plus one
+line in `registered_classifiers.py` -- see `classifiers/segments.py` for the
 pattern to copy. Details and the alternatives considered (CDC, broker
 offsets, dirty-flag columns) are in `inference-agent/4.md` section 4.
 
@@ -243,3 +242,19 @@ being asked for.
 - Deploying this server to `cev-nuc` and confirming a client elsewhere on
   the tailnet can reach it -- verified here over this dev machine's own
   tailnet interface only.
+
+## Track segments and efficiency
+
+`src/evil/data/ims_2026_segments.json` defines the track as 17 segments in lap order (13 turns, 4 straights;
+official T1+T2 are one segment, "Turn 1-2", because cars take the outer path). Each segment starts at a gate: a
+line ~80 m wide across the road, generous against GPS error (about 6.5 m at the gates). A segment instance runs
+from crossing its gate to crossing the next, so segments tile the lap; crossing times are interpolated between
+GPS fixes, and energy is cut at the same instants. Dropouts (>5 s or >120 m between fixes) discard the open
+segment instead of inventing one.
+
+Efficiency is miles per kWh, same as the Race Engineer Dashboard: power = max(0, V x I), energy = trapezoid
+over the DAQ clock, distance = sum of ECEF fix-to-fix distances. It is stored per turn, straight, lap and run
+(`run_summary`) and returned by `get_turn`, `get_straight`, `compare_*`, `list_*`.
+
+After changing the track or the math, run `python -m evil.scripts.reclassify --db <path>`. Opening an older
+database drops the derived tables (not raw data) and they are rebuilt this way.
