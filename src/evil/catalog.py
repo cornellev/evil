@@ -713,5 +713,138 @@ def system_status(conn: sqlite3.Connection, root: DataRoot, recent: int = 25) ->
         "system": {"cpu_count": os.cpu_count(), "load_avg": list(load),
                    "mem_total_bytes": mem.get("MemTotal"), "mem_available_bytes": mem.get("MemAvailable"),
                    "disk": disk_info, "recordings_bytes": raw_bytes},
+        "cache": cache_summary(conn),
         "time": time.time(),
     }
+
+
+# ---- CAT cache (Phase 4) -------------------------------------------------
+
+CACHE_CONTAINERS = {"rosbag2-sqlite3": "bag", "csv": "csv"}
+CACHE_MAX_AGE_SEC = float(os.getenv("EVIL_CACHE_MAX_AGE_SEC", str(7 * 24 * 3600)))
+CACHE_MAX_BYTES = int(os.getenv("EVIL_CACHE_MAX_BYTES", str(20 * 1024**3)))
+
+
+def cache_kind(container: str) -> str | None:
+    return CACHE_CONTAINERS.get(container)
+
+
+def cache_state(conn: sqlite3.Connection, recording_id: str) -> dict | None:
+    """absent | queued | building | ready | failed for one recording (None if it does not exist).
+    Derived from cache_entries (ready) and the latest cache_build job."""
+    rec = conn.execute("SELECT recording_id, container, parse_error FROM recordings WHERE recording_id = ?",
+                       (recording_id,)).fetchone()
+    if rec is None:
+        return None
+    entry = conn.execute("SELECT * FROM cache_entries WHERE recording_id = ?", (recording_id,)).fetchone()
+    job = conn.execute("SELECT * FROM jobs WHERE recording_id = ? AND kind = 'cache_build' ORDER BY job_id DESC LIMIT 1",
+                       (recording_id,)).fetchone()
+    out = {"recording_id": recording_id, "state": "absent", "progress": None, "error": None,
+           "built_at": None, "last_access_at": None, "size_bytes": None, "messages": None, "detail": None,
+           "cacheable": cache_kind(rec["container"]) is not None
+                        and not (rec["parse_error"] or "").startswith("container unreadable")}
+    if entry is not None:
+        out.update(state="ready", built_at=entry["built_at"], last_access_at=entry["last_access_at"],
+                   size_bytes=entry["size_bytes"], messages=entry["messages"],
+                   detail=json.loads(entry["detail_json"]) if entry["detail_json"] else None)
+    elif job is not None and job["status"] == "pending" and job["attempts"] == 0:
+        out["state"] = "queued"
+    elif job is not None and job["status"] in ("pending", "running"):
+        out.update(state="building", progress=job["progress"])
+        if job["error"]:
+            out["error"] = f"retrying after: {job['error']}"
+    elif job is not None and job["status"] == "failed":
+        out.update(state="failed", error=job["error"])
+    return out
+
+
+def request_cache(conn: sqlite3.Connection, recording_id: str) -> dict:
+    """Ask for a recording's CAT cache to exist: queue a build unless it is ready or already
+    queued/running. A ready entry is touched. Raises CatalogError if it cannot be cached."""
+    st = cache_state(conn, recording_id)
+    if st is None:
+        raise KeyError(recording_id)
+    if not st["cacheable"]:
+        raise CatalogError("this recording cannot be opened in CAT (not a readable rosbag2 or CSV)")
+    if st["state"] == "ready":
+        touch_cache(conn, recording_id)
+    elif st["state"] in ("absent", "failed"):
+        with conn:
+            enqueue_job(conn, recording_id, "cache_build", "cache")
+    return cache_state(conn, recording_id)
+
+
+def touch_cache(conn: sqlite3.Connection, recording_id: str, now: float | None = None) -> bool:
+    with conn:
+        cur = conn.execute("UPDATE cache_entries SET last_access_at = ? WHERE recording_id = ?",
+                           (time.time() if now is None else now, recording_id))
+    return cur.rowcount > 0
+
+
+def record_cache_built(conn: sqlite3.Connection, recording_id: str, size_bytes: int, messages: int | None,
+                       detail: dict | None, now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    with conn:
+        conn.execute(
+            """INSERT INTO cache_entries (recording_id, built_at, last_access_at, size_bytes, messages, detail_json)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(recording_id) DO UPDATE SET built_at = excluded.built_at,
+                   last_access_at = excluded.last_access_at, size_bytes = excluded.size_bytes,
+                   messages = excluded.messages, detail_json = excluded.detail_json""",
+            (recording_id, now, now, int(size_bytes or 0), messages, json.dumps(detail) if detail else None))
+
+
+def plan_eviction(conn: sqlite3.Connection, now: float | None = None, max_age: float = CACHE_MAX_AGE_SEC,
+                  max_bytes: int = CACHE_MAX_BYTES) -> list[str]:
+    """Which cache entries to drop: everything idle longer than max_age, then least-recently-used
+    entries while what remains exceeds max_bytes."""
+    now = time.time() if now is None else now
+    rows = conn.execute("SELECT recording_id, size_bytes, last_access_at FROM cache_entries "
+                        "ORDER BY last_access_at ASC, recording_id").fetchall()
+    evict = [r["recording_id"] for r in rows if now - r["last_access_at"] > max_age]
+    keep = [r for r in rows if r["recording_id"] not in set(evict)]
+    total = sum(r["size_bytes"] for r in keep)
+    for r in keep:                      # oldest access first
+        if total <= max_bytes:
+            break
+        evict.append(r["recording_id"])
+        total -= r["size_bytes"]
+    return evict
+
+
+def drop_cache_entry(conn: sqlite3.Connection, recording_id: str) -> None:
+    with conn:
+        conn.execute("DELETE FROM cache_entries WHERE recording_id = ?", (recording_id,))
+
+
+def cat_recordings(conn: sqlite3.Connection, kind: str = "all", limit: int = 500, offset: int = 0) -> list[dict]:
+    """What CAT lists: every recording it could open (rosbag2 and CSV), newest first, with a
+    display name and its cache state."""
+    containers = [c for c, k in CACHE_CONTAINERS.items() if kind in ("all", k)]
+    if not containers:
+        return []
+    marks = ",".join("?" * len(containers))
+    rows = conn.execute(
+        f"""SELECT recording_id FROM recordings WHERE container IN ({marks})
+              AND COALESCE(parse_error, '') NOT LIKE 'container unreadable%'
+            ORDER BY COALESCE(recorded_start, uploaded_at) DESC, recording_id DESC LIMIT ? OFFSET ?""",
+        (*containers, max(1, min(limit, 2000)), max(0, offset))).fetchall()
+    out = []
+    for r in rows:
+        rec = conn.execute("SELECT * FROM recordings WHERE recording_id = ?", (r["recording_id"],)).fetchone()
+        st = cache_state(conn, r["recording_id"])
+        out.append({
+            "recording_id": rec["recording_id"],
+            "name": rec["label"] or rec["original_name"] or rec["recording_id"],
+            "kind": CACHE_CONTAINERS[rec["container"]], "container": rec["container"],
+            "category": rec["category"], "car": rec["car"], "event": rec["event"],
+            "recorded_start": rec["recorded_start"], "uploaded_at": rec["uploaded_at"],
+            "total_bytes": rec["total_bytes"], "parse_status": rec["parse_status"],
+            "cache_state": st["state"], "cache_progress": st["progress"], "cache_error": st["error"],
+        })
+    return out
+
+
+def cache_summary(conn: sqlite3.Connection) -> dict:
+    row = conn.execute("SELECT COUNT(*) n, COALESCE(SUM(size_bytes), 0) b FROM cache_entries").fetchone()
+    return {"entries": row["n"], "bytes": row["b"], "max_bytes": CACHE_MAX_BYTES, "max_age_sec": CACHE_MAX_AGE_SEC}

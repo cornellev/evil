@@ -309,3 +309,49 @@ async def post_location(body: dict) -> dict:
     except catalog.CatalogError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"location_id": location_id, "name": name}
+
+
+# ---- CAT cache -------------------------------------------------------------
+
+@app.get("/cat/recordings")
+async def cat_recordings(kind: str = "all", limit: int = 500, offset: int = 0) -> list[dict]:
+    """What CAT lists: rosbag2 and CSV recordings with a display name and their cache state."""
+    if kind not in ("all", "bag", "csv"):
+        raise HTTPException(status_code=400, detail="kind must be all, bag or csv")
+    return await _with_catalog(lambda c, r: catalog.cat_recordings(c, kind=kind, limit=limit, offset=offset))
+
+
+@app.post("/recordings/{recording_id}/cache", status_code=202)
+async def request_cache(recording_id: str) -> dict:
+    """Make sure CAT's cache for this recording exists: queues a build if needed (CAT shows
+    'preparing...' until it is ready). A ready cache is just marked as used."""
+    try:
+        return await _with_catalog(lambda c, r: catalog.request_cache(c, recording_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="recording not found") from exc
+    except catalog.CatalogError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/recordings/{recording_id}/cache")
+async def get_cache(recording_id: str) -> dict:
+    state = await _with_catalog(lambda c, r: catalog.cache_state(c, recording_id))
+    if state is None:
+        raise HTTPException(status_code=404, detail="recording not found")
+    return state
+
+
+@app.post("/recordings/{recording_id}/cache/touch")
+async def touch_cache(recording_id: str) -> dict:
+    """CAT calls this when a user opens a recording, so a cache in use is not evicted."""
+    touched = await _with_catalog(lambda c, r: catalog.touch_cache(c, recording_id))
+    return {"recording_id": recording_id, "touched": touched}
+
+
+@app.get("/cache")
+async def cache_overview() -> dict:
+    def run(c, r):
+        entries = [dict(row) for row in c.execute(
+            "SELECT recording_id, built_at, last_access_at, size_bytes, messages FROM cache_entries ORDER BY last_access_at DESC")]
+        return {"summary": catalog.cache_summary(c), "entries": entries}
+    return await _with_catalog(run)
