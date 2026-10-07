@@ -25,6 +25,7 @@ from evil import catalog
 from evil.db import connect_readonly
 from evil.tools.compare_laps import compare_laps
 from evil.tools.compare_turn_instances import compare_turn_instances
+from evil.tools.get_straight import get_straight
 from evil.tools.get_turn import get_turn
 from evil.tools.list_laps import list_laps
 from evil.tools.list_runs import list_runs
@@ -32,6 +33,7 @@ from evil.tools.list_straights import list_straights
 from evil.tools.list_turns import list_turns
 from evil.tools.catalog_tools import describe_recording, find_nas_files, list_recordings
 from evil.tools.read_only_sql import read_only_sql
+from evil.tools.segment_tools import list_track_segments
 
 DEFAULT_DB_PATH = os.getenv("EVIL_DB_PATH", "evil.db")
 DEFAULT_HOST = os.getenv("EVIL_MCP_HOST", "0.0.0.0")
@@ -73,50 +75,67 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None) -
 
     @server.tool(name="get_turn")
     async def get_turn_handler(run_id: str, turn_name: str, occurrence: str = "latest") -> dict:
-        """Get start/end time, entry speed, exit speed, and duration for one turn
-        instance in a run, by turn name. Defaults to the most recent occurrence."""
+        """Get start/end time, entry/exit speed, duration, distance, energy (Wh) and efficiency (mi/kWh)
+        for one turn instance in a run, by turn name or official number. Defaults to the most recent occurrence.
+        Official turns 1 and 2 are one segment, 'Turn 1-2'."""
         return await asyncio.to_thread(
             _run_readonly, path, get_turn, run_id=run_id, turn_name=turn_name, occurrence=occurrence
         )
 
+    @server.tool(name="get_straight")
+    async def get_straight_handler(run_id: str, straight_name: str, occurrence: str = "latest") -> dict:
+        """Get time, entry/exit speed, distance, energy (Wh) and efficiency (mi/kWh) for one pass down a
+        straight, by name (e.g. 'Straight 6-7' or '6-7'). Defaults to the most recent occurrence.
+        list_track_segments shows which straights exist."""
+        return await asyncio.to_thread(
+            _run_readonly, path, get_straight, run_id=run_id, straight_name=straight_name, occurrence=occurrence
+        )
+
+    @server.tool(name="list_track_segments")
+    async def list_track_segments_handler() -> list[dict]:
+        """The track's turns and straights in lap order (name, kind, length, official turn numbers)."""
+        return await asyncio.to_thread(_run_readonly, path, list_track_segments)
+
     @server.tool(name="compare_turn_instances")
     async def compare_turn_instances_handler(run_id: str, turn_name: str, limit: int = 10) -> dict:
-        """Compare every instance of a named turn within a run (entry/exit speed,
-        duration) to answer what could be improved compared to earlier attempts."""
+        """Compare every instance of a named turn within a run (entry/exit speed, duration, energy,
+        efficiency in mi/kWh) to answer what could be improved compared to earlier attempts."""
         return await asyncio.to_thread(
             _run_readonly, path, compare_turn_instances, run_id=run_id, turn_name=turn_name, limit=limit
         )
 
     @server.tool(name="list_runs")
     async def list_runs_handler() -> list[dict]:
-        """List every run_id with its sample count and time range, for browsing."""
+        """List every run_id with its sample count, time range and whole-run distance, energy and
+        efficiency (mi/kWh), for browsing."""
         return await asyncio.to_thread(_run_readonly, path, list_runs)
 
     @server.tool(name="list_turns")
     async def list_turns_handler(run_id: str, limit: int = 50, offset: int = 0) -> dict:
-        """List every turn in a run, paginated, for browsing (not a specific lookup)."""
+        """List every turn in a run, paginated, with duration, distance, energy and efficiency, for browsing."""
         return await asyncio.to_thread(
             _run_readonly, path, list_turns, run_id=run_id, limit=limit, offset=offset
         )
 
     @server.tool(name="list_laps")
     async def list_laps_handler(run_id: str, limit: int = 50, offset: int = 0) -> dict:
-        """List every lap in a run, paginated, for browsing."""
+        """List every lap in a run, paginated, with duration, distance, energy and efficiency, for browsing."""
         return await asyncio.to_thread(
             _run_readonly, path, list_laps, run_id=run_id, limit=limit, offset=offset
         )
 
     @server.tool(name="list_straights")
     async def list_straights_handler(run_id: str, limit: int = 50, offset: int = 0) -> dict:
-        """List every straight in a run, paginated, for browsing."""
+        """List every straight in a run (named, like turns), paginated, with duration, distance, energy and
+        efficiency, for browsing."""
         return await asyncio.to_thread(
             _run_readonly, path, list_straights, run_id=run_id, limit=limit, offset=offset
         )
 
     @server.tool(name="compare_laps")
     async def compare_laps_handler(run_id: str, lap_a: int, lap_b: int) -> dict:
-        """Compare two laps in a run by lap number (duration, turn count, energy,
-        average speed) to answer what changed or what could be improved."""
+        """Compare two laps in a run by lap number (duration, turn count, energy, distance, efficiency in
+        mi/kWh, average speed) to answer what changed or what could be improved."""
         return await asyncio.to_thread(
             _run_readonly, path, compare_laps, run_id=run_id, lap_a=lap_a, lap_b=lap_b
         )

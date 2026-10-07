@@ -14,15 +14,15 @@ export PYTHONPATH="$REPO_ROOT/src"
 DB_PATH="$WORKDIR/evil.db"
 BAG_PATH="$WORKDIR/recording.db3"
 
-echo "[smoke] seeding track_geometry"
+echo "[smoke] seeding the track: a 100 m turn, then a straight"
 "$VENV_PYTHON" -c "
-from evil import db
+from evil import db, track
 conn = db.connect('$DB_PATH')
 db.apply_schema(conn)
-conn.execute(
-    \"INSERT INTO track_geometry (turn_name, center_lat, center_lon, radius_m) VALUES ('T1', 42.0, -76.0, 50)\"
-)
-conn.commit()
+track.seed_track(conn, {'segments': [
+    {'name': 'T1', 'kind': 'turn', 'aliases': ['1'], 'length_m': 100.0, 'entry_gate': [41.999, -76.0006043, 42.001, -76.0006043]},
+    {'name': 'Straight 1', 'kind': 'straight', 'aliases': [], 'length_m': 500.0, 'entry_gate': [41.999, -75.9993957, 42.001, -75.9993957]},
+]})
 conn.close()
 "
 
@@ -40,10 +40,10 @@ conn.execute('CREATE TABLE messages (id INTEGER PRIMARY KEY, topic_id INTEGER, t
 conn.execute(\"INSERT INTO topics (id, name, type) VALUES (1, 'spi_data', 'std_msgs/msg/String')\")
 
 payloads = [
-    {'gps': {'lat': 42.0, 'long': -76.01}, 'power': {'voltage': 20.0, 'current': 1.0}},
-    {'gps': {'lat': 42.0, 'long': -76.0003}, 'power': {'voltage': 8.0, 'current': 1.0}},
+    {'gps': {'lat': 42.0, 'long': -76.0012087}, 'power': {'voltage': 20.0, 'current': 1.0}},
+    {'gps': {'lat': 42.0, 'long': -76.0003022}, 'power': {'voltage': 8.0, 'current': 1.0}},
     {'gps': {'lat': 42.0, 'long': -76.0000}, 'power': {'voltage': 9.0, 'current': 1.0}},
-    {'gps': {'lat': 42.0, 'long': -75.999}, 'power': {'voltage': 7.0, 'current': 1.0}},
+    {'gps': {'lat': 42.0, 'long': -75.9990935}, 'power': {'voltage': 7.0, 'current': 1.0}},
 ]
 for i, payload in enumerate(payloads):
     conn.execute(

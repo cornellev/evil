@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from evil.tools.compare_laps import compare_laps
 from evil.tools.compare_turn_instances import compare_turn_instances
+from evil.tools.get_straight import get_straight
 from evil.tools.get_turn import get_turn
 from evil.tools.list_laps import list_laps
 from evil.tools.list_runs import list_runs
@@ -19,6 +20,7 @@ from evil.tools.list_straights import list_straights
 from evil.tools.list_turns import list_turns
 from evil.tools.catalog_tools import describe_recording, find_nas_files, list_recordings
 from evil.tools.read_only_sql import read_only_sql
+from evil.tools.segment_tools import list_track_segments
 
 
 @dataclass(frozen=True)
@@ -57,8 +59,9 @@ def build_registry(conn: sqlite3.Connection, catalog_conn: sqlite3.Connection | 
             ToolDef(
                 name="get_turn",
                 description=(
-                    "Get start/end time, entry speed, exit speed, and duration for one turn "
-                    "instance in a run, by turn name. Defaults to the most recent occurrence."
+                    "Get start/end time, entry/exit speed, duration, distance, energy (Wh) and "
+                    "efficiency (mi/kWh) for one turn instance in a run, by turn name or official "
+                    "number. Defaults to the most recent occurrence."
                 ),
                 parameters={
                     "type": "object",
@@ -70,6 +73,29 @@ def build_registry(conn: sqlite3.Connection, catalog_conn: sqlite3.Connection | 
                     "required": ["run_id", "turn_name"],
                 },
                 handler=lambda **kw: get_turn(conn, **kw),
+            ),
+            ToolDef(
+                name="get_straight",
+                description=(
+                    "Get time, entry/exit speed, distance, energy (Wh) and efficiency (mi/kWh) for one "
+                    "pass down a named straight (e.g. 'Straight 6-7'). Defaults to the most recent occurrence."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "run_id": {"type": "string"},
+                        "straight_name": {"type": "string"},
+                        "occurrence": {"type": "string", "enum": ["latest", "first"]},
+                    },
+                    "required": ["run_id", "straight_name"],
+                },
+                handler=lambda **kw: get_straight(conn, **kw),
+            ),
+            ToolDef(
+                name="list_track_segments",
+                description="The track's turns and straights in lap order (name, kind, length, official turn numbers).",
+                parameters={"type": "object", "properties": {}},
+                handler=lambda **kw: list_track_segments(conn, **kw),
             ),
             ToolDef(
                 name="compare_turn_instances",

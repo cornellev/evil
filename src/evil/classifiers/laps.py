@@ -1,13 +1,12 @@
-"""Second real classifier, after turns.py -- and the first one that actually
-depends on another classifier's output rather than a test double: laps
-counts turns crossed and needs turns' rows to already be committed. The
-runner's topological ordering (classifiers/registry.py) guarantees that
-within one tick(), turns runs and commits before laps does, so this join is
-always safe, never a race against a partially-written tick.
+"""Laps: depends on the `segments` classifier's output, since a lap counts the
+turns driven in it and needs those rows committed first. The runner's topological
+ordering (classifiers/registry.py) guarantees that within one tick(), segments runs
+and commits before laps does.
 
-Boundary detection mirrors turns.py's circle-geofence state machine, but
-crossing INTO the line is the event of interest (not dwelling inside it):
-a crossing both closes the currently-open lap and starts the next one.
+Boundary detection is a circle around the start/finish line: crossing INTO it is the
+event of interest (not dwelling inside it): a crossing both closes the currently-open
+lap and starts the next one. Per-lap energy, distance and efficiency use RED's formulas
+(metrics.py).
 """
 
 from __future__ import annotations
@@ -32,11 +31,12 @@ def _close_lap(
     end_seq: int,
     end_ts: float,
 ) -> None:
+    m = metrics.range_metrics(conn, run_id, start_seq, end_seq)
     conn.execute(
         """INSERT INTO laps
                (run_id, lap_number, start_seq, end_seq, start_ts, end_ts,
-                turn_count, energy_wh, avg_speed)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                turn_count, energy_wh, avg_speed, duration_s, distance_m, efficiency_mi_per_kwh)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             run_id,
             lap_number,
@@ -45,8 +45,11 @@ def _close_lap(
             start_ts,
             end_ts,
             metrics.turn_count(conn, run_id, start_seq, end_seq),
-            metrics.energy_wh(conn, run_id, start_seq, end_seq),
-            metrics.avg_speed(conn, run_id, start_seq, end_seq),
+            m["energy_wh"],
+            m["avg_speed"],
+            m["duration_s"],
+            m["distance_m"],
+            m["efficiency_mi_per_kwh"],
         ),
     )
 
@@ -55,7 +58,7 @@ class LapsClassifier:
     spec = ClassifierSpec(
         name="laps",
         version=1,
-        depends_on=["main_snapshot", "turns"],
+        depends_on=["main_snapshot", "segments"],
         lookback_margin_s=2.0,
     )
 

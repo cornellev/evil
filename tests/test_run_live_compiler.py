@@ -5,20 +5,21 @@ of the event-driven wake design over blind fixed-interval polling.
 
 import asyncio
 
-from evil.classifiers.turns import TurnsClassifier
+from evil.classifiers.segments import SegmentsClassifier
 from evil.ingestion.replay_source import ReplaySource
 from evil.models import GpsReading, RawSample
 from evil.scripts.run_live_compiler import LiveCompiler
+from track_fixtures import ll, seed_line
 
-CENTER_LAT, CENTER_LON, RADIUS_M = 42.0, -76.0, 50.0
+CENTER_LAT = 42.0
 
 
 def _seed_turn(conn):
-    conn.execute(
-        "INSERT INTO track_geometry (turn_name, center_lat, center_lon, radius_m) VALUES ('T1', ?, ?, ?)",
-        (CENTER_LAT, CENTER_LON, RADIUS_M),
-    )
-    conn.commit()
+    seed_line(conn, turn_from_x=-50.0, turn_to_x=50.0)     # a turn 100 m long, then a straight
+
+
+def _lon(x_m):
+    return ll(x_m, 0.0)[1]
 
 
 def _gps_sample(ts, lon, speed):
@@ -34,20 +35,20 @@ def test_compiler_ticks_incrementally_while_samples_are_still_arriving(conn):
     run proves it was wake-driven, not the 10s fallback interval."""
     _seed_turn(conn)
     samples = [
-        _gps_sample(0.0, -76.01, 20.0),  # outside
-        _gps_sample(1.0, -76.0003, 8.0),  # entry
-        _gps_sample(2.0, -76.0000, 9.0),  # inside
-        _gps_sample(3.0, -75.999, 7.0),  # exit
+        _gps_sample(0.0, _lon(-100.0), 20.0),  # outside
+        _gps_sample(1.0, _lon(-25.0), 8.0),  # entry (crosses the turn's entry gate)
+        _gps_sample(2.0, _lon(0.0), 9.0),  # inside
+        _gps_sample(3.0, _lon(75.0), 7.0),  # exit (crosses the exit gate)
     ]
     source = ReplaySource(samples, delay_s=0.15)
-    compiler = LiveCompiler(conn, "run-1", source, [TurnsClassifier()], max_interval_s=10.0)
+    compiler = LiveCompiler(conn, "run-1", source, [SegmentsClassifier()], max_interval_s=10.0)
 
     async def scenario():
         task = asyncio.create_task(compiler.run())
 
         await asyncio.sleep(0.35)
         mid_run_open = conn.execute(
-            "SELECT COUNT(*) AS n FROM turns_open_state WHERE run_id = 'run-1'"
+            "SELECT COUNT(*) AS n FROM segments_open_state WHERE run_id = 'run-1' AND ordinal IS NOT NULL"
         ).fetchone()["n"]
         mid_run_closed = conn.execute(
             "SELECT COUNT(*) AS n FROM turns WHERE run_id = 'run-1'"
@@ -66,6 +67,7 @@ def test_compiler_ticks_incrementally_while_samples_are_still_arriving(conn):
     assert final_turn is not None
     assert final_turn["entry_speed"] == 8.0
     assert final_turn["exit_speed"] == 7.0
+    assert final_turn["duration_s"] > 0
 
 
 def test_final_tick_after_source_ends_catches_trailing_data(conn):
@@ -73,11 +75,12 @@ def test_final_tick_after_source_ends_catches_trailing_data(conn):
     wait even starts, so only the shutdown tick can classify them."""
     _seed_turn(conn)
     samples = [
-        _gps_sample(0.0, -76.0003, 8.0),  # entry
-        _gps_sample(1.0, -75.999, 7.0),  # exit -- arrives right as the source ends
+        _gps_sample(0.0, _lon(-100.0), 20.0),  # outside
+        _gps_sample(1.0, _lon(-25.0), 8.0),  # entry
+        _gps_sample(2.0, _lon(75.0), 7.0),  # exit -- arrives right as the source ends
     ]
     source = ReplaySource(samples, delay_s=0.0)
-    compiler = LiveCompiler(conn, "run-1", source, [TurnsClassifier()], max_interval_s=10.0)
+    compiler = LiveCompiler(conn, "run-1", source, [SegmentsClassifier()], max_interval_s=10.0)
 
     asyncio.run(asyncio.wait_for(compiler.run(), timeout=5.0))
 

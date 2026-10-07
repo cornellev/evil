@@ -26,18 +26,37 @@ def connect_readonly(path: str) -> sqlite3.Connection:
     return conn
 
 
+# Schema version (PRAGMA user_version). 2 = gate-based track segments: turns/straights/laps gained
+# duration/distance/energy/efficiency and reference data moved from circles (track_geometry) to
+# track_segments. Derived tables are rebuildable (scripts/reclassify), so an older database has them
+# dropped and recreated rather than altered.
+SCHEMA_VERSION = 2
+_DERIVED_TABLES = ("turns", "turns_open_state", "straights", "laps", "laps_open_state", "classifier_cursor")
+
+
 def apply_schema(conn: sqlite3.Connection, schema_dir: Path | None = None) -> None:
     """Apply every schema/*.sql file in filename order. Idempotent: every
-    statement uses CREATE TABLE IF NOT EXISTS / CREATE INDEX IF NOT EXISTS."""
+    statement uses CREATE TABLE IF NOT EXISTS / CREATE INDEX IF NOT EXISTS.
+    A database from before SCHEMA_VERSION 2 first has its derived tables (and the old circle
+    geometry) dropped; raw snapshots are untouched and `scripts/reclassify` rebuilds the rest."""
     directory = schema_dir or SCHEMA_DIR
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version < SCHEMA_VERSION:
+        has_old = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name IN ('turns', 'track_geometry') LIMIT 1"
+        ).fetchone()
+        if has_old:
+            for table in _DERIVED_TABLES + ("track_geometry",):
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
     for sql_file in sorted(directory.glob("*.sql")):
         conn.executescript(sql_file.read_text())
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 
 
 _RUN_TABLES_IN_DELETE_ORDER = (
     # derived first, then the snapshot rows that point at raw rows, then raw rows
-    "turns", "turns_open_state", "laps", "laps_open_state", "straights", "classifier_cursor",
+    "turns", "segments_open_state", "laps", "laps_open_state", "straights", "classifier_cursor", "run_summary",
     "main_snapshot",
     "joulemeter", "steering", "rpm_front", "rpm_back", "gps", "motor", "local_planner",
 )

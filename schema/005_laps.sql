@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS laps (
     turn_count INTEGER NOT NULL,
     energy_wh REAL,
     avg_speed REAL,
+    duration_s REAL,
+    distance_m REAL,
+    efficiency_mi_per_kwh REAL,
     UNIQUE (run_id, lap_number)
 );
 
