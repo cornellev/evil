@@ -112,3 +112,19 @@ def test_skips_undecodable_or_non_json_payloads_without_crashing(tmp_path):
 
     assert len(samples) == 1
     assert samples[0].ts == 2.0
+
+
+def test_matches_topic_stored_with_leading_slash(tmp_path):
+    db3_path = str(tmp_path / "recording.db3")
+    conn = _make_db3(db3_path, topic_name="/spi_data")  # real bags store the slash
+    conn.execute(
+        "INSERT INTO messages (topic_id, timestamp, data) VALUES (1, 1000000000, ?)",
+        (_encode_std_msgs_string(json.dumps({"gps": {"lat": 1.0, "long": 2.0}})),),
+    )
+    conn.commit()
+    conn.close()
+
+    samples = _collect(RosbagFileSource(run_id="run-1", path=db3_path))
+
+    assert len(samples) == 1
+    assert samples[0].gps.lat == 1.0

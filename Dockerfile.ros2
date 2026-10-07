@@ -17,7 +17,7 @@ COPY schema/ schema/
 COPY src/ src/
 
 ENV PYTHONPATH=/app/src
-ENV EVIL_DB_PATH=/data/evil.db
+ENV EVIL_DB_PATH=/data/parsed/uc26/evil_uc26.db
 
 VOLUME ["/data"]
 

@@ -5,3 +5,7 @@ mcp>=2.2,<2.3
 fastapi>=0.141,<0.142
 uvicorn[standard]>=0.52,<0.53
 python-multipart>=0.0.20,<0.1
+
+# Worker/parser: metadata.yaml parsing and America/New_York run dates.
+pyyaml>=6,<7
+tzdata

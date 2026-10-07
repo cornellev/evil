@@ -16,6 +16,7 @@ def energy_wh(conn: sqlite3.Connection, run_id: str, start_seq: int, end_seq: in
         """SELECT ms.global_ts AS ts, j.voltage, j.current
            FROM main_snapshot ms JOIN joulemeter j ON j.id = ms.joulemeter_id
            WHERE ms.run_id = ? AND ms.seq > ? AND ms.seq <= ?
+             AND j.voltage IS NOT NULL AND j.current IS NOT NULL
            ORDER BY ms.seq""",
         (run_id, start_seq, end_seq),
     ).fetchall()

@@ -17,7 +17,7 @@ from evil.tools.list_laps import list_laps
 from evil.tools.list_runs import list_runs
 from evil.tools.list_straights import list_straights
 from evil.tools.list_turns import list_turns
-from evil.tools.nas_index import find_nas_files
+from evil.tools.catalog_tools import describe_recording, find_nas_files, list_recordings
 from evil.tools.read_only_sql import read_only_sql
 
 
@@ -52,9 +52,8 @@ class ToolRegistry:
         return self._by_name[name].handler(**arguments)
 
 
-def build_registry(conn: sqlite3.Connection) -> ToolRegistry:
-    return ToolRegistry(
-        [
+def build_registry(conn: sqlite3.Connection, catalog_conn: sqlite3.Connection | None = None) -> ToolRegistry:
+    tools = [
             ToolDef(
                 name="get_turn",
                 description=(
@@ -156,24 +155,6 @@ def build_registry(conn: sqlite3.Connection) -> ToolRegistry:
                 handler=lambda **kw: compare_laps(conn, **kw),
             ),
             ToolDef(
-                name="find_nas_files",
-                description=(
-                    "Find raw autonomy recordings (bag/video/lidar) on NAS for a run, optionally "
-                    "only those overlapping a time range (e.g. a turn's start/end time) to find "
-                    "the exact clip covering a moment."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "run_id": {"type": "string"},
-                        "start_ts": {"type": "number"},
-                        "end_ts": {"type": "number"},
-                    },
-                    "required": ["run_id"],
-                },
-                handler=lambda **kw: find_nas_files(conn, **kw),
-            ),
-            ToolDef(
                 name="read_only_sql",
                 description=(
                     "Run a single read-only SELECT against the EVIL database for questions "
@@ -187,5 +168,60 @@ def build_registry(conn: sqlite3.Connection) -> ToolRegistry:
                 },
                 handler=lambda **kw: read_only_sql(conn, **kw),
             ),
-        ]
-    )
+    ]
+    if catalog_conn is not None:
+        tools += _catalog_tools(catalog_conn)
+    return ToolRegistry(tools)
+
+
+def _catalog_tools(catalog_conn: sqlite3.Connection) -> list[ToolDef]:
+    return [
+        ToolDef(
+            name="find_nas_files",
+            description=(
+                "Find the stored raw recordings (bag/csv/video/lidar files) covering a run, "
+                "optionally only those overlapping a time range (e.g. a turn's start/end time) "
+                "to find the exact clip covering a moment."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string"},
+                    "start_ts": {"type": "number"},
+                    "end_ts": {"type": "number"},
+                },
+                "required": ["run_id"],
+            },
+            handler=lambda **kw: find_nas_files(catalog_conn, **kw),
+        ),
+        ToolDef(
+            name="list_recordings",
+            description=(
+                "List uploaded recordings, newest first, with date, category, car, location and "
+                "parse state. If several match, list them and ask which one is meant."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "since": {"type": "number"},
+                    "until": {"type": "number"},
+                    "category": {"type": "string"},
+                    "car": {"type": "string"},
+                    "parse_status": {"type": "string"},
+                    "limit": {"type": "integer"},
+                    "offset": {"type": "integer"},
+                },
+            },
+            handler=lambda **kw: list_recordings(catalog_conn, **kw),
+        ),
+        ToolDef(
+            name="describe_recording",
+            description="Everything the catalog knows about one recording: files, streams, time range, location, parse state.",
+            parameters={
+                "type": "object",
+                "properties": {"recording_id": {"type": "string"}},
+                "required": ["recording_id"],
+            },
+            handler=lambda **kw: describe_recording(catalog_conn, **kw),
+        ),
+    ]
