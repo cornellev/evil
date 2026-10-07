@@ -305,7 +305,8 @@ async def post_location(body: dict) -> dict:
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="send name, lat, lon, radius_m") from exc
     try:
-        location_id = await _with_catalog(lambda c, r: catalog.add_location(c, name, lat, lon, radius))
+        location_id = await _with_catalog(
+            lambda c, r: catalog.add_location(c, name, lat, lon, radius, body.get("default_category")))
     except catalog.CatalogError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"location_id": location_id, "name": name}

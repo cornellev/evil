@@ -161,7 +161,7 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None) -
         offset: int = 0,
     ) -> list[dict]:
         """List uploaded recordings, newest first (since/until are epoch seconds;
-        category is competition/testing/bench/sim/other). Returns every candidate
+        category is competition/testing/bench/sim/b_lot/other). Returns every candidate
         with its date, category, car, location and parse state so similar ones can
         be told apart; if several match, list them and ask which one is meant."""
         return await asyncio.to_thread(

@@ -230,3 +230,120 @@ def test_list_recordings_filters_and_orders_newest_first(conn, root):
     assert [r["recording_id"] for r in catalog.list_recordings(conn, since=1500)] == [b]
     assert [r["recording_id"] for r in catalog.list_recordings(conn, until=1500)] == [a]
     assert catalog.list_recordings(conn, parse_status="parsed") == []
+
+
+# ---- b_lot category, manual vs automatic category, location edits ---------
+
+def _gps_rec(conn, root, name=b"x", **fields):
+    rid = _store(conn, root, [("run.csv", name)], **fields).recording_id
+    with conn:
+        conn.execute("UPDATE recordings SET gps_min_lat=42.0, gps_max_lat=42.0, gps_min_lon=-76.0, gps_max_lon=-76.0 "
+                     "WHERE recording_id = ?", (rid,))
+    catalog.relabel_locations(conn)                 # what a parse does once the GPS box is known
+    return rid
+
+
+def test_b_lot_is_a_category(conn, root):
+    assert "b_lot" in catalog.CATEGORIES
+    rid = _store(conn, root, [("run.csv", b"x")], category="b_lot").recording_id
+    assert catalog.get_recording(conn, rid)["category"] == "b_lot"
+    with pytest.raises(catalog.CatalogError):
+        _store(conn, root, [("run2.csv", b"y")], category="blot")
+
+
+def test_an_older_catalog_gains_b_lot_without_losing_rows(tmp_path):
+    root = catalog.DataRoot(tmp_path / "data")
+    root.ensure()
+    old_sql = (catalog.CATALOG_SCHEMA_DIR / "001_catalog.sql").read_text().replace("'sim','b_lot','other'", "'sim','other'")
+    raw = sqlite3.connect(root.catalog_db)
+    raw.executescript(old_sql)
+    raw.execute("INSERT INTO recordings (recording_id, category, uploaded_at, content_sha256, label) "
+                "VALUES ('r1', 'testing', 1.0, 'h1', 'keep me')")
+    raw.execute("INSERT INTO recording_files VALUES ('f1', 'r1', 'csv', 'a.csv', 'nuc-local', 'p/a.csv', 3, 's')")
+    raw.commit()
+    raw.close()
+
+    conn = catalog.connect_catalog(root)                       # migrates
+    try:
+        assert "'b_lot'" in conn.execute("SELECT sql FROM sqlite_master WHERE name = 'recordings'").fetchone()[0]
+        row = conn.execute("SELECT * FROM recordings WHERE recording_id = 'r1'").fetchone()
+        assert (row["label"], row["category"]) == ("keep me", "testing")
+        assert conn.execute("SELECT COUNT(*) FROM recording_files").fetchone()[0] == 1
+        with conn:
+            conn.execute("UPDATE recordings SET category = 'b_lot' WHERE recording_id = 'r1'")        # now allowed
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'idx_recordings_uploaded'").fetchone()
+    finally:
+        conn.close()
+    again = catalog.connect_catalog(root)                       # second open: nothing to do, no error
+    assert again.execute("SELECT COUNT(*) FROM recordings").fetchone()[0] == 1
+    again.close()
+
+
+def test_a_location_with_a_default_category_labels_matching_recordings_as_auto(conn, root):
+    rid = _gps_rec(conn, root)
+    far = _store(conn, root, [("far.csv", b"z")]).recording_id
+    with conn:
+        conn.execute("UPDATE recordings SET gps_min_lat=10, gps_max_lat=10, gps_min_lon=10, gps_max_lon=10 WHERE recording_id=?", (far,))
+
+    catalog.add_location(conn, "IMS", 42.0, -76.0, 500, default_category="competition")
+
+    rec = catalog.get_recording(conn, rid)
+    assert (rec["category"], rec["category_method"]) == ("competition", "auto")
+    assert catalog.get_recording(conn, far)["category"] is None
+    with pytest.raises(catalog.CatalogError):
+        catalog.add_location(conn, "bad", 1, 1, 1, default_category="nope")
+
+
+def test_a_manual_category_is_never_overwritten_by_auto(conn, root):
+    rid = _gps_rec(conn, root, category="testing")             # chosen at upload: manual
+    catalog.add_location(conn, "IMS", 42.0, -76.0, 500, default_category="competition")
+    assert catalog.get_recording(conn, rid)["category"] == "testing"
+
+    other = _gps_rec(conn, root, name=b"o")
+    assert catalog.get_recording(conn, other)["category"] == "competition"
+    catalog.update_recording(conn, root, other, {"category": "bench"})                  # an edit locks it
+    catalog.add_location(conn, "IMS", 42.0, -76.0, 500, default_category="sim")         # default changes later
+    assert catalog.get_recording(conn, other)["category"] == "bench"
+    assert catalog.get_recording(conn, other)["category_method"] == "manual"
+
+
+def test_clearing_a_manual_category_hands_it_back_to_auto(conn, root):
+    catalog.add_location(conn, "IMS", 42.0, -76.0, 500, default_category="competition")
+    rid = _gps_rec(conn, root)
+    catalog.update_recording(conn, root, rid, {"category": "bench"})
+    assert catalog.get_recording(conn, rid)["category"] == "bench"
+
+    back = catalog.update_recording(conn, root, rid, {"category": ""})
+
+    assert (back["category"], back["category_method"]) == ("competition", "auto")
+
+
+def test_an_automatic_category_is_withdrawn_when_the_location_no_longer_matches(conn, root):
+    rid = _gps_rec(conn, root)
+    lid = catalog.add_location(conn, "IMS", 42.0, -76.0, 500, default_category="competition")
+    assert catalog.get_recording(conn, rid)["category"] == "competition"
+
+    catalog.add_location(conn, "IMS", 10.0, 10.0, 500, default_category="competition")   # location moved away
+
+    rec = catalog.get_recording(conn, rid)
+    assert rec["location_id"] is None and rec["category"] is None and rec["category_method"] is None
+
+
+def test_editing_the_location_locks_it_and_clearing_restores_the_gps_match(conn, root):
+    rid = _gps_rec(conn, root)
+    ims = catalog.add_location(conn, "IMS", 42.0, -76.0, 500, default_category="competition")
+    blot = catalog.add_location(conn, "B Lot", 1.0, 1.0, 50, default_category="b_lot")
+
+    moved = catalog.update_recording(conn, root, rid, {"location_id": blot})
+    assert (moved["location_id"], moved["location_method"], moved["category"]) == (blot, "manual", "b_lot")
+    catalog.add_location(conn, "IMS", 42.0, -76.0, 600, default_category="competition")   # relabel pass leaves it
+    assert catalog.get_recording(conn, rid)["location_id"] == blot
+
+    cleared = catalog.update_recording(conn, root, rid, {"location_id": None})
+    assert (cleared["location_id"], cleared["location_method"], cleared["category"]) == (ims, "gps-match", "competition")
+
+    with pytest.raises(catalog.CatalogError):
+        catalog.update_recording(conn, root, rid, {"location_id": 999})
+    with pytest.raises(catalog.CatalogError):
+        catalog.update_recording(conn, root, rid, {"location_id": "1"})
