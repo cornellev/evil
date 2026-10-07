@@ -268,6 +268,7 @@ def test_an_older_catalog_gains_b_lot_without_losing_rows(tmp_path):
         assert "'b_lot'" in conn.execute("SELECT sql FROM sqlite_master WHERE name = 'recordings'").fetchone()[0]
         row = conn.execute("SELECT * FROM recordings WHERE recording_id = 'r1'").fetchone()
         assert (row["label"], row["category"]) == ("keep me", "testing")
+        assert row["category_method"] == "manual"          # a category from before auto-labelling was chosen by a person
         assert conn.execute("SELECT COUNT(*) FROM recording_files").fetchone()[0] == 1
         with conn:
             conn.execute("UPDATE recordings SET category = 'b_lot' WHERE recording_id = 'r1'")        # now allowed

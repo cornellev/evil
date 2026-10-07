@@ -154,6 +154,9 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
         for name, decl in columns.items():
             if name not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                if (table, name) == ("recordings", "category_method"):
+                    # every category set before this column existed was chosen by a person
+                    conn.execute("UPDATE recordings SET category_method = 'manual' WHERE category IS NOT NULL")
 
 
 def connect_catalog(root: DataRoot) -> sqlite3.Connection:
