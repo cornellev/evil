@@ -111,7 +111,9 @@ src/evil/
     catalog_tools.py            list_recordings / describe_recording / find_nas_files over catalog.db (read-only)
     read_only_sql.py            constrained fallback: SELECT/WITH-only, row cap, step budget
     registry.py                 binds tools to a connection, Ollama-shaped schemas (used by tests)
-  mcp_server.py             exposes the tools above over MCP / Streamable HTTP
+  mcp_server.py             exposes the tools above over MCP / Streamable HTTP (:8765)
+  mcp_raw_server.py         separate server (:8767): query_recording_sql / catalog_sql
+  rawquery.py, rawquery_child.py   the sandbox those two tools run in
   upload_server.py          write-only HTTP: /recordings (catalog), /system/status, /locations, legacy /upload
   catalog.py                recording catalog: staging, dedup, manifests, jobs, backup, status
   parser.py, scan.py        container readers + strict schema match; the cheap level-1 scan

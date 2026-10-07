@@ -47,6 +47,31 @@ services:
     command: ["uvicorn", "evil.upload_server:app", "--host", "0.0.0.0", "--port", "8766"]
     restart: unless-stopped
 
+  # Free-form read-only SQL over stored recordings and the catalog, for power
+  # users and real agents (see mcp_raw_server.py). A separate service on its own
+  # port on purpose: tern-llm and evil-ui never connect to it, and a hostile or
+  # huge file can hang at most this container (memory/pid limits, read-only
+  # root filesystem). Queries also run in a sandboxed child process.
+  mcp-raw:
+    build: .
+    ports:
+      - "8767:8767"
+    environment:
+      EVIL_DATA_ROOT: /data
+      EVIL_RAW_PORT: "8767"
+    volumes:
+      - evil-data:/data
+    command: ["python", "-m", "evil.mcp_raw_server"]
+    mem_limit: 2g
+    pids_limit: 128
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
   worker:
     build: .
     environment:
