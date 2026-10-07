@@ -30,6 +30,8 @@ def test_registers_expected_tools_with_schemas(evil_db_path):
         "list_laps",
         "list_straights",
         "find_nas_files",
+        "list_recordings",
+        "describe_recording",
         "read_only_sql",
     }
 

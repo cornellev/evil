@@ -68,6 +68,7 @@ class LapsClassifier:
             """SELECT ms.seq, ms.global_ts, g.lat, g.lon
                FROM main_snapshot ms JOIN gps g ON g.id = ms.gps_id
                WHERE ms.run_id = ? AND ms.seq > ? AND ms.seq <= ?
+                 AND g.lat IS NOT NULL AND g.lon IS NOT NULL   -- ticks with no GPS fix are skipped
                ORDER BY ms.seq""",
             (run_id, since_seq, until_seq),
         ).fetchall()

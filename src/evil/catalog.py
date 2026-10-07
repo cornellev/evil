@@ -84,11 +84,49 @@ class DataRoot:
             d.mkdir(parents=True, exist_ok=True)
 
 
+def parsed_db_path(root: DataRoot, car: str | None) -> Path:
+    """Where a car's parsed database lives: parsed/<car>/evil_<car>.db."""
+    car = sanitize_relpath(car or "uc26").replace("/", "_")
+    return root.path / "parsed" / car / f"evil_{car}.db"
+
+
+def ensure_parsed_db(root: DataRoot, car: str | None = None) -> Path:
+    """Create the car's parsed DB with the current schema if it is missing, so
+    the read-only MCP server always has a database to open (it never creates one).
+    Reference data (track_geometry, start_finish_line) is NOT created here: load it
+    with evil.scripts.seed_reference_data / migrate_reference_data."""
+    from evil import db
+
+    path = parsed_db_path(root, car)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = db.connect(str(path))
+    try:
+        db.apply_schema(conn)
+    finally:
+        conn.close()
+    return path
+
+
 def data_root_from_env() -> DataRoot:
     explicit = os.getenv("EVIL_DATA_ROOT")
     if explicit:
         return DataRoot(Path(explicit))
     return DataRoot(Path(os.getenv("EVIL_DB_PATH", "evil.db")).resolve().parent)
+
+
+# Columns added after a catalog.db may already exist (CREATE TABLE IF NOT EXISTS
+# does not add them). Idempotent.
+_ADDED_COLUMNS = {
+    "recordings": {"parse_stats_json": "TEXT"},
+}
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    for table, columns in _ADDED_COLUMNS.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns.items():
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 def connect_catalog(root: DataRoot) -> sqlite3.Connection:
@@ -99,7 +137,18 @@ def connect_catalog(root: DataRoot) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     for sql_file in sorted(CATALOG_SCHEMA_DIR.glob("*.sql")):
         conn.executescript(sql_file.read_text())
+    _ensure_columns(conn)
     conn.commit()
+    return conn
+
+
+def connect_catalog_readonly(path: str | Path) -> sqlite3.Connection | None:
+    """Read-only handle for the MCP server (it never creates or writes the
+    catalog). None if the catalog does not exist yet."""
+    if not Path(path).exists():
+        return None
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    conn.row_factory = sqlite3.Row
     return conn
 
 
@@ -305,6 +354,20 @@ def _raw_dir(root: DataRoot, source: str, car: str | None, uploaded_at: float, r
     return root.raw / source / car_part.replace("/", "_") / f"{when:%Y}" / f"{when:%Y-%m-%d}" / recording_id
 
 
+def enqueue_job(conn: sqlite3.Connection, recording_id: str, kind: str, lane: str, max_attempts: int = 2) -> int:
+    """Add a pending job (the caller owns the transaction)."""
+    return conn.execute(
+        "INSERT INTO jobs (recording_id, kind, lane, created_at, max_attempts) VALUES (?, ?, ?, ?, ?)",
+        (recording_id, kind, lane, time.time(), max_attempts),
+    ).lastrowid
+
+
+def enqueue_ingest_jobs(conn: sqlite3.Connection, recording_id: str) -> None:
+    """The cheap scan runs first on the fast lane; the parse is a deep-lane job."""
+    enqueue_job(conn, recording_id, "scan", "fast")
+    enqueue_job(conn, recording_id, "parse", "deep")
+
+
 def _insert_recording(conn: sqlite3.Connection, rec: dict, files: list[dict], root: DataRoot, final_dir: Path) -> None:
     rel_dir = final_dir.relative_to(root.raw).as_posix()
     with conn:
@@ -323,6 +386,7 @@ def _insert_recording(conn: sqlite3.Connection, rec: dict, files: list[dict], ro
                 (new_id(), rec["recording_id"], f["role"], f["original_name"],
                  f"{rel_dir}/{f['rel_path']}", f["size_bytes"], f["sha256"]),
             )
+        enqueue_ingest_jobs(conn, rec["recording_id"])
 
 
 def commit(conn: sqlite3.Connection, root: DataRoot, staging: Staging, fields: UploadFields,
@@ -537,3 +601,117 @@ def backup_catalog(conn: sqlite3.Connection, root: DataRoot, keep: int = BACKUPS
     for old in sorted(root.backup.glob("catalog-*.db"))[:-keep]:
         old.unlink(missing_ok=True)
     return created
+
+
+# ---- reparse, locations, status ------------------------------------------
+
+def request_reparse(conn: sqlite3.Connection, recording_id: str, rescan: bool = False) -> int | None:
+    """Queue a parse (and optionally a fresh scan) for an already-stored recording.
+    Returns the parse job id, or None if the recording does not exist. A parse
+    already waiting or running is reused instead of queued twice."""
+    if conn.execute("SELECT 1 FROM recordings WHERE recording_id = ?", (recording_id,)).fetchone() is None:
+        return None
+    with conn:
+        if rescan:
+            enqueue_job(conn, recording_id, "scan", "fast")
+        existing = conn.execute(
+            "SELECT job_id FROM jobs WHERE recording_id = ? AND kind = 'parse' AND status IN ('pending','running')",
+            (recording_id,)).fetchone()
+        if existing:
+            return existing["job_id"]
+        conn.execute("UPDATE recordings SET parse_status = 'pending', parse_error = NULL WHERE recording_id = ?",
+                     (recording_id,))
+        return enqueue_job(conn, recording_id, "parse", "deep")
+
+
+def add_location(conn: sqlite3.Connection, name: str, lat: float, lon: float, radius_m: float) -> int:
+    """Create or update a named location (by name), then relabel recordings."""
+    name = (name or "").strip()
+    if not name:
+        raise CatalogError("name is required")
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise CatalogError("lat/lon out of range")
+    if radius_m <= 0:
+        raise CatalogError("radius_m must be positive")
+    with conn:
+        conn.execute(
+            """INSERT INTO named_locations (name, center_lat, center_lon, radius_m) VALUES (?, ?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET center_lat = excluded.center_lat,
+                   center_lon = excluded.center_lon, radius_m = excluded.radius_m""",
+            (name, lat, lon, radius_m))
+    relabel_locations(conn)
+    return conn.execute("SELECT location_id FROM named_locations WHERE name = ?", (name,)).fetchone()["location_id"]
+
+
+def relabel_locations(conn: sqlite3.Connection) -> int:
+    """Re-match every recording that has a GPS box and no manual label against the
+    current named locations (cheap: no file is opened). Returns how many changed."""
+    from evil.geo import haversine_m
+
+    locations = conn.execute("SELECT * FROM named_locations").fetchall()
+    changed = 0
+    with conn:
+        for rec in conn.execute(
+            """SELECT recording_id, location_id, gps_min_lat, gps_max_lat, gps_min_lon, gps_max_lon FROM recordings
+               WHERE gps_min_lat IS NOT NULL AND COALESCE(location_method, '') != 'manual'""").fetchall():
+            lat = (rec["gps_min_lat"] + rec["gps_max_lat"]) / 2
+            lon = (rec["gps_min_lon"] + rec["gps_max_lon"]) / 2
+            best, best_d = None, float("inf")
+            for loc in locations:
+                d = haversine_m(lat, lon, loc["center_lat"], loc["center_lon"])
+                if d <= loc["radius_m"] and d < best_d:
+                    best, best_d = loc["location_id"], d
+            if best != rec["location_id"]:
+                conn.execute("UPDATE recordings SET location_id = ?, location_method = ? WHERE recording_id = ?",
+                             (best, "gps-match" if best is not None else None, rec["recording_id"]))
+                changed += 1
+    return changed
+
+
+def list_locations(conn: sqlite3.Connection) -> list[dict]:
+    return [dict(r) for r in conn.execute("SELECT * FROM named_locations ORDER BY name")]
+
+
+def _meminfo() -> dict[str, int]:
+    info: dict[str, int] = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                info[key] = int(rest.split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return info
+
+
+def system_status(conn: sqlite3.Connection, root: DataRoot, recent: int = 25) -> dict:
+    """What the status panel shows: the job queue plus CPU/memory/disk."""
+    counts = {r["status"]: r["n"] for r in conn.execute("SELECT status, COUNT(*) n FROM jobs GROUP BY status")}
+    queue = [dict(r) for r in conn.execute(
+        """SELECT j.job_id, j.recording_id, j.kind, j.lane, j.status, j.attempts, j.max_attempts, j.progress,
+                  j.error, j.created_at, j.started_at, j.finished_at,
+                  COALESCE(r.label, r.original_name, r.recording_id) AS name, r.total_bytes AS size_bytes
+           FROM jobs j JOIN recordings r ON r.recording_id = j.recording_id
+           ORDER BY CASE j.status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+                    COALESCE(j.finished_at, j.created_at) DESC, j.job_id DESC
+           LIMIT ?""", (recent,))]
+    oldest = conn.execute("SELECT MIN(created_at) m FROM jobs WHERE status = 'pending'").fetchone()["m"]
+    mem = _meminfo()
+    try:
+        disk = shutil.disk_usage(root.path)
+        disk_info = {"total_bytes": disk.total, "free_bytes": disk.free}
+    except OSError:
+        disk_info = {"total_bytes": None, "free_bytes": None}
+    try:
+        load = os.getloadavg()
+    except OSError:
+        load = (None, None, None)
+    raw_bytes = conn.execute("SELECT COALESCE(SUM(total_bytes), 0) b FROM recordings").fetchone()["b"]
+    return {
+        "jobs": {"counts": {k: counts.get(k, 0) for k in ("pending", "running", "done", "failed")},
+                 "oldest_pending_age_sec": (time.time() - oldest) if oldest else None, "queue": queue},
+        "system": {"cpu_count": os.cpu_count(), "load_avg": list(load),
+                   "mem_total_bytes": mem.get("MemTotal"), "mem_available_bytes": mem.get("MemAvailable"),
+                   "disk": disk_info, "recordings_bytes": raw_bytes},
+        "time": time.time(),
+    }

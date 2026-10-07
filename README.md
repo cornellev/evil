@@ -30,19 +30,24 @@ docker compose --profile live up
 # Or, offline / after a race: bulk-load a recorded session instead of step 3.
 docker compose run --rm mcp-server python -m evil.scripts.ingest_recording <recording.csv-or-.db3> <run-id>
 
-# And separately: register a NAS recording against a run, so a derived row
-# can be joined back to the exact clip that covers it (find_nas_files).
-docker compose run --rm mcp-server python -m evil.scripts.register_nas_file <run-id> <path-on-nas> <kind> <start-ts> <end-ts>
-
-# Or upload a recording from a UI: `upload` (also started by the bare
-# `docker compose up` above) exposes a write-only HTTP endpoint on :8766,
-# kept off the mcp-server port on purpose -- evil-ui's backend proxies to
-# this, or POST directly: curl -F run_id=<id> -F file=@recording.db3 http://<host>:8766/upload
+# Recordings: `upload` (also started by the bare `docker compose up`) stores
+# every upload RAW and cataloged on :8766 and returns once it is stored; the
+# `worker` service then scans and parses it off the catalog's job queue.
+# evil-ui's backend proxies to it, or POST directly:
+#   curl -F files=@recording.db3 -F category=testing http://<host>:8766/recordings
+# (several -F files=@... for a rosbag folder: .db3 + metadata.yaml). Any file is
+# accepted, even unreadable ones; see recording-catalog-design.md.
+#
+# Moving an existing deployment to the catalog layout (once): the parsed DB is a
+# fresh file, so copy the reference data (turn geometry, start/finish) across:
+docker compose run --rm mcp-server python -m evil.scripts.migrate_reference_data \
+    --from /data/evil.db --to /data/parsed/uc26/evil_uc26.db
 ```
 
 All of the above share the same `evil-data` volume (see `docker-compose.yml`),
-so the CLI commands and the running `mcp-server`/`upload` services see the
-same database.
+so the CLI commands and the running `mcp-server`/`upload`/`worker` services see the
+same data: `catalog.db` (recordings + job queue), `raw/` (originals) and
+`parsed/uc26/evil_uc26.db` (what the MCP tools read).
 
 `live-compiler` builds from `Dockerfile.ros2` (`ros:humble-ros-base`), not
 this repo's default `Dockerfile` -- `mcp-server`/`upload` stay on the lighter
@@ -103,15 +108,19 @@ src/evil/
     turn_name_matching.py       digit-normalized fallback so "3" also resolves to "Turn 3"
     list_runs.py, list_turns.py, list_laps.py, list_straights.py
                                  browsing-shaped (paginated, no lookup needed) -- for evil-ui
-    nas_index.py                register_nas_file() (write, CLI-only) + find_nas_files() (read, MCP tool)
+    catalog_tools.py            list_recordings / describe_recording / find_nas_files over catalog.db (read-only)
     read_only_sql.py            constrained fallback: SELECT/WITH-only, row cap, step budget
     registry.py                 binds tools to a connection, Ollama-shaped schemas (used by tests)
   mcp_server.py             exposes the tools above over MCP / Streamable HTTP
-  upload_server.py          write-only HTTP /upload -- separate from mcp_server.py on purpose
+  upload_server.py          write-only HTTP: /recordings (catalog), /system/status, /locations, legacy /upload
+  catalog.py                recording catalog: staging, dedup, manifests, jobs, backup, status
+  parser.py, scan.py        container readers + strict schema match; the cheap level-1 scan
+  schemas/telemetry_v1.py   the strict evil.telemetry.v1 payload definition
+  worker.py, parse_job.py   job queue worker (fast/deep lanes) and the isolated parse subprocess
   scripts/
     seed_reference_data.py  load track_geometry / start_finish_line rows
     ingest_recording.py     bulk-load a recorded CSV or rosbag .db3 as historical data
-    register_nas_file.py    register one NAS recording against a run
+    migrate_reference_data.py  copy track geometry into the new parsed DB
     run_live_compiler.py    the production entry point: live Ros2Source + ALL_CLASSIFIERS
 tests/                  pytest, one file per module above
 tests/e2e/              bash scripts exercising the real running server, see below
@@ -163,8 +172,8 @@ SQLite's WAL mode (already set in `db.connect()`) lets any number of
 readers proceed alongside the single ingestion writer without blocking
 each other.
 
-Writes never go through MCP -- `register_nas_file` and bulk ingestion are
-CLI-only, same reasoning as why `read_only_sql` is generic-but-read-only:
+Writes never go through MCP -- uploads, the worker and bulk ingestion are
+separate processes, same reasoning as why `read_only_sql` is generic-but-read-only:
 a bad write is a categorically worse failure than a bad read.
 
 ## Running tests
@@ -224,10 +233,11 @@ being asked for.
   yet -- it needs ROS2 Humble on a matching Ubuntu 22.04 environment,
   see `mock-daq/README.md` for why (Humble targets Jammy, not this dev
   machine's Noble).
-- A watcher that calls `register_nas_file` automatically once
-  `tailscale-ros-telemetry`'s rosbag service finishes a recording -- the
-  write path exists and is tested, but nothing triggers it yet besides a
-  human (or `RaceEngineerDashboard`) running the CLI by hand.
+- A watcher that uploads (or registers) `tailscale-ros-telemetry`'s rosbag
+  recordings automatically when they finish -- today a human uploads them.
+- `evil.telemetry.v2` (the later payload shape: `errcount`, `duty_cycle`):
+  deferred, such recordings are stored and `skipped`. Autonomy planner data and
+  the Zenoh recording format also wait for real samples.
 - Deploying this server to `cev-nuc` and confirming a client elsewhere on
   the tailnet can reach it -- verified here over this dev machine's own
   tailnet interface only.

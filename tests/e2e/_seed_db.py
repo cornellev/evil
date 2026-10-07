@@ -38,9 +38,6 @@ conn.executemany(
         ("run-1", 2, 20, 44, 20.0, 42.0, 1, 4.5, 9.0),
     ],
 )
-conn.execute(
-    "INSERT INTO nas_index (run_id, path, kind, start_ts, end_ts) VALUES ('run-1', '/nas/run-1.bag', 'rosbag', 0.0, 42.0)"
-)
 conn.commit()
 conn.close()
 print(path)

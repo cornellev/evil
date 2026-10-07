@@ -58,6 +58,7 @@ def _root() -> catalog.DataRoot:
 def _run_maintenance(root: catalog.DataRoot) -> None:
     conn = catalog.connect_catalog(root)
     try:
+        catalog.ensure_parsed_db(root)
         swept = catalog.sweep_incoming(root)
         adopted = catalog.reconcile(conn, root)
         catalog.backup_catalog(conn, root)
@@ -258,3 +259,53 @@ async def patch_recording(recording_id: str, changes: dict) -> dict:
         raise HTTPException(status_code=404, detail="recording not found") from exc
     except catalog.CatalogError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ---- reparse, status, locations -----------------------------------------
+
+async def _with_catalog(fn):
+    root = _root()
+
+    def run():
+        conn = catalog.connect_catalog(root)
+        try:
+            return fn(conn, root)
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(run)
+
+
+@app.post("/recordings/{recording_id}/reparse", status_code=202)
+async def reparse_recording(recording_id: str, rescan: bool = False) -> dict:
+    """Queue a fresh parse (optionally a fresh scan first) of a stored recording.
+    Idempotent: a parse already queued or running is reused."""
+    job_id = await _with_catalog(lambda c, r: catalog.request_reparse(c, recording_id, rescan=rescan))
+    if job_id is None:
+        raise HTTPException(status_code=404, detail="recording not found")
+    return {"recording_id": recording_id, "job_id": job_id, "status": "queued"}
+
+
+@app.get("/system/status")
+async def system_status() -> dict:
+    """The upload page's status panel: job queue plus CPU, memory and disk."""
+    return await _with_catalog(lambda c, r: catalog.system_status(c, r))
+
+
+@app.get("/locations")
+async def get_locations() -> list[dict]:
+    return await _with_catalog(lambda c, r: catalog.list_locations(c))
+
+
+@app.post("/locations", status_code=201)
+async def post_location(body: dict) -> dict:
+    """Create or update a named location (circle) and relabel recordings against it."""
+    try:
+        name, lat, lon, radius = body["name"], float(body["lat"]), float(body["lon"]), float(body["radius_m"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="send name, lat, lon, radius_m") from exc
+    try:
+        location_id = await _with_catalog(lambda c, r: catalog.add_location(c, name, lat, lon, radius))
+    except catalog.CatalogError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"location_id": location_id, "name": name}
