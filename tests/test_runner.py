@@ -22,7 +22,7 @@ class RaisingClassifier:
 
     def run(self, conn, run_id, since_seq, until_seq):
         conn.execute(
-            "INSERT INTO turns_open_state (run_id, turn_def_id, start_seq, start_ts) VALUES ('run-1', 1, 1, 1.0)"
+            "INSERT INTO segments_open_state (run_id, ordinal) VALUES ('run-1', 0)"
         )
         raise RuntimeError("boom")
 
@@ -89,10 +89,6 @@ def test_missing_dependency_raises_a_clear_error_not_a_bare_keyerror(conn):
 
 def test_failed_classifier_run_does_not_advance_cursor(conn):
     _ingest_n(conn, "run-1", 5, start_ts=0.0, step=1.0)
-    conn.execute(
-        "INSERT INTO track_geometry (turn_name, center_lat, center_lon, radius_m) VALUES ('T1', 0, 0, 10)"
-    )
-    conn.commit()
     classifier = RaisingClassifier()
 
     with pytest.raises(RuntimeError):
@@ -100,4 +96,4 @@ def test_failed_classifier_run_does_not_advance_cursor(conn):
 
     assert get_cursor(conn, "run-1", "boom", 1) == 0
     # the write inside the failed transaction must be rolled back, not just the cursor
-    assert conn.execute("SELECT COUNT(*) AS n FROM turns_open_state").fetchone()["n"] == 0
+    assert conn.execute("SELECT COUNT(*) AS n FROM segments_open_state").fetchone()["n"] == 0

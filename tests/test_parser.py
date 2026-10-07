@@ -44,8 +44,8 @@ def _seed_turn(root, car="uc26"):
     path.parent.mkdir(parents=True, exist_ok=True)
     c = db.connect(str(path))
     db.apply_schema(c)
-    c.execute("INSERT INTO track_geometry (turn_name, center_lat, center_lon, radius_m) VALUES ('Turn 3', 42.0, -76.0, 50)")
-    c.commit()
+    from track_fixtures import seed_line
+    seed_line(c, turn_from_x=-50.0, turn_to_x=50.0)        # a turn 100 m long (east of lat 42, lon -76), then a straight
     c.close()
     return path
 
@@ -303,19 +303,23 @@ def test_run_ids_are_unique_per_recording(tmp_path, root, cat):
 
 
 def test_classifiers_run_and_skip_ticks_without_a_gps_fix(tmp_path, root, cat):
+    from track_fixtures import ll
     _seed_turn(root)
-    # inside the turn circle, then no-fix ticks, then outside: the no-fix ticks must not end the turn
-    msgs = []
-    for i, lat in enumerate([42.0, 42.0, None, None, 42.0, 42.01, 42.01]):
-        msgs.append((T0 + i, payload(seq=2 + 2 * i, lat=lat)))
+    # outside, inside the turn, two no-fix ticks, then through and out the far side: the no-fix ticks must not end the turn
+    lons = [ll(-100, 0)[1], ll(-25, 0)[1], None, None, ll(0, 0)[1], ll(75, 0)[1], ll(75, 0)[1]]
+    msgs = [(T0 + i, payload(seq=2 + 2 * i, lat=None if lon is None else 42.0, lon=-76.0 if lon is None else lon))
+            for i, lon in enumerate(lons)]
     rid = _upload(cat, root, {"b.db3": _bag(tmp_path, msgs)})
 
     r = parser.parse_recording(root, rid)
 
     p = _parsed(root)
-    turns = p.execute("SELECT start_ts, end_ts FROM turns WHERE run_id = ?", (r.run_id,)).fetchall()
-    assert len(turns) == 1
-    assert turns[0]["start_ts"] == pytest.approx(T0) and turns[0]["end_ts"] == pytest.approx(T0 + 5)
+    turns = p.execute("SELECT t.*, s.name FROM turns t JOIN track_segments s ON s.segment_id = t.turn_def_id "
+                      "WHERE t.run_id = ?", (r.run_id,)).fetchall()
+    assert [t["name"] for t in turns] == ["Turn 1"]
+    assert turns[0]["start_seq"] < turns[0]["end_seq"] and turns[0]["duration_s"] > 0
+    summary = p.execute("SELECT * FROM run_summary WHERE run_id = ?", (r.run_id,)).fetchone()
+    assert summary is not None and summary["energy_wh"] is not None       # whole-run totals are stored after a parse
 
 
 def test_location_label_and_gps_box_come_from_the_parsed_gps(tmp_path, root, cat):

@@ -33,6 +33,7 @@ def test_list_runs_returns_every_run_with_counts_and_range(evil_db_path):
     assert runs[0]["sample_count"] == 2
     assert runs[0]["start_ts"] == 0.0
     assert runs[0]["end_ts"] == 5.0
+    assert runs[0]["efficiency_mi_per_kwh"] is None            # no summary yet for a run that was never classified
 
 
 def test_list_runs_empty_db_returns_empty_list(conn):
@@ -47,6 +48,9 @@ def test_list_turns_paginates(readonly_conn):
     second_page = list_turns(readonly_conn, run_id="run-1", limit=1, offset=1)
     assert len(second_page["turns"]) == 1
     assert first_page["turns"][0]["turn_id"] != second_page["turns"][0]["turn_id"]
+    t = first_page["turns"][0]
+    assert t["turn_name"] == "Turn 3" and t["name"] == "Turn 3"
+    assert t["duration_s"] == 2.0 and t["distance_m"] == 14.0 and t["energy_wh"] == 0.5 and t["efficiency_mi_per_kwh"] == 17.4
 
 
 def test_list_turns_unknown_run_returns_empty(readonly_conn):
@@ -63,8 +67,8 @@ def test_list_laps_and_list_straights_shape(evil_db_path):
         "VALUES ('run-1', 1, 1, 10, 0.0, 10.0, 2)"
     )
     conn.execute(
-        "INSERT INTO straights (run_id, start_seq, end_seq, start_ts, end_ts) "
-        "VALUES ('run-1', 10, 20, 10.0, 20.0)"
+        "INSERT INTO straights (run_id, segment_id, start_seq, end_seq, start_ts, end_ts, distance_m, energy_wh, "
+        "efficiency_mi_per_kwh) VALUES ('run-1', 2, 10, 20, 10.0, 20.0, 600.0, 5.0, 74.5)"
     )
     conn.commit()
     conn.close()
@@ -78,5 +82,8 @@ def test_list_laps_and_list_straights_shape(evil_db_path):
         straights_result = list_straights(readonly, run_id="run-1")
         assert straights_result["total"] == 1
         assert straights_result["straights"][0]["start_seq"] == 10
+        assert straights_result["straights"][0]["name"] == "Straight 6-7"       # straights are named like turns
+        assert straights_result["straights"][0]["duration_s"] == 10.0            # falls back to end - start
+        assert straights_result["straights"][0]["efficiency_mi_per_kwh"] == 74.5
     finally:
         readonly.close()

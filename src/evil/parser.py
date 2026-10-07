@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from evil import catalog, db
+from evil.classifiers import metrics as run_metrics
 from evil.classifiers.runner import tick
 from evil.geo import haversine_m
 from evil.ingest import insert_sample
@@ -444,6 +445,7 @@ def _parse(cat, root, rec, files, progress, parsed_db_path) -> ParseResult:
         if progress:
             progress(0.97)
         tick(parsed, run_id, ALL_CLASSIFIERS, now_ts=last_ts + 3600.0)
+        run_metrics.store_run_summary(parsed, run_id)
         gps = _gps_summary(parsed, run_id)
     except BaseException:
         parsed.rollback()

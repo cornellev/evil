@@ -37,7 +37,8 @@ async def _one_list_runs(i: int) -> tuple[int, bool, str]:
             result = await session.call_tool("list_runs", {})
             structured = (result.structured_content or {}).get("result")
             ok = not result.is_error and structured == [
-                {"run_id": "run-1", "sample_count": 2, "start_ts": 0.0, "end_ts": 42.0}
+                {"run_id": "run-1", "sample_count": 2, "start_ts": 0.0, "end_ts": 42.0,
+                 "distance_m": None, "energy_wh": None, "efficiency_mi_per_kwh": None}
             ]
             return i, ok, str(structured)
 
