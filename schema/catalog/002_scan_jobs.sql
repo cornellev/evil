@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     job_id          INTEGER PRIMARY KEY AUTOINCREMENT,
     recording_id    TEXT NOT NULL REFERENCES recordings(recording_id),
     kind            TEXT NOT NULL,               -- 'scan' | 'parse' | 'cache_build' | 'repair'
-    lane            TEXT NOT NULL DEFAULT 'deep' CHECK (lane IN ('fast','deep')),
+    lane            TEXT NOT NULL DEFAULT 'deep' CHECK (lane IN ('fast','deep','cache')),
     status          TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending','running','done','failed')),
     attempts        INTEGER NOT NULL DEFAULT 0,
@@ -39,3 +39,16 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(lane, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_recording ON jobs(recording_id);
+
+-- CAT's derived cache (Phase 4): CAT's Postgres holds decoded messages for a recording
+-- while someone is using it; this table is the bookkeeping that decides when to drop them.
+-- Presence of a row means "ready". Rebuilt on demand, never a source of truth.
+CREATE TABLE IF NOT EXISTS cache_entries (
+    recording_id    TEXT PRIMARY KEY REFERENCES recordings(recording_id),
+    built_at        REAL NOT NULL,
+    last_access_at  REAL NOT NULL,
+    size_bytes      INTEGER NOT NULL DEFAULT 0,
+    messages        INTEGER,
+    detail_json     TEXT                         -- topics, which ones were stored undecoded
+);
+CREATE INDEX IF NOT EXISTS idx_cache_entries_access ON cache_entries(last_access_at);

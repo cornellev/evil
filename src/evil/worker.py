@@ -17,6 +17,7 @@ Run with `python -m evil.worker` (docker-compose's `worker` service).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -32,11 +33,14 @@ from evil import catalog, scan
 
 log = logging.getLogger("evil.worker")
 
-LANE_KINDS = {"fast": ("scan",), "deep": ("parse",)}
+LANE_KINDS = {"fast": ("scan",), "deep": ("parse",), "cache": ("cache_build",)}
 HEARTBEAT_SEC = 5.0
 STALE_AFTER_SEC = 60.0
 POLL_SEC = 1.0
 PARSE_TIMEOUT_SEC = float(os.getenv("EVIL_PARSE_TIMEOUT_SEC", str(2 * 3600)))
+CACHE_BUILD_TIMEOUT_SEC = float(os.getenv("EVIL_CACHE_BUILD_TIMEOUT_SEC", str(2 * 3600)))
+EVICTION_INTERVAL_SEC = 3600.0
+CONNECT_TIMEOUT_SEC = 5.0
 
 
 @dataclass
@@ -139,13 +143,127 @@ def default_parse_command(root: catalog.DataRoot, recording_id: str) -> list[str
 
 class Worker:
     def __init__(self, root: catalog.DataRoot, *, parse_timeout: float = PARSE_TIMEOUT_SEC,
-                 heartbeat_sec: float = HEARTBEAT_SEC,
+                 heartbeat_sec: float = HEARTBEAT_SEC, cat_url: str | None = None,
+                 cache_timeout: float = CACHE_BUILD_TIMEOUT_SEC,
                  parse_command: Callable[[catalog.DataRoot, str], Sequence[str]] = default_parse_command):
         self.root = root
         self.parse_timeout = parse_timeout
         self.heartbeat_sec = heartbeat_sec
+        self._cat_url = cat_url
+        self.cache_timeout = cache_timeout
         self.parse_command = parse_command
         self.stop = threading.Event()
+
+    # -- CAT cache ----------------------------------------------------------
+    @property
+    def cat_url(self) -> str | None:
+        url = self._cat_url if self._cat_url is not None else os.getenv("EVIL_CAT_PYWORKER_URL", "")
+        return url.rstrip("/") or None
+
+    def _cat_call(self, method: str, path: str, body: dict | None = None, timeout: float = 30.0) -> dict:
+        """JSON call to CAT's pyworker. `timeout` bounds the wait for the RESPONSE (a build can take
+        hours); connecting always gives up after CONNECT_TIMEOUT_SEC so a dead address fails fast.
+        Raises RuntimeError with a readable message."""
+        import http.client
+        from urllib.parse import urlsplit
+
+        if not self.cat_url:
+            raise RuntimeError("EVIL_CAT_PYWORKER_URL is not set; CAT's cache builder is unreachable")
+        parts = urlsplit(self.cat_url)
+        data = json.dumps(body).encode() if body is not None else None
+        conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=CONNECT_TIMEOUT_SEC)
+        try:
+            conn.connect()
+            conn.sock.settimeout(timeout)
+            conn.request(method, (parts.path.rstrip("/") + path), body=data,
+                         headers={"Content-Type": "application/json"} if data else {})
+            resp = conn.getresponse()
+            raw = resp.read().decode(errors="replace") or "{}"
+            status = resp.status
+        except (OSError, http.client.HTTPException) as exc:
+            raise RuntimeError(f"CAT pyworker unreachable or timed out ({exc})") from exc
+        finally:
+            conn.close()
+        if status >= 400:
+            detail = raw[:500]
+            try:
+                detail = json.loads(raw).get("detail", detail)
+            except (ValueError, AttributeError):
+                pass
+            raise RuntimeError(f"CAT pyworker {method} {path} -> {status}: {detail}")
+        return json.loads(raw)
+
+    def _run_cache_build(self, job: Job) -> str | None:
+        """Ask CAT's pyworker to decode this recording into CAT's database. It reads the raw files
+        itself from the shared read-only volume; we send relative paths only. While it works, a
+        heartbeat thread keeps the job alive and mirrors the pyworker's progress."""
+        cat = catalog.connect_catalog(self.root)
+        try:
+            rec = catalog.get_recording(cat, job.recording_id)
+            if rec is None:
+                return "recording no longer exists"
+            kind = catalog.cache_kind(rec["container"])
+            if kind is None:
+                return f"container {rec['container']!r} cannot be opened in CAT"
+            files = [f["rel_path"] for f in rec["files"] if f["role"] in ("db3", "metadata", "csv")]
+        finally:
+            cat.close()
+
+        stop = threading.Event()
+
+        def beat() -> None:
+            c = catalog.connect_catalog(self.root)
+            try:
+                while not stop.wait(self.heartbeat_sec):
+                    progress = None
+                    try:
+                        progress = self._cat_call("GET", f"/cache/progress/{job.recording_id}", timeout=5).get("fraction")
+                    except RuntimeError:
+                        pass
+                    _heartbeat(c, job.job_id, progress)
+            finally:
+                c.close()
+
+        beater = threading.Thread(target=beat, daemon=True)
+        beater.start()
+        try:
+            result = self._cat_call("POST", "/cache/build", {"recording_id": job.recording_id, "kind": kind,
+                                                            "files": files, "name": rec["label"] or rec["original_name"]},
+                                    timeout=self.cache_timeout)
+        except RuntimeError as exc:
+            return str(exc)
+        finally:
+            stop.set()
+            beater.join(timeout=2)
+        c = catalog.connect_catalog(self.root)
+        try:
+            catalog.record_cache_built(c, job.recording_id, result.get("bytes", 0), result.get("messages"),
+                                       {"topics": result.get("topics", []), "opaque_topics": result.get("opaque_topics", []),
+                                        "kind": kind})
+        finally:
+            c.close()
+        return None
+
+    def evict_cache(self, now: float | None = None) -> list[str]:
+        """Drop CAT cache entries that are idle past the max age or over the size cap (LRU). An entry is
+        only forgotten after CAT confirmed deleting its rows; if CAT is down it stays for the next sweep."""
+        cat = catalog.connect_catalog(self.root)
+        evicted: list[str] = []
+        try:
+            for rid in catalog.plan_eviction(cat, now=now):
+                kind = catalog.cache_kind((catalog.get_recording(cat, rid) or {}).get("container", ""))
+                try:
+                    self._cat_call("DELETE", f"/cache/{rid}?kind={kind or 'bag'}", timeout=120)
+                except RuntimeError as exc:
+                    log.warning("cache eviction of %s postponed: %s", rid, exc)
+                    continue
+                catalog.drop_cache_entry(cat, rid)
+                evicted.append(rid)
+        finally:
+            cat.close()
+        if evicted:
+            log.info("evicted %d CAT cache entries", len(evicted))
+        return evicted
 
     # -- one job ----------------------------------------------------------
     def _run_scan(self, job: Job) -> str | None:
@@ -213,7 +331,12 @@ class Worker:
         return None
 
     def run_job(self, cat, job: Job) -> None:
-        error = self._run_scan(job) if job.kind == "scan" else self._run_parse(cat, job)
+        if job.kind == "scan":
+            error = self._run_scan(job)
+        elif job.kind == "cache_build":
+            error = self._run_cache_build(job)
+        else:
+            error = self._run_parse(cat, job)
         _complete(cat, job, error)
 
     # -- loops ------------------------------------------------------------
@@ -230,9 +353,9 @@ class Worker:
             cat.close()
 
     def drain(self, max_jobs: int = 10_000) -> int:
-        """Run every runnable job (both lanes, fast first) until none are left. For tests and scripts."""
+        """Run every runnable job (all lanes, fast first) until none are left. For tests and scripts."""
         n = 0
-        while n < max_jobs and (self.run_once("fast") or self.run_once("deep")):
+        while n < max_jobs and (self.run_once("fast") or self.run_once("deep") or self.run_once("cache")):
             n += 1
         return n
 
@@ -273,6 +396,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, lambda *_: worker.stop.set())
     threads = worker.start()
     log.info("worker started (data root %s)", root.path)
+    last_eviction = 0.0
     while not worker.stop.is_set():
         worker.stop.wait(60)
         cat = catalog.connect_catalog(root)
@@ -280,6 +404,12 @@ def main() -> int:
             reset_stale(cat)  # a lane that hung without heartbeating
         finally:
             cat.close()
+        if time.time() - last_eviction >= EVICTION_INTERVAL_SEC:
+            last_eviction = time.time()
+            try:
+                worker.evict_cache()
+            except Exception:
+                log.exception("cache eviction failed")
     for t in threads:
         t.join(timeout=10)
     return 0

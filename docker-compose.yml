@@ -77,6 +77,11 @@ services:
     environment:
       EVIL_DATA_ROOT: /data
       EVIL_DB_PATH: /data/parsed/uc26/evil_uc26.db
+      # CAT's cache builder (its pyworker). Use the NUC's tailnet IP, not 127.0.0.1: inside this
+      # container loopback is the container itself. Without it, opening a bag in CAT cannot build.
+      EVIL_CAT_PYWORKER_URL: ${EVIL_CAT_PYWORKER_URL:-}
+      # EVIL_CACHE_MAX_BYTES: "21474836480"     # CAT cache size cap (default 20 GB)
+      # EVIL_CACHE_MAX_AGE_SEC: "604800"         # evict after this long unused (default 7 days)
       # EVIL_PARSE_TIMEOUT_SEC: "7200"
     volumes:
       - evil-data:/data
