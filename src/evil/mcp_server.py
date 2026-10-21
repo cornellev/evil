@@ -77,7 +77,7 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None) -
     async def get_turn_handler(run_id: str, turn_name: str, occurrence: str = "latest") -> dict:
         """Get start/end time, entry/exit speed, duration, distance, energy (Wh) and efficiency (mi/kWh)
         for one turn instance in a run, by turn name or official number. Defaults to the most recent occurrence.
-        Official turns 1 and 2 are one segment, 'Turn 1-2'."""
+        Official turns 1 and 2 are one segment, 'Turn 1-2'. Units: speeds m/s, energy Wh, distance m, durations s."""
         return await asyncio.to_thread(
             _run_readonly, path, get_turn, run_id=run_id, turn_name=turn_name, occurrence=occurrence
         )
@@ -86,7 +86,7 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None) -
     async def get_straight_handler(run_id: str, straight_name: str, occurrence: str = "latest") -> dict:
         """Get time, entry/exit speed, distance, energy (Wh) and efficiency (mi/kWh) for one pass down a
         straight, by name (e.g. 'Straight 6-7' or '6-7'). Defaults to the most recent occurrence.
-        list_track_segments shows which straights exist."""
+        list_track_segments shows which straights exist. Units: speeds m/s, energy Wh, distance m, durations s."""
         return await asyncio.to_thread(
             _run_readonly, path, get_straight, run_id=run_id, straight_name=straight_name, occurrence=occurrence
         )
@@ -99,27 +99,28 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None) -
     @server.tool(name="compare_turn_instances")
     async def compare_turn_instances_handler(run_id: str, turn_name: str, limit: int = 10) -> dict:
         """Compare every instance of a named turn within a run (entry/exit speed, duration, energy,
-        efficiency in mi/kWh) to answer what could be improved compared to earlier attempts."""
+        efficiency in mi/kWh) to answer what could be improved compared to earlier attempts. Units: speeds m/s, energy Wh, distance m, durations s."""
         return await asyncio.to_thread(
             _run_readonly, path, compare_turn_instances, run_id=run_id, turn_name=turn_name, limit=limit
         )
 
     @server.tool(name="list_runs")
     async def list_runs_handler() -> list[dict]:
-        """List every run_id with its sample count, time range and whole-run distance, energy and
-        efficiency (mi/kWh), for browsing."""
+        """List every run_id, most recent first, with its lap count, time range, duration and whole-run
+        distance, energy and efficiency (mi/kWh), for browsing. sample_count is the number of raw
+        telemetry rows, not laps: use lap_count for laps. Units: speeds m/s, energy Wh, distance m, durations s."""
         return await asyncio.to_thread(_run_readonly, path, list_runs)
 
     @server.tool(name="list_turns")
     async def list_turns_handler(run_id: str, limit: int = 50, offset: int = 0) -> dict:
-        """List every turn in a run, paginated, with duration, distance, energy and efficiency, for browsing."""
+        """List every turn in a run, paginated, with duration, distance, energy and efficiency, for browsing. Units: speeds m/s, energy Wh, distance m, durations s."""
         return await asyncio.to_thread(
             _run_readonly, path, list_turns, run_id=run_id, limit=limit, offset=offset
         )
 
     @server.tool(name="list_laps")
     async def list_laps_handler(run_id: str, limit: int = 50, offset: int = 0) -> dict:
-        """List every lap in a run, paginated, with duration, distance, energy and efficiency, for browsing."""
+        """List every lap in a run, paginated, with duration, distance, energy and efficiency, for browsing. Units: speeds m/s, energy Wh, distance m, durations s."""
         return await asyncio.to_thread(
             _run_readonly, path, list_laps, run_id=run_id, limit=limit, offset=offset
         )
@@ -127,7 +128,7 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None) -
     @server.tool(name="list_straights")
     async def list_straights_handler(run_id: str, limit: int = 50, offset: int = 0) -> dict:
         """List every straight in a run (named, like turns), paginated, with duration, distance, energy and
-        efficiency, for browsing."""
+        efficiency, for browsing. Units: speeds m/s, energy Wh, distance m, durations s."""
         return await asyncio.to_thread(
             _run_readonly, path, list_straights, run_id=run_id, limit=limit, offset=offset
         )
@@ -135,7 +136,8 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None) -
     @server.tool(name="compare_laps")
     async def compare_laps_handler(run_id: str, lap_a: int, lap_b: int) -> dict:
         """Compare two laps in a run by lap number (duration, turn count, energy, distance, efficiency in
-        mi/kWh, average speed) to answer what changed or what could be improved."""
+        mi/kWh, average speed) to answer what changed or what could be improved. delta is lap_b minus
+        lap_a, not either lap's own value. Units: speeds m/s, energy Wh, distance m, durations s."""
         return await asyncio.to_thread(
             _run_readonly, path, compare_laps, run_id=run_id, lap_a=lap_a, lap_b=lap_b
         )

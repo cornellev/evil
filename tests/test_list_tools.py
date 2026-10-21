@@ -33,7 +33,32 @@ def test_list_runs_returns_every_run_with_counts_and_range(evil_db_path):
     assert runs[0]["sample_count"] == 2
     assert runs[0]["start_ts"] == 0.0
     assert runs[0]["end_ts"] == 5.0
+    assert runs[0]["duration_s"] == 5.0
+    assert runs[0]["lap_count"] == 0                            # never classified, so no laps yet
     assert runs[0]["efficiency_mi_per_kwh"] is None            # no summary yet for a run that was never classified
+
+
+def test_list_runs_lap_count_counts_classified_laps_not_samples(evil_db_path):
+    """lap_count is what a "how many laps" question needs; sample_count (raw rows) was the only
+    count before, and a small model reported it as laps."""
+    from evil import db
+    from evil.ingest import ingest_sample
+    from evil.models import RawSample
+
+    conn = db.connect(evil_db_path)
+    for k in range(5):
+        ingest_sample(conn, RawSample(run_id="run-1", ts=float(k)))
+    with conn:
+        for n in (1, 2):
+            conn.execute(
+                "INSERT INTO laps (run_id, lap_number, start_seq, end_seq, start_ts, end_ts, turn_count) "
+                "VALUES ('run-1', ?, 0, 1, 0.0, 1.0, 0)", (n,),
+            )
+    runs = list_runs(conn)
+    conn.close()
+
+    assert runs[0]["sample_count"] == 5
+    assert runs[0]["lap_count"] == 2
 
 
 def test_list_runs_empty_db_returns_empty_list(conn):
