@@ -34,8 +34,28 @@ services:
       # Traces to Phoenix (observability/docker-compose.yml), e.g. http://<NUC tailnet IP>:6006.
       # Unset = no tracing. Tool calls never wait on it or fail because of it.
       OTEL_EXPORTER_OTLP_ENDPOINT: ${EVIL_OTLP_ENDPOINT:-}
+      # Names each caller in traces (tailnet login + device) via the tailnet-whois service below.
+      EVIL_WHOIS_URL: ${EVIL_WHOIS_URL:-}
     volumes:
       - evil-data:/data
+    restart: unless-stopped
+
+  # Answers "who is this tailnet IP?" for traces, from the host's tailscaled (src/evil/tailnet.py).
+  # Its own container because tailscaled gives full admin rights to root callers: this one runs as
+  # nobody, which tailscaled limits to read-only calls, and publishes no port. Only on hosts that
+  # run Tailscale: enable with COMPOSE_PROFILES=tailnet and EVIL_WHOIS_URL=http://tailnet-whois:8770.
+  tailnet-whois:
+    build: .
+    profiles: ["tailnet"]
+    user: "65534:65534"
+    command: ["python", "-m", "evil.tailnet"]
+    volumes:
+      - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock
+    mem_limit: 128m
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
   upload:
@@ -63,6 +83,7 @@ services:
       EVIL_DATA_ROOT: /data
       EVIL_RAW_PORT: "8767"
       OTEL_EXPORTER_OTLP_ENDPOINT: ${EVIL_OTLP_ENDPOINT:-}
+      EVIL_WHOIS_URL: ${EVIL_WHOIS_URL:-}
     volumes:
       - evil-data:/data
     command: ["python", "-m", "evil.mcp_raw_server"]

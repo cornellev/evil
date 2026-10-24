@@ -119,3 +119,112 @@ def test_session_housekeeping_spans_are_dropped_but_tool_calls_kept():
         assert decision(name) == Decision.DROP, name
     for name in ("tools/call get_turn", "MCP send tools/call get_turn", "ask", "agent"):
         assert decision(name) == Decision.RECORD_AND_SAMPLE, name
+
+
+# --- who called: tailnet identity (tailnet.py) ---
+
+from evil import tailnet  # noqa: E402
+
+PERSON = {"Node": {"Name": "ajayslaptop.tail4ccb95.ts.net.", "ComputedName": "ajayslaptop"},
+          "UserProfile": {"LoginName": "AjayParthibha@github", "DisplayName": "Ajay Parthibha"}}
+SHARED = {"Node": {"Name": "thor.tail4ccb95.ts.net.", "ComputedName": "thor", "Tags": ["tag:general"]},
+          "UserProfile": {"LoginName": "tagged-devices", "DisplayName": "Tagged Devices"}}
+
+
+def test_whois_names_a_person_and_their_device():
+    assert tailnet.parse_whois(PERSON) == {"device": "ajayslaptop", "user": "AjayParthibha@github",
+                                          "user_name": "Ajay Parthibha"}
+
+
+def test_whois_of_a_shared_machine_names_no_person():
+    assert tailnet.parse_whois(SHARED) == {"device": "thor", "tags": "tag:general"}
+
+
+@pytest.fixture
+def whois_service(tmp_path, monkeypatch):
+    """A fake tailscaled on a unix socket, and the real whois service in front of it."""
+    import socketserver
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    known = {"100.65.206.31": PERSON, "100.94.168.55": SHARED}
+
+    class Tailscaled(BaseHTTPRequestHandler):
+        def do_GET(self):
+            assert self.headers["Host"] == "local-tailscaled.sock"
+            ip = self.path.split("addr=", 1)[1]
+            if ip not in known:
+                self.send_error(404, "no match for IP:port")
+                return
+            body = json.dumps(known[ip]).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    class UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+
+        def get_request(self):  # BaseHTTPRequestHandler wants a (host, port) client address
+            sock, _ = super().get_request()
+            return sock, ("local", 0)
+
+    sock_path = str(tmp_path / "tailscaled.sock")
+    fake = UnixServer(sock_path, Tailscaled)
+    service = ThreadingHTTPServer(("127.0.0.1", 0), tailnet._Handler)
+    for server in (fake, service):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv(tailnet.SOCKET_ENV, sock_path)
+    monkeypatch.setenv(tailnet.WHOIS_URL_ENV, f"http://127.0.0.1:{service.server_address[1]}")
+    monkeypatch.setattr(tailnet, "_cache", {})
+    yield
+    service.shutdown()
+    fake.shutdown()
+
+
+def test_lookup_goes_through_the_whois_service_to_tailscaled(whois_service):
+    assert tailnet.lookup("100.65.206.31")["user"] == "AjayParthibha@github"
+    assert tailnet.lookup("100.94.168.55") == {"device": "thor", "tags": "tag:general"}
+    assert tailnet.lookup("172.18.0.1") == {}  # not on the tailnet (Docker's own bridge)
+
+
+def test_lookup_is_off_without_a_service_url(monkeypatch):
+    monkeypatch.delenv(tailnet.WHOIS_URL_ENV, raising=False)
+    assert tailnet.lookup("100.65.206.31") == {}
+
+
+def test_lookup_caches_failures_so_an_outage_costs_one_timeout_per_ip(monkeypatch):
+    monkeypatch.setenv(tailnet.WHOIS_URL_ENV, "http://127.0.0.1:9")
+    monkeypatch.setattr(tailnet, "_cache", {})
+    calls = []
+    real = tailnet.urllib.request.urlopen
+    monkeypatch.setattr(tailnet.urllib.request, "urlopen", lambda *a, **k: calls.append(1) or real(*a, **k))
+    assert tailnet.lookup("100.65.206.31") == {}
+    assert tailnet.lookup("100.65.206.31") == {}
+    assert len(calls) == 1
+
+
+def test_tool_span_names_the_caller_from_the_tailnet(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(tailnet, "lookup", lambda ip: tailnet.parse_whois(PERSON) if ip == "100.65.206.31" else {})
+    ctx = SimpleNamespace(method="tools/call", params={"name": "list_runs", "arguments": {}}, meta=None,
+                          session=SimpleNamespace(client_params=None),
+                          request=SimpleNamespace(client=SimpleNamespace(host="100.65.206.31")))
+
+    async def call_next(_):
+        return {"content": [], "structuredContent": {"result": []}}
+
+    async def go():
+        with trace.get_tracer("t").start_as_current_span("tools/call list_runs"):
+            await telemetry.ToolCallDetails()(ctx, call_next)
+    asyncio.run(go())
+
+    (span,) = _EXPORTER.get_finished_spans()
+    a = span.attributes
+    assert (a["evil.user"], a["user.id"], a["evil.user.name"], a["evil.device"]) == (
+        "AjayParthibha@github", "AjayParthibha@github", "Ajay Parthibha", "ajayslaptop")
+    assert a["evil.client.ip"] == "100.65.206.31"

@@ -180,8 +180,10 @@ a bad write is a categorically worse failure than a bad read.
 ## Tracing (Phoenix)
 
 Every MCP tool call, from every client, can be traced to Arize Phoenix: arguments (the SQL, for
-`read_only_sql`), the result (truncated to 4 KB), timing, errors, the client's name and IP, and an
-optional `X-EVIL-User` name header that evil-mcp's installer sets. Tern's questions arrive with
+`read_only_sql`), the result (truncated to 4 KB), timing, errors, the client's name and IP, and who
+called: the caller's Tailscale login and device (`evil.user`, `evil.device`), looked up from the
+NUC's tailscaled by the `tailnet-whois` service (`src/evil/tailnet.py`). Nobody configures anything;
+shared tagged machines (thor, the DAQ) get a device name but no person. Tern's questions arrive with
 their trace context, so EVIL's spans nest under the question that caused them. See
 `src/evil/telemetry.py` and `harness/observability-design.md`.
 
@@ -190,6 +192,8 @@ e.g. `http://<NUC tailnet IP>:6006`). Spans export in the background and are dro
 down, so a tool call never waits on or fails because of tracing. Phoenix itself runs as its own
 compose project: `docker compose -p phoenix -f observability/docker-compose.yml up -d`
 (needs `PHOENIX_TAILNET_IP` in `observability/.env`); traces are kept 90 days.
+Caller names need `COMPOSE_PROFILES=tailnet` and `EVIL_WHOIS_URL=http://tailnet-whois:8770` in `.env`
+(only on a host running Tailscale).
 
 ## Running tests
 
