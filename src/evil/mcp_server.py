@@ -23,6 +23,7 @@ from mcp.server.mcpserver import MCPServer
 
 from evil import catalog
 from evil.db import connect_readonly
+from evil.telemetry import ToolCallDetails, setup_tracing
 from evil.tools.compare_laps import compare_laps
 from evil.tools.compare_turn_instances import compare_turn_instances
 from evil.tools.get_straight import get_straight
@@ -72,6 +73,7 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None) -
     path = db_path or DEFAULT_DB_PATH
     cat_path = catalog_path or default_catalog_path()
     server = MCPServer("evil")
+    server.middleware.append(ToolCallDetails())
 
     @server.tool(name="get_turn")
     async def get_turn_handler(run_id: str, turn_name: str, occurrence: str = "latest") -> dict:
@@ -188,6 +190,7 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None) -
 
 
 def main() -> None:
+    setup_tracing("evil-mcp")
     server = create_server()
     server.run(transport="streamable-http", host=DEFAULT_HOST, port=DEFAULT_PORT)
 
