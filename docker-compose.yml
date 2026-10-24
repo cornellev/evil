@@ -31,6 +31,9 @@ services:
       EVIL_DB_PATH: /data/parsed/uc26/evil_uc26.db
       EVIL_MCP_HOST: "0.0.0.0"
       EVIL_MCP_PORT: "8765"
+      # Traces to Phoenix (observability/docker-compose.yml), e.g. http://<NUC tailnet IP>:6006.
+      # Unset = no tracing. Tool calls never wait on it or fail because of it.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${EVIL_OTLP_ENDPOINT:-}
     volumes:
       - evil-data:/data
     restart: unless-stopped
@@ -59,6 +62,7 @@ services:
     environment:
       EVIL_DATA_ROOT: /data
       EVIL_RAW_PORT: "8767"
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${EVIL_OTLP_ENDPOINT:-}
     volumes:
       - evil-data:/data
     command: ["python", "-m", "evil.mcp_raw_server"]

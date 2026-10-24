@@ -177,6 +177,20 @@ Writes never go through MCP -- uploads, the worker and bulk ingestion are
 separate processes, same reasoning as why `read_only_sql` is generic-but-read-only:
 a bad write is a categorically worse failure than a bad read.
 
+## Tracing (Phoenix)
+
+Every MCP tool call, from every client, can be traced to Arize Phoenix: arguments (the SQL, for
+`read_only_sql`), the result (truncated to 4 KB), timing, errors, the client's name and IP, and an
+optional `X-EVIL-User` name header that evil-mcp's installer sets. Tern's questions arrive with
+their trace context, so EVIL's spans nest under the question that caused them. See
+`src/evil/telemetry.py` and `harness/observability-design.md`.
+
+Off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set (compose reads `EVIL_OTLP_ENDPOINT` from `.env`,
+e.g. `http://<NUC tailnet IP>:6006`). Spans export in the background and are dropped if Phoenix is
+down, so a tool call never waits on or fails because of tracing. Phoenix itself runs as its own
+compose project: `docker compose -p phoenix -f observability/docker-compose.yml up -d`
+(needs `PHOENIX_TAILNET_IP` in `observability/.env`); traces are kept 90 days.
+
 ## Running tests
 
 ```bash

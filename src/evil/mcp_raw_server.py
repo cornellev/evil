@@ -25,6 +25,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from evil import catalog, rawquery
+from evil.telemetry import ToolCallDetails, setup_tracing
 
 DEFAULT_HOST = os.getenv("EVIL_RAW_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("EVIL_RAW_PORT", "8767"))
@@ -50,6 +51,7 @@ def _with_catalog(root: catalog.DataRoot, fn: Callable[..., Any]) -> Any:
 def create_raw_server(data_root: str | None = None, limits: rawquery.QueryLimits | None = None) -> MCPServer:
     root = catalog.DataRoot(Path(data_root)) if data_root else catalog.data_root_from_env()
     server = MCPServer("evil-raw", instructions=INSTRUCTIONS)
+    server.middleware.append(ToolCallDetails())
 
     @server.tool(name="query_recording_sql")
     async def query_recording_sql_handler(recording_id: str, sql: str, file: str | None = None, limit: int = 200) -> dict:
@@ -80,6 +82,7 @@ def create_raw_server(data_root: str | None = None, limits: rawquery.QueryLimits
 
 
 def main() -> None:
+    setup_tracing("evil-raw")
     create_raw_server().run(transport="streamable-http", host=DEFAULT_HOST, port=DEFAULT_PORT)
 
 

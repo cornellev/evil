@@ -1,5 +1,9 @@
 mcp>=2.2,<2.3
 
+# Tracing to Phoenix (telemetry.py); opentelemetry-api itself comes with mcp.
+opentelemetry-sdk>=1.44,<1.46
+opentelemetry-exporter-otlp-proto-http>=1.44,<1.46
+
 # Only needed by upload_server.py, not mcp_server.py -- that's why they're
 # two separate services/images-from-one-image rather than one server.
 fastapi>=0.141,<0.142

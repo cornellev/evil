@@ -1,0 +1,26 @@
+# Phoenix: trace UI + OTLP receiver for every MCP tool call and every Tern question
+# (see harness/observability-design.md). Its own compose project, so deploying EVIL never
+# restarts it and vice versa:
+#   docker compose -p phoenix -f observability/docker-compose.yml up -d
+#
+# Reached only over the tailnet: bound to loopback (for the `cev-traces` Tailscale Service,
+# which proxies http://localhost:6006) and to the NUC's tailnet IP (for EVIL's containers and
+# for Tern on thor, which send traces to http://<tailnet ip>:6006). Put the IP in .env next to
+# this file: PHOENIX_TAILNET_IP=100.x.y.z
+services:
+  phoenix:
+    image: arizephoenix/phoenix:version-20.24.0
+    ports:
+      - "127.0.0.1:6006:6006"
+      - "${PHOENIX_TAILNET_IP:?set PHOENIX_TAILNET_IP in observability/.env}:6006:6006"
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data          # SQLite database lives here
+      PHOENIX_DEFAULT_RETENTION_POLICY_DAYS: "90"
+      PHOENIX_TELEMETRY_ENABLED: "false"      # no usage pings to Arize
+    volumes:
+      - phoenix-data:/mnt/data
+    mem_limit: 2g
+    restart: unless-stopped
+
+volumes:
+  phoenix-data:
