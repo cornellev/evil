@@ -4,7 +4,8 @@ The MCP SDK already opens one SERVER span per message (its OpenTelemetryMiddlewa
 default) and nests it under a caller's trace when the request carries a W3C traceparent in
 `_meta` -- which the SDK's own client sends, so Tern's questions get EVIL's spans nested under
 them for free. All it lacks is somewhere to send them, and the details worth looking at:
-arguments, result, and who called. setup_tracing() supplies the first, ToolCallDetails the second.
+arguments, result, and who called. setup_tracing() supplies the first, ToolCallDetails the second;
+who called comes from the tailnet (tailnet.py).
 
 Off unless OTEL_EXPORTER_OTLP_ENDPOINT is set (tests and laptops export nothing). Spans leave in
 a background batch, so a tool call never waits on Phoenix, and if Phoenix is down they are
@@ -18,7 +19,10 @@ import logging
 import os
 from typing import Any
 
+import anyio
 from opentelemetry import trace
+
+from evil import tailnet
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +30,6 @@ PROJECT_ENV = "PHOENIX_PROJECT_NAME"
 DEFAULT_PROJECT = "evil"
 OUTPUT_LIMIT_BYTES = 4096
 CLIENT_INFO_META_KEY = "io.modelcontextprotocol/clientInfo"
-USER_HEADER = "x-evil-user"
 
 
 # MCP session housekeeping the SDK traces on both ends. Tern opens a session per tool call and
@@ -138,10 +141,13 @@ class ToolCallDetails:
             host = getattr(getattr(request, "client", None), "host", None)
             if host:
                 span.set_attribute("evil.client.ip", host)
-            headers = getattr(request, "headers", None)
-            user = headers.get(USER_HEADER) if headers is not None else None
-            if user:
-                span.set_attribute("evil.user", user[:100])
+                who = await anyio.to_thread.run_sync(tailnet.lookup, host)
+                for key, attr in (("user", "evil.user"), ("user_name", "evil.user.name"),
+                                  ("device", "evil.device"), ("tags", "evil.device.tags")):
+                    if who.get(key):
+                        span.set_attribute(attr, who[key])
+                if who.get("user"):
+                    span.set_attribute("user.id", who["user"])  # OpenInference's user field
         except Exception:  # never let decorating a span break the call itself
             logger.debug("could not add tool call details", exc_info=True)
 
