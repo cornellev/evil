@@ -143,9 +143,11 @@ class ToolCallDetails:
                     span.set_attribute(f"evil.client.{key}", str(client[key]))
             request = ctx.request
             host = getattr(getattr(request, "client", None), "host", None)
-            if host:
-                span.set_attribute("evil.client.ip", host)
-                who = await anyio.to_thread.run_sync(tailnet.lookup, host)
+            caller_ip, who = await anyio.to_thread.run_sync(tailnet.identify, host, getattr(request, "headers", None))
+            if caller_ip:
+                span.set_attribute("evil.client.ip", caller_ip)
+                if caller_ip != host:
+                    span.set_attribute("evil.client.via", host)  # the local proxy it came through
                 for key, attr in (("user", "evil.user"), ("user_name", "evil.user.name"),
                                   ("device", "evil.device"), ("tags", "evil.device.tags")):
                     if who.get(key):
