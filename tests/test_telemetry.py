@@ -258,3 +258,81 @@ def test_tool_span_names_the_caller_from_the_tailnet(monkeypatch):
     assert (a["evil.user"], a["user.id"], a["evil.user.name"], a["evil.device"]) == (
         "AjayParthibha@github", "AjayParthibha@github", "Ajay Parthibha", "ajayslaptop")
     assert a["evil.client.ip"] == "100.65.206.31"
+
+
+# --- who called, through a Tailscale Service (Serve's identity headers) ---
+
+def _fake_whois(monkeypatch):
+    known = {"100.65.206.31": tailnet.parse_whois(PERSON), "100.94.168.55": tailnet.parse_whois(SHARED)}
+    monkeypatch.setattr(tailnet, "lookup", lambda ip: known.get(ip, {}))
+    monkeypatch.delenv(tailnet.TRUSTED_PROXIES_ENV, raising=False)
+
+
+SERVE_HEADERS = {"tailscale-user-login": "AjayParthibha@github", "tailscale-user-name": "Ajay Parthibha",
+                 "x-forwarded-for": "100.65.206.31"}
+
+
+def test_via_tailscale_serve_the_headers_name_the_caller(monkeypatch):
+    _fake_whois(monkeypatch)
+    ip, who = tailnet.identify("172.18.0.1", SERVE_HEADERS)  # Docker bridge gateway: tailscaled's proxy
+    assert ip == "100.65.206.31"
+    assert who == {"device": "ajayslaptop", "user": "AjayParthibha@github", "user_name": "Ajay Parthibha"}
+
+
+def test_a_direct_tailnet_caller_cannot_claim_someone_else(monkeypatch):
+    _fake_whois(monkeypatch)
+    ip, who = tailnet.identify("100.94.168.55", {"tailscale-user-login": "AjayParthibha@github"})
+    assert ip == "100.94.168.55" and who == {"device": "thor", "tags": "tag:general"}
+
+
+def test_a_lan_caller_cannot_claim_an_identity(monkeypatch):
+    _fake_whois(monkeypatch)
+    assert tailnet.identify("192.168.1.50", SERVE_HEADERS) == ("192.168.1.50", {})
+
+
+def test_only_the_proxys_own_forwarded_entry_counts(monkeypatch):
+    _fake_whois(monkeypatch)
+    ip, who = tailnet.identify("127.0.0.1", {**SERVE_HEADERS, "x-forwarded-for": "100.94.168.55, 100.65.206.31"})
+    assert ip == "100.65.206.31" and who["device"] == "ajayslaptop"
+
+
+def test_without_a_tailnet_forwarded_address_the_headers_still_name_the_person(monkeypatch):
+    _fake_whois(monkeypatch)
+    ip, who = tailnet.identify("127.0.0.1", {"tailscale-user-login": "AjayParthibha@github"})
+    assert ip == "127.0.0.1" and who == {"user": "AjayParthibha@github"}
+
+
+def test_a_non_ascii_display_name_is_decoded(monkeypatch):
+    _fake_whois(monkeypatch)
+    _, who = tailnet.identify("127.0.0.1", {"tailscale-user-login": "jose@github",
+                                            "tailscale-user-name": "=?utf-8?q?Jos=C3=A9?="})
+    assert who["user_name"] == "José"
+
+
+def test_trusted_proxy_addresses_are_configurable(monkeypatch):
+    _fake_whois(monkeypatch)
+    monkeypatch.setenv(tailnet.TRUSTED_PROXIES_ENV, "10.0.0.0/8")
+    assert tailnet.identify("172.18.0.1", SERVE_HEADERS) == ("172.18.0.1", {})
+    assert tailnet.identify("10.1.2.3", SERVE_HEADERS)[1]["user"] == "AjayParthibha@github"
+
+
+def test_tool_span_via_serve_records_the_person_and_the_proxy(monkeypatch):
+    from types import SimpleNamespace
+
+    _fake_whois(monkeypatch)
+    ctx = SimpleNamespace(method="tools/call", params={"name": "list_runs", "arguments": {}}, meta=None,
+                          session=SimpleNamespace(client_params=None),
+                          request=SimpleNamespace(client=SimpleNamespace(host="172.18.0.1"), headers=SERVE_HEADERS))
+
+    async def call_next(_):
+        return {"content": [], "structuredContent": {"result": []}}
+
+    async def go():
+        with trace.get_tracer("t").start_as_current_span("tools/call list_runs"):
+            await telemetry.ToolCallDetails()(ctx, call_next)
+    asyncio.run(go())
+
+    (span,) = _EXPORTER.get_finished_spans()
+    a = span.attributes
+    assert (a["evil.user"], a["evil.client.ip"], a["evil.client.via"], a["evil.device"]) == (
+        "AjayParthibha@github", "100.65.206.31", "172.18.0.1", "ajayslaptop")

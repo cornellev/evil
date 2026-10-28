@@ -12,6 +12,12 @@ holds the socket, as an unprivileged user, which tailscaled limits to read-only 
   GET /whois?ip=100.x.y.z -> {"user", "user_name", "device"} or {"device", "tags"}, {} if unknown.
 - `lookup(ip)` is what the MCP servers call, via EVIL_WHOIS_URL. Cached per IP, short timeout,
   and any failure is just {} -- a trace without a name, never a failed tool call.
+
+Callers that come through a Tailscale Service (https://cev-mcp...) reach EVIL via tailscaled's
+own proxy, so the source address is the NUC itself and whois can't name them. Serve adds
+Tailscale-User-Login / -Name headers instead (and strips copies a client sends), so `identify()`
+reads those -- but only on requests from a trusted local proxy address; a request straight from
+a tailnet or LAN address could have written them itself.
 """
 
 from __future__ import annotations
@@ -24,7 +30,9 @@ import socket
 import time
 import urllib.parse
 import urllib.request
+from email.header import decode_header, make_header
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import ip_address, ip_network
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -36,6 +44,11 @@ PORT_ENV = "EVIL_WHOIS_PORT"
 DEFAULT_PORT = 8770
 TIMEOUT_S = 0.5
 CACHE_TTL_S = 600
+# Where a local proxy's requests appear from: loopback, and Docker's bridge networks (a request
+# tailscaled proxies to localhost:8765 reaches the container from its bridge gateway).
+TRUSTED_PROXIES_ENV = "EVIL_TRUSTED_PROXIES"
+DEFAULT_TRUSTED_PROXIES = "127.0.0.0/8,::1/128,172.16.0.0/12"
+TAILNET_NETS = (ip_network("100.64.0.0/10"), ip_network("fd7a:115c:a1e0::/48"))
 
 
 def parse_whois(data: dict[str, Any]) -> dict[str, str]:
@@ -126,6 +139,50 @@ def lookup(ip: str) -> dict[str, str]:
         logger.debug("tailnet lookup for %s failed", ip, exc_info=True)
     _cache[ip] = (now + CACHE_TTL_S, info)
     return info
+
+
+def _within(ip: str, nets) -> bool:
+    try:
+        addr = ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr.version == n.version and addr in n for n in nets)
+
+
+def _trusted_proxies():
+    raw = os.getenv(TRUSTED_PROXIES_ENV, DEFAULT_TRUSTED_PROXIES)
+    return [ip_network(part.strip(), strict=False) for part in raw.split(",") if part.strip()]
+
+
+def _header_text(value: str | None) -> str | None:
+    """Tailscale sends a non-ASCII display name RFC 2047-encoded (=?utf-8?q?...?=)."""
+    if not value:
+        return None
+    try:
+        return str(make_header(decode_header(value)))
+    except Exception:
+        return value
+
+
+def identify(source_ip: str | None, headers: Any) -> tuple[str | None, dict[str, str]]:
+    """(the caller's address, who they are) for one request. Blocking, like lookup()."""
+    if not source_ip:
+        return None, {}
+    if not _within(source_ip, _trusted_proxies()):
+        return source_ip, lookup(source_ip)  # direct: the address is the caller; headers ignored
+    get = headers.get if headers is not None else (lambda _key: None)
+    # A reverse proxy appends the address it saw, so only the LAST entry is the proxy's own.
+    forwarded = (get("x-forwarded-for") or "").split(",")[-1].strip()
+    client = forwarded if _within(forwarded, TAILNET_NETS) else source_ip
+    who = dict(lookup(client)) if client != source_ip else {}
+    login = get("tailscale-user-login")
+    if login:
+        who.pop("tags", None)
+        who["user"] = login[:200]
+        name = _header_text(get("tailscale-user-name"))
+        if name:
+            who["user_name"] = name[:200]
+    return client, who
 
 
 def main() -> None:
