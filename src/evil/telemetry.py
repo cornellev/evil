@@ -32,28 +32,32 @@ OUTPUT_LIMIT_BYTES = 4096
 CLIENT_INFO_META_KEY = "io.modelcontextprotocol/clientInfo"
 
 
-# MCP session housekeeping the SDK traces on both ends. Tern opens a session per tool call and
-# every client lists tools on connect, so these outnumber the real calls several to one and
-# carry nothing worth reading. Dropped when the span starts; their children follow (ParentBased).
-HOUSEKEEPING_SPANS = ("initialize", "tools/list", "notifications/", "ping")
+# Of the MCP SDK's own spans (both ends tag them with mcp.method.name when they start), only tool
+# calls are worth reading. The rest is session traffic -- initialize, tools/list, ping, and newer
+# clients' polling (server/discover, subscriptions/listen, resources/list, prompts/list) -- which
+# outnumbered tool calls by far more than ten to one. Allowlisted rather than blocklisted, so a
+# method a future client invents doesn't flood the traces. Spans without the attribute (Tern's
+# ask/agent/llm turns) are kept. Dropped at start; their children follow (ParentBased).
+TRACED_MCP_METHODS = frozenset({"tools/call"})
 
 
 def _sampler():
     from opentelemetry.sdk.trace.sampling import ALWAYS_ON, Decision, ParentBased, Sampler, SamplingResult
 
-    class DropHousekeeping(Sampler):
+    class ToolCallsOnly(Sampler):
         def __init__(self) -> None:
             self._base = ParentBased(ALWAYS_ON)
 
         def should_sample(self, parent_context, trace_id, name, kind=None, attributes=None, links=None, trace_state=None):
-            if name.removeprefix("MCP send ").startswith(HOUSEKEEPING_SPANS):
+            method = (attributes or {}).get("mcp.method.name")
+            if method is not None and method not in TRACED_MCP_METHODS:
                 return SamplingResult(Decision.DROP)
             return self._base.should_sample(parent_context, trace_id, name, kind, attributes, links, trace_state)
 
         def get_description(self) -> str:
-            return "DropHousekeeping"
+            return "ToolCallsOnly"
 
-    return DropHousekeeping()
+    return ToolCallsOnly()
 
 
 def setup_tracing(service_name: str) -> bool:

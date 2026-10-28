@@ -107,18 +107,48 @@ def test_an_unreachable_collector_never_blocks_or_raises():
     provider.shutdown()
 
 
-def test_session_housekeeping_spans_are_dropped_but_tool_calls_kept():
+def test_only_tool_calls_are_kept_of_the_sdk_mcp_spans():
     sampler = telemetry._sampler()
     from opentelemetry.sdk.trace.sampling import Decision
 
-    def decision(name):
-        return sampler.should_sample(None, 1, name).decision
+    def decision(name, method=None):
+        attrs = {"mcp.method.name": method} if method else None
+        return sampler.should_sample(None, 1, name, attributes=attrs).decision
 
-    for name in ("initialize", "tools/list", "MCP send initialize", "MCP send tools/list",
-                 "notifications/initialized", "MCP send notifications/initialized", "ping"):
-        assert decision(name) == Decision.DROP, name
-    for name in ("tools/call get_turn", "MCP send tools/call get_turn", "ask", "agent"):
+    for method in ("initialize", "tools/list", "notifications/initialized", "ping", "server/discover",
+                   "subscriptions/listen", "resources/list", "resources/templates/list", "prompts/list",
+                   "some/method-a-future-client-invents"):
+        assert decision(method, method) == Decision.DROP, method
+        assert decision(f"MCP send {method}", method) == Decision.DROP, method
+    assert decision("tools/call get_turn", "tools/call") == Decision.RECORD_AND_SAMPLE
+    assert decision("MCP send tools/call get_turn", "tools/call") == Decision.RECORD_AND_SAMPLE
+    for name in ("ask", "agent", "llm turn 1"):  # Tern's own spans carry no MCP method
         assert decision(name) == Decision.RECORD_AND_SAMPLE, name
+
+
+def test_the_sdk_tags_its_spans_with_the_method_when_they_start(evil_db_path):
+    """The sampler only sees attributes given at span start; this pins that the SDK gives the
+    method there (an SDK upgrade that sets it later would silently turn the filter off)."""
+    seen = []
+
+    class Recording(type(telemetry._sampler())):
+        def should_sample(self, parent_context, trace_id, name, kind=None, attributes=None, links=None, trace_state=None):
+            seen.append((name, (attributes or {}).get("mcp.method.name")))
+            return super().should_sample(parent_context, trace_id, name, kind, attributes, links, trace_state)
+
+    import mcp.shared._otel as sdk_otel
+
+    provider = TracerProvider(sampler=Recording())
+    real_tracer = sdk_otel._tracer
+    sdk_otel._tracer = provider.get_tracer("mcp")
+    try:
+        _call(create_server(db_path=evil_db_path), "list_runs", {})
+    finally:
+        sdk_otel._tracer = real_tracer
+    assert ("tools/call list_runs", "tools/call") in seen
+    # and session traffic (server/discover or initialize, tools/list, depending on protocol version)
+    assert any(method not in (None, "tools/call") and name == method for name, method in seen)
+
 
 
 # --- who called: tailnet identity (tailnet.py) ---
