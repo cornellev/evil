@@ -49,7 +49,8 @@ def test_compiler_ticks_incrementally_while_samples_are_still_arriving(conn):
         _gps_sample(9.0, _lon(75.0), 7.0),  # exit (crosses the exit gate)
     ]
     source = ReplaySource(samples, delay_s=0.15)
-    compiler = LiveCompiler(conn, "run-1", source, [SegmentsClassifier()], max_interval_s=10.0, lock_after=1)
+    compiler = LiveCompiler(conn, "run-1", source, [SegmentsClassifier()], max_interval_s=10.0, lock_after=1,
+                            batch_s=0.02)
 
     async def scenario():
         task = asyncio.create_task(compiler.run())
@@ -88,7 +89,8 @@ def test_final_tick_after_source_ends_catches_trailing_data(conn):
         _gps_sample(2.0, _lon(75.0), 7.0),  # exit -- arrives right as the source ends
     ]
     source = ReplaySource(samples, delay_s=0.0)
-    compiler = LiveCompiler(conn, "run-1", source, [SegmentsClassifier()], max_interval_s=10.0, lock_after=1)
+    compiler = LiveCompiler(conn, "run-1", source, [SegmentsClassifier()], max_interval_s=10.0, lock_after=1,
+                            batch_s=0.02)
 
     asyncio.run(asyncio.wait_for(compiler.run(), timeout=5.0))
 
@@ -119,3 +121,41 @@ def test_a_stream_matching_no_schema_stores_nothing_and_counts_it(conn):
     assert compiler.runs == [] and compiler.run_id is None
     assert conn.execute("SELECT COUNT(*) FROM main_snapshot").fetchone()[0] == 0
     assert compiler.counters()["unknown"]["rejected"] == 50
+
+
+def test_writes_are_committed_in_batches_and_loss_is_reported(conn):
+    envs = [Envelope(T0 + i * 0.02, payload(seq=2 + 2 * i, publish_ns=int((T0 + i * 0.02) * 1e9)))
+            for i in range(130) if not 60 <= i < 63]                    # 3 messages lost upstream
+    compiler = LiveCompiler(conn, "live-1", ReplaySource(envs), [SegmentsClassifier()], max_interval_s=10.0,
+                            batch_rows=25)
+    asyncio.run(asyncio.wait_for(compiler.run(), timeout=5.0))
+    assert conn.execute("SELECT COUNT(*) FROM main_snapshot").fetchone()[0] == 127
+    assert compiler.commits == 6                                         # 5 full batches + the tail
+    loss = compiler.counters()["loss"]
+    assert (loss["holes"], loss["missing"]) == (1, 3)
+    assert "lost~3" in compiler.status_line()
+
+
+def test_a_slow_trickle_is_committed_within_the_batch_window(tmp_path):
+    """Fewer than batch_rows messages: the timer commits them, the reader sees them before the source ends."""
+    import sqlite3
+
+    from evil import db
+    path = str(tmp_path / "live.db")
+    conn = db.connect(path)
+    db.apply_schema(conn)
+    envs = [Envelope(T0 + i * 0.02, payload(seq=2 + 2 * i, publish_ns=int((T0 + i * 0.02) * 1e9))) for i in range(3)]
+    envs.append(Envelope(T0 + 5, {"_t_publish_ns": int((T0 + 5) * 1e9)}))     # keeps the source open a while
+    compiler = LiveCompiler(conn, "live-1", ReplaySource(envs, delay_s=0.1), [SegmentsClassifier()],
+                            max_interval_s=10.0, lock_after=1, batch_rows=25, batch_s=0.05)
+
+    async def scenario():
+        task = asyncio.create_task(compiler.run())
+        await asyncio.sleep(0.38)            # 3 arrived by 0.3 s, timer fired by 0.35 s; 4th not until 0.4 s
+        other = sqlite3.connect(path)
+        seen = other.execute("SELECT COUNT(*) FROM main_snapshot").fetchone()[0]
+        other.close()
+        await task
+        return seen
+
+    assert asyncio.run(scenario()) == 3

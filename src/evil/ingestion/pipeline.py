@@ -240,3 +240,79 @@ class LiveClock:
                 self.clock_jumps += 1
         self._prev = (pub_s, recv_s)
         return Envelope(pub_s + self.offset, payload, env.error)
+
+
+class LossMeter:
+    """Counts holes in the stream between the car's publisher and EVIL, from gaps in
+    `_t_publish_ns` in arrival order (before repeat dropping).
+
+    This is an ESTIMATE, and cannot be exact with today's payload:
+      - DAQ `seq` is no help: the DAQ updates faster than the publisher reads it, so seq
+        steps of 4 are normal (~15-20 % of messages in 0409/0411).
+      - The publisher's own rate is irregular: nominal 20 ms, but it averages 20.26 ms
+        (0409) with jitter, so "expected minus received" reads ~1.3 % loss on a lossless
+        onboard recording, and a 1.5-period threshold flags ~1.6 % from jitter alone.
+    So only clear holes count (a single lost message, a 40 ms gap, is NOT counted: 0.4 % of
+    onboard gaps are already 40 ms+ from jitter): a gap of at least HOLE_FACTOR periods (period = median of
+    recent gaps) adds round(gap / period) - 1 to `missing`. Baseline on onboard recordings
+    (no network involved; publisher stalls only): 0409 90 holes = 195 missing / 96,869
+    messages (0.2 %), 0411 41 holes = 89 / 75,165 (0.12 %). Live numbers well above that
+    are real loss. Gaps longer than OUTAGE_S are the
+    publisher or link being down: counted as outages with their duration, not as missing.
+    Exact loss needs a publisher-side message counter (asked of the DAQ owner; a payload
+    change means a new schema id).
+    """
+
+    OUTAGE_S = 2.0
+    HOLE_FACTOR = 2.5      # below this, a long gap is indistinguishable from publisher jitter
+
+    def __init__(self, window: int = 101):
+        self.window = window
+        self._gaps: list[float] = []
+        self._period: float | None = None
+        self._prev: float | None = None
+        self._n_gaps = 0
+        self.missing = 0
+        self.holes = 0
+        self.outages = 0
+        self.outage_s = 0.0
+        self.backwards = 0           # publish stamp went back (reordering, or a car clock reset)
+        self.max_gap_s = 0.0
+
+    @property
+    def period_s(self) -> float | None:
+        return self._period
+
+    def observe(self, env: Envelope) -> None:
+        payload = env.payload
+        pub = payload.get("_t_publish_ns") if isinstance(payload, dict) else None
+        if not isinstance(pub, int) or isinstance(pub, bool):
+            return
+        t = pub / 1e9
+        prev, self._prev = self._prev, t
+        if prev is None:
+            return
+        gap = t - prev
+        if gap < 0:
+            self.backwards += 1
+            return
+        self.max_gap_s = max(self.max_gap_s, gap)
+        if gap > self.OUTAGE_S:
+            self.outages += 1
+            self.outage_s += gap
+            return
+        if self._period is not None and gap >= self.HOLE_FACTOR * self._period:
+            self.holes += 1
+            self.missing += max(1, round(gap / self._period) - 1)
+            return                    # loss gaps do not feed the period estimate
+        self._gaps.append(gap)
+        self._n_gaps += 1
+        if len(self._gaps) > self.window:
+            del self._gaps[0]
+        if len(self._gaps) >= 11 and (self._period is None or self._n_gaps % 10 == 0):
+            self._period = sorted(self._gaps)[len(self._gaps) // 2]
+
+    def stats(self) -> dict:
+        return {"period_s": self._period, "missing": self.missing, "holes": self.holes,
+                "outages": self.outages, "outage_s": round(self.outage_s, 3), "backwards": self.backwards,
+                "max_gap_s": round(self.max_gap_s, 3)}
