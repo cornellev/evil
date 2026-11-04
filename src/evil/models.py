@@ -59,6 +59,7 @@ class MotorReading:
     rpm: float | None
     throttle: float | None
     device_ts_us: int | None = None
+    duty_cycle: float | None = None      # v2's motor.duty_cycle (separate from v1's throttle)
 
 
 @dataclass(frozen=True)
@@ -77,3 +78,4 @@ class RawSample:
     device_global_ts_us: int | None = None
     publish_ns: int | None = None
     filtered_speed: float | None = None
+    errcount: int | None = None          # v2's top-level errcount

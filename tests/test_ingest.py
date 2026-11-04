@@ -35,15 +35,13 @@ def test_ingest_sample_assigns_increasing_seq(conn):
     assert len(set(seqs)) == 5
 
 
-def test_replay_source_feeds_ingest(conn):
-    samples = [RawSample(run_id="run-1", ts=float(i)) for i in range(3)]
-    source = ReplaySource(samples)
+def test_replay_source_yields_envelopes_stamped_in_order():
+    from evil.ingestion.pipeline import Envelope
+    source = ReplaySource([{"a": 1}, Envelope(9.0, None, "not JSON: x"), {"a": 2}], start_ts=100.0, step_s=0.5)
 
     async def drain():
-        seqs = []
-        async for sample in source.samples():
-            seqs.append(ingest_sample(conn, sample))
-        return seqs
+        return [env async for env in source.envelopes()]
 
-    seqs = asyncio.run(drain())
-    assert len(seqs) == 3
+    envs = asyncio.run(drain())
+    assert [(e.ts, e.payload, e.error) for e in envs] == [(100.0, {"a": 1}, None), (9.0, None, "not JSON: x"),
+                                                         (101.0, {"a": 2}, None)]

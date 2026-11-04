@@ -77,3 +77,33 @@ def test_apply_schema_is_idempotent(conn):
 
     db.apply_schema(conn)
     db.apply_schema(conn)
+
+
+def test_a_version_2_database_gains_the_v2_columns_and_keeps_its_derived_data(tmp_path):
+    """The NUC's database is at user_version 2: upgrading must ADD motor.duty_cycle and
+    main_snapshot.errcount in place and must NOT drop turns/laps (only pre-2 databases are rebuilt)."""
+
+    from evil import db
+    from evil.ingest import ingest_sample
+    from evil.models import MotorReading, RawSample
+
+    path = str(tmp_path / "v2.db")
+    conn = db.connect(path)
+    db.apply_schema(conn)
+    conn.execute("ALTER TABLE motor DROP COLUMN duty_cycle")
+    conn.execute("ALTER TABLE main_snapshot DROP COLUMN errcount")
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.execute("INSERT INTO turns (run_id, turn_def_id, start_seq, end_seq, start_ts, end_ts) VALUES ('r', 1, 1, 2, 0, 1)")
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+    conn.close()
+
+    conn = db.connect(path)
+    db.apply_schema(conn)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    assert conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0] == 1
+    assert "duty_cycle" in {r["name"] for r in conn.execute("PRAGMA table_info(motor)")}
+    ingest_sample(conn, RawSample("r", 1.0, motor=MotorReading(1.0, 0.0, None, 5, 0.3), errcount=7))
+    assert conn.execute("SELECT errcount FROM main_snapshot").fetchone()[0] == 7
+    assert conn.execute("SELECT duty_cycle FROM motor").fetchone()[0] == 0.3
+    conn.close()

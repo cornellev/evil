@@ -4,16 +4,33 @@ Autonomy may move to Zenoh, either as a ROS2 rmw swap (this seam wouldn't
 even need a new adapter) or as a native Zenoh pub/sub with a different wire
 format (a new IngestionSource implementation, nothing else changes). See
 inference-agent/4.md section 6.
+
+A source only receives and decodes: it yields one `Envelope(receive_ts, payload, error)`
+per message and never validates, maps or drops anything. Schema detection, validation,
+repeat dropping and mapping happen in ingestion/pipeline.py, the same code uploads use,
+so a new transport cannot change what gets stored.
 """
 
 from __future__ import annotations
 
 from typing import AsyncIterator, Protocol
 
-from evil.models import RawSample
+from evil.ingestion.pipeline import Envelope
 
 
 class IngestionSource(Protocol):
-    def samples(self) -> AsyncIterator[RawSample]:
-        """Yield normalized samples for as long as the source is live."""
+    def envelopes(self) -> AsyncIterator[Envelope]:
+        """Yield one envelope per received message for as long as the source is live
+        (a finite source ends; a live one runs until cancelled). `ts` is the receive
+        time in epoch seconds; `payload` is the decoded JSON (bare NaN allowed);
+        undecodable messages are yielded with `error` set, not skipped."""
         ...
+
+
+def decode_json(text: str, receive_ts: float) -> Envelope:
+    """The shared decode step for text transports (ROS2 std_msgs/String, Zenoh bytes)."""
+    import json
+    try:
+        return Envelope(receive_ts, json.loads(text))
+    except (json.JSONDecodeError, TypeError) as exc:
+        return Envelope(receive_ts, None, f"not JSON: {getattr(exc, 'msg', exc)}")

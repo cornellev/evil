@@ -30,7 +30,14 @@ def connect_readonly(path: str) -> sqlite3.Connection:
 # duration/distance/energy/efficiency and reference data moved from circles (track_geometry) to
 # track_segments. Derived tables are rebuildable (scripts/reclassify), so an older database has them
 # dropped and recreated rather than altered.
-SCHEMA_VERSION = 2
+# 3 = v2 telemetry columns (motor.duty_cycle, main_snapshot.errcount), added in place.
+SCHEMA_VERSION = 3
+# Columns added after a table was first created: (table, column, type). CREATE TABLE IF NOT
+# EXISTS cannot add them to an existing database, so apply_schema adds any that are missing.
+_ADDED_COLUMNS = (
+    ("motor", "duty_cycle", "REAL"),
+    ("main_snapshot", "errcount", "INTEGER"),
+)
 _DERIVED_TABLES = ("turns", "turns_open_state", "straights", "laps", "laps_open_state", "classifier_cursor")
 
 
@@ -41,7 +48,7 @@ def apply_schema(conn: sqlite3.Connection, schema_dir: Path | None = None) -> No
     geometry) dropped; raw snapshots are untouched and `scripts/reclassify` rebuilds the rest."""
     directory = schema_dir or SCHEMA_DIR
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if version < SCHEMA_VERSION:
+    if version < 2:  # gate-based segments: old derived tables are dropped, not altered
         has_old = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name IN ('turns', 'track_geometry') LIMIT 1"
         ).fetchone()
@@ -50,6 +57,10 @@ def apply_schema(conn: sqlite3.Connection, schema_dir: Path | None = None) -> No
                 conn.execute(f"DROP TABLE IF EXISTS {table}")
     for sql_file in sorted(directory.glob("*.sql")):
         conn.executescript(sql_file.read_text())
+    for table, column, type_ in _ADDED_COLUMNS:
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if existing and column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_}")
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 

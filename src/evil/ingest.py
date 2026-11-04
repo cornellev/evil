@@ -61,18 +61,18 @@ def insert_sample(conn: sqlite3.Connection, sample: RawSample) -> int:
     if sample.motor is not None:
         mo = sample.motor
         motor_id = _row(
-            "INSERT INTO motor (run_id, ts, device_ts_us, rpm, throttle) VALUES (?, ?, ?, ?, ?)",
-            (run_id, mo.ts, mo.device_ts_us, mo.rpm, mo.throttle),
+            "INSERT INTO motor (run_id, ts, device_ts_us, rpm, throttle, duty_cycle) VALUES (?, ?, ?, ?, ?, ?)",
+            (run_id, mo.ts, mo.device_ts_us, mo.rpm, mo.throttle, mo.duty_cycle),
         )
 
     return _row(
         """INSERT INTO main_snapshot
                (run_id, global_ts, joulemeter_id, planner_id, gps_id, steering_id, rpm_front_id,
-                rpm_back_id, motor_id, device_seq, device_global_ts_us, publish_ns, filtered_speed)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                rpm_back_id, motor_id, device_seq, device_global_ts_us, publish_ns, filtered_speed, errcount)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (run_id, sample.ts, joulemeter_id, planner_id, gps_id, steering_id, rpm_ids["rpm_front"],
          rpm_ids["rpm_back"], motor_id, sample.device_seq, sample.device_global_ts_us,
-         sample.publish_ns, sample.filtered_speed),
+         sample.publish_ns, sample.filtered_speed, sample.errcount),
     )
 
 

@@ -1,14 +1,16 @@
-"""Proves the live compiler classifies incrementally as samples trickle in
+"""Proves the live compiler classifies incrementally as messages trickle in
 (via a delayed ReplaySource), not only once at shutdown -- the actual point
-of the event-driven wake design over blind fixed-interval polling.
+of the event-driven wake design over blind fixed-interval polling -- and that
+live messages go through the same strict pipeline as uploads.
 """
 
 import asyncio
 
 from evil.classifiers.segments import SegmentsClassifier
+from evil.ingestion.pipeline import Envelope
 from evil.ingestion.replay_source import ReplaySource
-from evil.models import GpsReading, RawSample
 from evil.scripts.run_live_compiler import LiveCompiler
+from telemetry_fixtures import payload
 from track_fixtures import ll, seed_line
 
 CENTER_LAT = 42.0
@@ -22,31 +24,37 @@ def _lon(x_m):
     return ll(x_m, 0.0)[1]
 
 
-def _gps_sample(ts, lon, speed):
-    return RawSample(run_id="run-1", ts=ts, gps=GpsReading(ts=ts, lat=CENTER_LAT, lon=lon, speed=speed))
+T0 = 1_775_000_000.0
+
+
+def _gps_sample(ts, lon, speed, seq=None):
+    """A strict v1 message at data time T0 + ts (publish stamp = receive stamp)."""
+    seq = seq if seq is not None else 2 + int(ts * 10)
+    p = payload(seq=seq, lat=CENTER_LAT, lon=lon, speed=speed, publish_ns=int((T0 + ts) * 1e9))
+    return Envelope(T0 + ts, p)
 
 
 def test_compiler_ticks_incrementally_while_samples_are_still_arriving(conn):
-    """Sleeps 0.35s, well after ~2 samples (entry included) have arrived but
-    before the 4th (exit) sample or the 10s fallback interval, then checks
-    mid-run state: the turn should already be open (proving classification
-    happened DURING the run, not only at shutdown) but not yet closed (since
-    nothing closes it until the exit sample). tick_count > 1 in that ~0.6s
+    """Messages are 3 s apart in data time and arrive 0.15 s apart in wall time.
+    Sleeps 0.5s (3 arrived: outside, entry, inside), then checks mid-run state:
+    the turn should already be open (classification happened DURING the run,
+    once the entry is older than the 2 s lookback in DATA time) but not yet
+    closed (nothing closes it until the exit message). tick_count > 1 in that
     run proves it was wake-driven, not the 10s fallback interval."""
     _seed_turn(conn)
     samples = [
         _gps_sample(0.0, _lon(-100.0), 20.0),  # outside
-        _gps_sample(1.0, _lon(-25.0), 8.0),  # entry (crosses the turn's entry gate)
-        _gps_sample(2.0, _lon(0.0), 9.0),  # inside
-        _gps_sample(3.0, _lon(75.0), 7.0),  # exit (crosses the exit gate)
+        _gps_sample(3.0, _lon(-25.0), 8.0),  # entry (crosses the turn's entry gate)
+        _gps_sample(6.0, _lon(0.0), 9.0),  # inside
+        _gps_sample(9.0, _lon(75.0), 7.0),  # exit (crosses the exit gate)
     ]
     source = ReplaySource(samples, delay_s=0.15)
-    compiler = LiveCompiler(conn, "run-1", source, [SegmentsClassifier()], max_interval_s=10.0)
+    compiler = LiveCompiler(conn, "run-1", source, [SegmentsClassifier()], max_interval_s=10.0, lock_after=1)
 
     async def scenario():
         task = asyncio.create_task(compiler.run())
 
-        await asyncio.sleep(0.35)
+        await asyncio.sleep(0.5)
         mid_run_open = conn.execute(
             "SELECT COUNT(*) AS n FROM segments_open_state WHERE run_id = 'run-1' AND ordinal IS NOT NULL"
         ).fetchone()["n"]
@@ -80,10 +88,34 @@ def test_final_tick_after_source_ends_catches_trailing_data(conn):
         _gps_sample(2.0, _lon(75.0), 7.0),  # exit -- arrives right as the source ends
     ]
     source = ReplaySource(samples, delay_s=0.0)
-    compiler = LiveCompiler(conn, "run-1", source, [SegmentsClassifier()], max_interval_s=10.0)
+    compiler = LiveCompiler(conn, "run-1", source, [SegmentsClassifier()], max_interval_s=10.0, lock_after=1)
 
     asyncio.run(asyncio.wait_for(compiler.run(), timeout=5.0))
 
     turn = conn.execute("SELECT * FROM turns WHERE run_id = 'run-1'").fetchone()
     assert turn is not None
     assert turn["exit_speed"] == 7.0
+
+
+def test_a_schema_change_mid_stream_closes_the_run_and_starts_another(conn):
+    from telemetry_fixtures import v2_payload
+    envs = [Envelope(T0 + i * 0.02, payload(seq=2 + 2 * i, publish_ns=int((T0 + i * 0.02) * 1e9))) for i in range(30)]
+    envs += [Envelope(T0 + 1 + i * 0.02, v2_payload(seq=2 + 2 * i, publish_ns=int((T0 + 1 + i * 0.02) * 1e9)))
+             for i in range(30)]
+    compiler = LiveCompiler(conn, "live-1", ReplaySource(envs), [SegmentsClassifier()], max_interval_s=10.0)
+    asyncio.run(asyncio.wait_for(compiler.run(), timeout=5.0))
+
+    assert compiler.runs == [("live-1", "evil.telemetry.v1"), ("live-1-2", "evil.telemetry.v2")]
+    counts = dict(conn.execute("SELECT run_id, COUNT(*) FROM main_snapshot GROUP BY run_id").fetchall())
+    assert counts == {"live-1": 30, "live-1-2": 30}
+    assert conn.execute("SELECT COUNT(errcount) FROM main_snapshot WHERE run_id = 'live-1-2'").fetchone()[0] == 30
+
+
+def test_a_stream_matching_no_schema_stores_nothing_and_counts_it(conn):
+    envs = [Envelope(T0 + i, {"gps": {"lat": 42.0, "lon": -76.0}, "speed": 5.0}) for i in range(50)]
+    compiler = LiveCompiler(conn, "live-1", ReplaySource(envs), [SegmentsClassifier()], max_interval_s=10.0)
+    asyncio.run(asyncio.wait_for(compiler.run(), timeout=5.0))
+
+    assert compiler.runs == [] and compiler.run_id is None
+    assert conn.execute("SELECT COUNT(*) FROM main_snapshot").fetchone()[0] == 0
+    assert compiler.counters()["unknown"]["rejected"] == 50
