@@ -179,3 +179,75 @@ def test_live_clock_leaves_messages_without_a_publish_stamp_on_receive_time():
     clock = LiveClock()
     assert clock.stamp(Envelope(7.0, {"x": 1})).ts == 7.0
     assert clock.stamp(Envelope(8.0, None, "not JSON")).ts == 8.0
+
+
+# ---- LossMeter -----------------------------------------------------------
+
+def _pub(t):
+    return Envelope(0.0, {"_t_publish_ns": int(t * 1e9)})
+
+
+def test_loss_meter_counts_clear_holes_and_ignores_jitter():
+    from evil.ingestion.pipeline import LossMeter
+    import random
+    rng = random.Random(3)
+    m = LossMeter()
+    t = 1000.0
+    for k in range(3000):
+        if k in (500, 501, 502):         # 3 messages lost
+            t += 0.02
+            continue
+        if 1500 <= k < 1505:             # 5 lost
+            t += 0.02
+            continue
+        if k == 2500:                    # 1 lost: indistinguishable from jitter, by design not counted
+            t += 0.02
+            continue
+        m.observe(_pub(t + rng.uniform(-0.004, 0.004)))   # real-data jitter
+        t += 0.02
+    s = m.stats()
+    assert s["holes"] == 2 and s["missing"] == 8 and s["outages"] == 0
+    assert abs(s["period_s"] - 0.02) < 0.001
+
+
+def test_loss_meter_separates_outages_and_adapts_to_the_rate():
+    from evil.ingestion.pipeline import LossMeter
+    m = LossMeter()
+    ts = [i * 0.1 for i in range(50)] + [4.9 + 10.0 + i * 0.1 for i in range(50)]   # 10 Hz, a 10 s outage
+    for t in ts:
+        m.observe(_pub(t))
+    m.observe(_pub(1.0))                                                        # backwards
+    s = m.stats()
+    assert abs(s["period_s"] - 0.1) < 1e-6 and s["missing"] == 0
+    assert s["outages"] == 1 and abs(s["outage_s"] - 10.0) < 1e-6 and s["backwards"] == 1
+
+
+# ---- ThreadBridge --------------------------------------------------------
+
+def test_thread_bridge_never_blocks_the_producer_and_counts_every_drop():
+    import asyncio
+    import threading
+    from evil.ingestion.base import ThreadBridge
+
+    async def scenario():
+        bridge = ThreadBridge(asyncio.get_running_loop(), maxsize=100)
+        n = 5000
+
+        def producer():
+            for i in range(n):
+                bridge.push(Envelope(float(i), {"i": i}))
+
+        th = threading.Thread(target=producer)
+        th.start()
+        th.join(timeout=5)                      # the consumer is not reading: the producer must still finish
+        assert not th.is_alive()
+        await asyncio.sleep(0.05)               # let the scheduled puts run
+        got = []
+        while not bridge.queue.empty():
+            got.append(bridge.queue.get_nowait().payload["i"])
+        return bridge, got, n
+
+    bridge, got, n = asyncio.run(scenario())
+    assert bridge.received == n and len(got) == 100 and bridge.overflow == n - 100
+    assert got == list(range(100))              # order kept; the newest are the ones dropped
+    assert bridge.stats()["max_queue_depth"] == 100
