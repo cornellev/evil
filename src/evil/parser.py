@@ -3,7 +3,10 @@ schema mapper, recording-catalog-design.md section 3.1).
 
 Container readers: rosbag2-sqlite3 (`.db3`, possibly split across several
 files) and `csv` (flattened payload keys plus a `timestamp` column in ns, as
-written by shleeco26-analysis's csv_converter). Schema mappers: the strict
+written by shleeco26-analysis's csv_converter), and `live-capture` (what the live
+compiler received for one live run: `<run_id>.live.tsv.gz`, receive time TAB message
+text per line; stamped with the same LiveClock as live, so a reparse reproduces the live
+rows; written to the car's live DB). Schema mappers: the strict
 registry in schemas/ (evil.telemetry.v1, evil.telemetry.v2, evil.telemetry.v1-dutycycle).
 
 A recording matches a schema by CONTENT, never by topic name: a std_msgs/String
@@ -32,12 +35,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
-from evil import catalog, db, schemas
+from evil import catalog, db, runs, schemas
 from evil.classifiers import metrics as run_metrics
 from evil.classifiers.runner import tick
 from evil.geo import haversine_m
 from evil.ingest import insert_sample
-from evil.ingestion.pipeline import Envelope, SchemaStream
+from evil.ingestion.base import decode_json
+from evil.ingestion.pipeline import Envelope, LiveClock, SchemaStream
 from evil.ingestion.rosbag_file_source import decode_std_msgs_string
 from evil.registered_classifiers import ALL_CLASSIFIERS
 from evil.schemas._strict import CAR
@@ -268,6 +272,27 @@ def match_csv(path: Path) -> tuple[Match | None, dict]:
     return (Match(schema.schema_id, path.name, len(decoded), len(decoded)) if schema else None), {path.name: entry}
 
 
+def _live_capture_envelopes(path: Path) -> Iterator[Envelope]:
+    import gzip
+    clock = LiveClock()
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        for line in f:
+            recv, _, text = line.rstrip("\n").partition("\t")
+            yield clock.stamp(decode_json(text, float(recv)))
+
+
+def match_live_capture(path: Path) -> tuple[Match | None, dict]:
+    try:
+        payloads = [e.payload if e.error is None else None for e in _live_capture_envelopes(path)]
+    except (OSError, ValueError, EOFError) as exc:
+        raise ContainerUnreadable(f"{path.name}: {exc}") from exc
+    if len(payloads) > SAMPLE_HEAD + SAMPLE_SPREAD:
+        step = (len(payloads) - SAMPLE_HEAD) / SAMPLE_SPREAD
+        payloads = payloads[:SAMPLE_HEAD] + [payloads[SAMPLE_HEAD + int(i * step)] for i in range(SAMPLE_SPREAD)]
+    schema, entry = _coverage_entry(payloads)
+    return (Match(schema.schema_id, path.name, len(payloads), len(payloads)) if schema else None), {path.name: entry}
+
+
 # ---- run ids and locations -----------------------------------------------
 
 def _local_date(epoch: float) -> str:
@@ -321,7 +346,9 @@ def _recording_files(cat: sqlite3.Connection, root: catalog.DataRoot, recording_
 
 def _messages(container: str, files: list[Path], stream: str) -> Iterator[Envelope]:
     """An envelope for every message of the matched stream (decode errors as `error`)."""
-    if container == "csv":
+    if container == catalog.LIVE_CAPTURE_CONTAINER:
+        yield from _live_capture_envelopes(files[0])
+    elif container == "csv":
         csv_file = next(f for f in files if f.name == stream or f.suffix.lower() == ".csv")
         for row in _csv_rows(csv_file):
             payload, ts, reason = _csv_row_to_payload(row)
@@ -385,10 +412,17 @@ def _parse(cat, root, rec, files, progress, parsed_db_path) -> ParseResult:
     container = rec["container"]
     if container == "unknown" and any(f.suffix.lower() == ".db3" for f in files):
         raise ContainerUnreadable("not a SQLite database")
-    if container not in ("rosbag2-sqlite3", "csv"):
+    if container not in ("rosbag2-sqlite3", "csv", catalog.LIVE_CAPTURE_CONTAINER):
         return ParseResult("skipped", message=f"no reader for container {container!r}")
 
-    if container == "rosbag2-sqlite3":
+    live_capture = container == catalog.LIVE_CAPTURE_CONTAINER
+    if live_capture:
+        match, coverage = match_live_capture(files[0])
+        if match is None and rec["schema_id"] in schemas.BY_ID:
+            # The live compiler already decided the schema (its detector tolerates junk while
+            # locking); a malformed message in the sample must not unparse a live run.
+            match = Match(rec["schema_id"], files[0].name, 0, 0)
+    elif container == "rosbag2-sqlite3":
         match, coverage = match_db3(db3_paths(files))
     else:
         csv_file = next((f for f in files if f.suffix.lower() == ".csv"), None)
@@ -401,7 +435,7 @@ def _parse(cat, root, rec, files, progress, parsed_db_path) -> ParseResult:
 
     schema = schemas.BY_ID[match.schema_id]
     car = rec["car"] or CAR
-    target = parsed_db_path or catalog.parsed_db_path(root, car)
+    target = parsed_db_path or (catalog.live_db_path(root, car) if live_capture else catalog.parsed_db_path(root, car))
     target.parent.mkdir(parents=True, exist_ok=True)
     run_id = assign_run_id(cat, rec)
     with cat:  # claim the run id before the long parse so a concurrent assign cannot reuse it
@@ -433,6 +467,16 @@ def _parse(cat, root, rec, files, progress, parsed_db_path) -> ParseResult:
         tick(parsed, run_id, ALL_CLASSIFIERS, now_ts=c.last_ts + 3600.0)
         run_metrics.store_run_summary(parsed, run_id)
         gps = _gps_summary(parsed, run_id)
+        with parsed:
+            # Uploads: row time IS the car's record time. Live captures keep the car-clock range
+            # the live compiler stored (COALESCE in upsert_run).
+            runs.upsert_run(parsed, run_id, tier="live" if live_capture else "upload",
+                            source="ros2" if live_capture else "file", schema_id=schema.schema_id, status="closed",
+                            started_at=c.first_ts, ended_at=c.last_ts,
+                            car_start=None if live_capture else c.first_ts, car_end=None if live_capture else c.last_ts,
+                            recording_id=rec["recording_id"])
+        if not live_capture:
+            runs.link_upload_and_live(parsed, catalog.live_db_path(root, car), run_id, cat)
     except BaseException:
         parsed.rollback()
         raise

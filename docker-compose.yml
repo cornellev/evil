@@ -119,17 +119,25 @@ services:
     profiles: ["live"] # only starts with `docker compose --profile live up`
     network_mode: host
     environment:
+      # Writes /data/parsed/uc26/evil_uc26_live.db (its own file: an upload parse never
+      # blocks live writes) and exports each closed run to raw/ as a live capture.
       EVIL_DATA_ROOT: /data
-      EVIL_DB_PATH: /data/parsed/uc26/evil_uc26.db
       # Same discovery setup as RED (RaceEngineerDashboard docker-compose.yml):
       # the car's DAQ is reached through a Fast DDS discovery server on
       # domain 14. Leave DISCOVERY_SERVER_IP empty for multicast discovery.
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-14}
       ROS_LOCALHOST_ONLY: "0"
       DISCOVERY_SERVER_IP: ${DISCOVERY_SERVER_IP:-}
+      # The car's bag service (RED's record button): a live run is exactly one onboard
+      # recording. Empty = gap mode (a session per burst of data, closed after
+      # EVIL_LIVE_GAP_S of silence); also the fallback while the bag service is unreachable.
+      BAG_SERVICE_URL: ${BAG_SERVICE_URL:-}
+      EVIL_LIVE_GAP_S: ${EVIL_LIVE_GAP_S:-60}
+      EVIL_LIVE_TOPIC: ${EVIL_LIVE_TOPIC:-spi_data}
     volumes:
       - evil-data:/data
-    command: ["python3", "-m", "evil.scripts.run_live_compiler", "race-day-1"]
+    command: ["python3", "-m", "evil.scripts.run_live_compiler"]
+    stop_grace_period: 30s # SIGTERM: commit + tick; the run is resumed (or closed) on restart
     restart: unless-stopped
 
 volumes:

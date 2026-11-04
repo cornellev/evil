@@ -33,10 +33,13 @@ SWITCH_AFTER = 20
 class Envelope:
     """One received message. `ts` is EVIL's row time in seconds (container record time for
     files, receive time for live). `payload` is the decoded JSON value (any type: validation
-    is the pipeline's job); `error` is set instead when the message could not be decoded."""
+    is the pipeline's job); `error` is set instead when the message could not be decoded.
+    `raw` is the message text as received (live sources), kept byte for byte in the live
+    capture so a live run can be reparsed exactly."""
     ts: float
     payload: Any = None
     error: str | None = None
+    raw: str | None = None
 
 
 @dataclass
@@ -65,6 +68,13 @@ class SchemaStream:
         self.counters = Counters()
         self._prev_key: str | None = None
         self._prev_seq: int | None = None
+        self._resume_key: tuple | None = None
+
+    def resume_after(self, device_seq: int | None, device_global_ts_us: int | None) -> None:
+        """Continue a run after a restart: a message repeating the last stored snapshot
+        (same DAQ seq and global_ts) is still a repeat."""
+        self._resume_key = (device_seq, device_global_ts_us)
+        self._prev_seq = device_seq
 
     def feed(self, env: Envelope) -> RawSample | None:
         """The sample to store for this message, or None (rejected or a repeat)."""
@@ -80,7 +90,8 @@ class SchemaStream:
             return None
         payload = env.payload
         key = self.schema.repeat_key(payload)
-        if key == self._prev_key:
+        resume_key, self._resume_key = self._resume_key, None
+        if key == self._prev_key or resume_key == (payload["seq"], payload["global_ts"]):
             c.duplicate += 1
             return None
         if self._prev_seq is not None and payload["seq"] == self._prev_seq:
@@ -122,6 +133,11 @@ class LiveDetector:
     @property
     def schema(self) -> StrictSchema | None:
         return self.stream.schema if self.stream else None
+
+    def lock_to(self, schema: StrictSchema, run_id: str) -> SchemaStream:
+        """Start already locked (resuming a run after a restart): no detection buffer."""
+        self.stream = SchemaStream(schema, run_id)
+        return self.stream
 
     def _lock(self, schema: StrictSchema, fed: Fed) -> None:
         if self.stream is not None:
@@ -239,7 +255,7 @@ class LiveClock:
                 self.offset = prev_ts + max(d_recv, 0.0) - pub_s
                 self.clock_jumps += 1
         self._prev = (pub_s, recv_s)
-        return Envelope(pub_s + self.offset, payload, env.error)
+        return Envelope(pub_s + self.offset, payload, env.error, env.raw)
 
 
 class LossMeter:

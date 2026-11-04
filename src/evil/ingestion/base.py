@@ -31,9 +31,9 @@ def decode_json(text: str, receive_ts: float) -> Envelope:
     """The shared decode step for text transports (ROS2 std_msgs/String, Zenoh bytes)."""
     import json
     try:
-        return Envelope(receive_ts, json.loads(text))
+        return Envelope(receive_ts, json.loads(text), raw=text)
     except (json.JSONDecodeError, TypeError) as exc:
-        return Envelope(receive_ts, None, f"not JSON: {getattr(exc, 'msg', exc)}")
+        return Envelope(receive_ts, None, f"not JSON: {getattr(exc, 'msg', exc)}", raw=text)
 
 
 class ThreadBridge:
