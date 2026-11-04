@@ -35,6 +35,8 @@ def test_registers_expected_tools_with_schemas(evil_db_path):
         "list_recordings",
         "describe_recording",
         "read_only_sql",
+        "get_live_status",
+        "get_live_window",
     }
 
     get_turn_tool = next(t for t in tools if t.name == "get_turn")

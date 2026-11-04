@@ -70,7 +70,8 @@ STATUS_EVERY_S = 10.0
 GAP_S = 60.0               # gap mode: silence that ends a session
 POLL_S = 1.0               # bag service poll interval
 UNREACHABLE_AFTER = 3      # consecutive failed polls before falling back to gap mode
-SUMMARY_EVERY_S = 10.0     # run_summary refresh while recording
+SUMMARY_EVERY_S = 10.0     # run_summary refresh while recording (data time)
+HEARTBEAT_EVERY_S = 2.0    # live_heartbeat row rewrite
 REBOOT_BACK_US = 1_000_000  # DAQ global_ts going back more than this (with seq going back) = reboot
 
 
@@ -143,6 +144,11 @@ class LiveCompiler:
         self._flush_handle: asyncio.TimerHandle | None = None
         self._latest_ts: dict[str, float] = {}
         self._last_summary = 0.0
+        self._last_heartbeat = 0.0
+        self.last_message_at: float | None = None
+        self.received = 0
+        self._rate_mark: tuple[float, int] = (time.monotonic(), 0)
+        self.msgs_per_s = 0.0
         self._wake = asyncio.Event()
         db.apply_schema(conn)
 
@@ -180,6 +186,7 @@ class LiveCompiler:
         self._open_run(session)
         log.info("session open (%s, %s%s): run %s", mode, reason, f", bag {bag_id[:12]}" if bag_id else "",
                  session.run_id)
+        self.heartbeat()
         return session
 
     def _open_run(self, session: Session) -> None:
@@ -219,6 +226,7 @@ class LiveCompiler:
         self.unknown_samples = (self.unknown_samples + session.detector.unknown.reject_samples)[:5]
         self._close_run(session.run_id, reason)
         log.info("session closed (%s): run %s", reason, session.run_id)
+        self.heartbeat()
 
     def _close_run(self, run_id: str, reason: str) -> None:
         self._flush()
@@ -409,6 +417,8 @@ class LiveCompiler:
 
     def on_envelope(self, env: Envelope) -> None:
         self.loss.observe(env)
+        self.last_message_at = env.ts
+        self.received += 1
         s = self.session
         if s is None:
             if self.bag_mode:
@@ -473,6 +483,25 @@ class LiveCompiler:
             self._wake.clear()
             self._flush()            # tick() commits on this connection: close the batch first
             self._tick_once()
+            if time.monotonic() - self._last_heartbeat >= HEARTBEAT_EVERY_S:
+                self.heartbeat()
+
+    def heartbeat(self) -> None:
+        """Rewrite the live_heartbeat row (readers: get_live_status, evil-ui)."""
+        mono = time.monotonic()
+        t0, n0 = self._rate_mark
+        if mono - t0 >= 1.0:
+            self.msgs_per_s = (self.received - n0) / (mono - t0)
+            self._rate_mark = (mono, self.received)
+        c = self.counters()
+        status = {**c, "run_id": self.run_id, "last_message_at": self.last_message_at,
+                  "msgs_per_s": round(self.msgs_per_s, 2), "received": self.received, "car": self.car,
+                  "gap_s": self.gap_s}
+        with self.conn:
+            self.conn.execute("INSERT INTO live_heartbeat (id, updated_at, status_json) VALUES (1, ?, ?) "
+                              "ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at, "
+                              "status_json = excluded.status_json", (self.now(), json.dumps(status, default=str)))
+        self._last_heartbeat = mono
 
     def _tick_run(self, run_id: str, final: bool = False) -> None:
         latest = self._latest_ts.get(run_id)
@@ -485,9 +514,12 @@ class LiveCompiler:
     def _tick_once(self, final: bool = False) -> None:
         if self.run_id is not None:
             self._tick_run(self.run_id, final=final)
-            if self._latest_ts.get(self.run_id) is not None and time.monotonic() - self._last_summary > SUMMARY_EVERY_S:
+            latest = self._latest_ts.get(self.run_id)
+            # every SUMMARY_EVERY_S of DATA time, like the classifiers: a 10x replay stays current
+            if latest is not None and (latest - self._last_summary >= SUMMARY_EVERY_S or latest < self._last_summary):
                 run_metrics.store_run_summary(self.conn, self.run_id)
-                self._last_summary = time.monotonic()
+                self.conn.commit()
+                self._last_summary = latest
         self.tick_count += 1
 
     def counters(self) -> dict:
@@ -549,6 +581,7 @@ class LiveCompiler:
             else:
                 self._flush()
                 self._tick_once()
+            self.heartbeat()
             log.info("stopped %s", self.status_line())
 
 
