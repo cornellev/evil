@@ -70,6 +70,7 @@ _RUN_TABLES_IN_DELETE_ORDER = (
     "turns", "segments_open_state", "laps", "laps_open_state", "straights", "classifier_cursor", "run_summary",
     "main_snapshot",
     "joulemeter", "steering", "rpm_front", "rpm_back", "gps", "motor", "local_planner",
+    "live_raw",                   # not `runs`: its live facts (end reason, bag id) are upserted, not rebuilt
 )
 
 

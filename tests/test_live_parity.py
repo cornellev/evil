@@ -146,7 +146,7 @@ def test_live_equals_offline(tmp_path, monkeypatch, make):
     stream = _stream(make)
     off, off_run, result = _offline(tmp_path, stream, monkeypatch)
     live, compiler = _live(tmp_path, stream)
-    live_run = compiler.run_id
+    live_run = compiler.runs[0][0]
 
     assert [r for r, _ in compiler.runs] == ["live-1"]                     # one run, no false schema switch
     assert compiler.runs[0][1] == result.schema_id

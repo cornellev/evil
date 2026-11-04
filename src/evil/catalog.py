@@ -90,6 +90,17 @@ def parsed_db_path(root: DataRoot, car: str | None) -> Path:
     return root.path / "parsed" / car / f"evil_{car}.db"
 
 
+def live_db_path(root: DataRoot, car: str | None) -> Path:
+    """The car's live database, written only by the live compiler: parsed/<car>/evil_<car>_live.db.
+    Separate from the parsed DB so an upload parse never blocks live writes (SQLite: one writer)."""
+    main = parsed_db_path(root, car)
+    return main.with_name(main.stem + "_live.db")
+
+
+LIVE_CAPTURE_CONTAINER = "live-capture"
+LIVE_CAPTURE_SUFFIX = ".live.tsv.gz"
+
+
 def ensure_parsed_db(root: DataRoot, car: str | None = None) -> Path:
     """Create the car's parsed DB with the current schema if it is missing, so
     the read-only MCP server always has a database to open (it never creates one).
@@ -117,7 +128,10 @@ def data_root_from_env() -> DataRoot:
 # Columns added after a catalog.db may already exist (CREATE TABLE IF NOT EXISTS
 # does not add them). Idempotent.
 _ADDED_COLUMNS = {
-    "recordings": {"parse_stats_json": "TEXT", "category_method": "TEXT"},   # category_method: 'manual' | 'auto'
+    "recordings": {"parse_stats_json": "TEXT", "category_method": "TEXT",   # category_method: 'manual' | 'auto'
+                   # 'upload' (a file someone uploaded) | 'live_capture' (what the live feed received for one live run)
+                   "kind": "TEXT NOT NULL DEFAULT 'upload'",
+                   "linked_recording_id": "TEXT"},                          # live capture <-> full upload of the same drive
     "named_locations": {"default_category": "TEXT"},                         # recordings made here get this category
 }
 
@@ -231,6 +245,8 @@ def detect_container(files: list["StagedFile"], root_dir: Path) -> str:
         return "unknown"
     if roles == {"csv"}:
         return "csv"
+    if len(files) == 1 and files[0].rel_path.endswith(LIVE_CAPTURE_SUFFIX):
+        return LIVE_CAPTURE_CONTAINER
     return "unknown"
 
 
@@ -464,6 +480,70 @@ def commit(conn: sqlite3.Connection, root: DataRoot, staging: Staging, fields: U
             return CommitResult(existing, True)
         raise
     return CommitResult(recording_id, False)
+
+
+def register_live_capture(conn: sqlite3.Connection, root: DataRoot, *, run_id: str, car: str, capture: Path,
+                          schema_id: str | None, recorded_start: float | None, recorded_end: float | None,
+                          rows_ingested: int, rows_duplicate: int, rows_rejected: int, stats: dict,
+                          reject_samples: list[dict] | None = None) -> str:
+    """Store a closed live run's capture file (`<run_id>.live.tsv.gz`: recv_ts TAB message text per line)
+    in the raw store and catalog it as kind 'live_capture', already parsed (the live compiler wrote the rows
+    into the live DB as they arrived). A reparse goes through the normal parse job and writes the live DB.
+    Idempotent per run_id: a second call returns the existing recording."""
+    existing = conn.execute("SELECT recording_id FROM recordings WHERE run_id = ?", (run_id,)).fetchone()
+    if existing:
+        return existing["recording_id"]
+    recording_id = new_id()
+    now = time.time()
+    data = capture.read_bytes()
+    sha = hashlib.sha256(data).hexdigest()
+    final_dir = _raw_dir(root, "telemetry", car, now, recording_id)
+    final_dir.mkdir(parents=True, exist_ok=True)
+    name = f"{run_id}{LIVE_CAPTURE_SUFFIX}"
+    (final_dir / name).write_bytes(data)
+    rec = {"recording_id": recording_id, "source": "telemetry", "car": car, "category": None, "event": None,
+           "label": f"live {run_id}", "notes": None, "uploader": "live-compiler", "original_name": name,
+           "uploaded_at": now, "container": LIVE_CAPTURE_CONTAINER, "total_bytes": len(data),
+           "content_sha256": hashlib.sha256(f"live:{run_id}:{sha}".encode()).hexdigest()}
+    files = [{"original_name": name, "rel_path": name, "size_bytes": len(data), "sha256": sha, "role": "other"}]
+    write_manifest(final_dir, rec, files)
+    rel_dir = final_dir.relative_to(root.raw).as_posix()
+    target = live_db_path(root, car).name
+    with conn:
+        conn.execute(
+            """INSERT INTO recordings (recording_id, run_id, kind, source, container, car, label, original_name,
+                   uploaded_at, uploader, storage_state, total_bytes, content_sha256, parse_status, parser_version,
+                   schema_id, target_db, rows_ingested, rows_duplicate, rows_rejected, reject_samples_json,
+                   parse_stats_json, recorded_start, recorded_end, time_source)
+               VALUES (:recording_id, :run_id, 'live_capture', :source, :container, :car, :label, :original_name,
+                   :uploaded_at, :uploader, 'stored', :total_bytes, :content_sha256, :status, :parser_version,
+                   :schema_id, :target, :rows, :dup, :rej, :rejects, :stats, :start, :end, 'live-publish-time')""",
+            {**rec, "run_id": run_id, "status": "parsed" if schema_id else "skipped",
+             "parser_version": _parser_version(schema_id), "schema_id": schema_id, "target": target,
+             "rows": rows_ingested, "dup": rows_duplicate, "rej": rows_rejected,
+             "rejects": json.dumps(reject_samples) if reject_samples else None, "stats": json.dumps(stats),
+             "start": recorded_start, "end": recorded_end})
+        conn.execute(
+            """INSERT INTO recording_files (file_id, recording_id, role, original_name, storage_backend, rel_path,
+                   size_bytes, sha256) VALUES (?, ?, 'other', ?, 'nuc-local', ?, ?, ?)""",
+            (new_id(), recording_id, name, f"{rel_dir}/{name}", len(data), sha))
+    apply_auto_category(conn)
+    return recording_id
+
+
+def _parser_version(schema_id: str | None) -> str | None:
+    if schema_id is None:
+        return None
+    from evil import schemas
+    return schemas.BY_ID[schema_id].parser_version
+
+
+def link_recordings(conn: sqlite3.Connection, upload_recording_id: str, live_recording_id: str) -> None:
+    with conn:
+        conn.execute("UPDATE recordings SET linked_recording_id = ? WHERE recording_id = ?",
+                     (live_recording_id, upload_recording_id))
+        conn.execute("UPDATE recordings SET linked_recording_id = ? WHERE recording_id = ?",
+                     (upload_recording_id, live_recording_id))
 
 
 # ---- queries and edits ---------------------------------------------------

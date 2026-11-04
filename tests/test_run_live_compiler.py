@@ -130,7 +130,7 @@ def test_writes_are_committed_in_batches_and_loss_is_reported(conn):
                             batch_rows=25)
     asyncio.run(asyncio.wait_for(compiler.run(), timeout=5.0))
     assert conn.execute("SELECT COUNT(*) FROM main_snapshot").fetchone()[0] == 127
-    assert compiler.commits == 6                                         # 5 full batches + the tail
+    assert 9 <= compiler.commits <= 12          # (127 rows + 127 raw messages) / 25 per batch, + the tail
     loss = compiler.counters()["loss"]
     assert (loss["holes"], loss["missing"]) == (1, 3)
     assert "lost~3" in compiler.status_line()
