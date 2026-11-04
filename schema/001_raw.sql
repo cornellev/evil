@@ -8,7 +8,8 @@
 -- tables hold the whole strict payload. Sensor columns are nullable: NaN (very
 -- common: no GPS fix, unplugged sensors) is stored as NULL. `ts` is EVIL's row
 -- time in seconds (container record time); `device_ts_us` is the group's own
--- device-clock timestamp, kept so staleness stays visible.
+-- device-clock timestamp, kept so staleness stays visible. v2 (evil.telemetry.v2) adds
+-- main_snapshot.errcount and motor.duty_cycle; columns a schema lacks are NULL.
 
 CREATE TABLE IF NOT EXISTS joulemeter (            -- payload "power"
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,7 +64,8 @@ CREATE TABLE IF NOT EXISTS motor (
     ts REAL NOT NULL,
     device_ts_us INTEGER,
     rpm REAL,
-    throttle REAL
+    throttle REAL,                                 -- v1 motor.throttle
+    duty_cycle REAL                                -- v2 motor.duty_cycle (not assumed to be throttle)
 );
 
 -- Autonomy planner output. Not part of the telemetry payload (provisional
@@ -90,7 +92,8 @@ CREATE TABLE IF NOT EXISTS main_snapshot (
     device_seq INTEGER,                            -- payload "seq" (DAQ seqlock counter)
     device_global_ts_us INTEGER,                   -- payload "global_ts"
     publish_ns INTEGER,                            -- payload "_t_publish_ns"
-    filtered_speed REAL                            -- payload "filtered.speed"
+    filtered_speed REAL,                           -- payload "filtered.speed"
+    errcount INTEGER                               -- payload "errcount" (v2 only)
 );
 
 CREATE INDEX IF NOT EXISTS idx_main_snapshot_run_seq ON main_snapshot(run_id, seq);

@@ -42,6 +42,13 @@ def v2_payload(seq: int = 2, **kw) -> dict:
     return p
 
 
+def transitional_payload(seq: int = 2, **kw) -> dict:
+    """The Apr 10 transitional shape: duty_cycle already, errcount not yet."""
+    p = payload(seq, **kw)
+    p["motor"] = {"ts": p["motor"]["ts"], "rpm": 0.0, "duty_cycle": 0.0}
+    return p
+
+
 def encode_cdr_string(text: str) -> bytes:
     body = text.encode() + b"\x00"
     return b"\x00\x01\x00\x00" + struct.pack("<I", len(body)) + body

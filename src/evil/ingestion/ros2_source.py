@@ -11,15 +11,15 @@ Exercise it against a real ROS2 environment before relying on it.
 
 from __future__ import annotations
 
-import json
+import time
 from typing import AsyncIterator
 
-from evil.ingestion.normalize import to_raw_sample
-from evil.models import RawSample
+from evil.ingestion.base import decode_json
+from evil.ingestion.pipeline import Envelope
 
 
 class Ros2Source:
-    def __init__(self, run_id: str, topic: str = "spi_data"):
+    def __init__(self, topic: str = "spi_data"):
         try:
             import rclpy  # noqa: F401
         except ImportError as exc:
@@ -28,10 +28,9 @@ class Ros2Source:
                 "(this is the same /spi_data topic tailscale-ros-telemetry publishes)."
             ) from exc
 
-        self._run_id = run_id
         self._topic = topic
 
-    async def samples(self) -> AsyncIterator[RawSample]:
+    async def envelopes(self) -> AsyncIterator[Envelope]:
         import rclpy
         from rclpy.node import Node
         from rclpy.qos import QoSProfile
@@ -39,15 +38,11 @@ class Ros2Source:
 
         rclpy.init(args=None)
         node = Node("evil_ros2_source")
-        queue: list[RawSample] = []
+        queue: list[Envelope] = []
 
         def _on_message(msg: String) -> None:
-            try:
-                payload = json.loads(msg.data)
-            except json.JSONDecodeError:
-                return
-            wall_ts = node.get_clock().now().nanoseconds / 1e9
-            queue.append(to_raw_sample(self._run_id, payload, ts=wall_ts))
+            # Receive time on EVIL's own clock; validation and mapping are the pipeline's job.
+            queue.append(decode_json(msg.data, time.time()))
 
         node.create_subscription(String, self._topic, _on_message, QoSProfile(depth=1))
         try:

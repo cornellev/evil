@@ -3,19 +3,20 @@ schema mapper, recording-catalog-design.md section 3.1).
 
 Container readers: rosbag2-sqlite3 (`.db3`, possibly split across several
 files) and `csv` (flattened payload keys plus a `timestamp` column in ns, as
-written by shleeco26-analysis's csv_converter). Schema mapper:
-evil.telemetry.v1 (schemas/telemetry_v1.py).
+written by shleeco26-analysis's csv_converter). Schema mappers: the strict
+registry in schemas/ (evil.telemetry.v1, evil.telemetry.v2, evil.telemetry.v1-dutycycle).
 
 A recording matches a schema by CONTENT, never by topic name: a std_msgs/String
-stream matches when every message in a sample (first 50 plus 50 spread through
-the file, or all if fewer) conforms exactly. Once matched, every message is
+stream matches a schema when every message in a sample (first 50 plus 50 spread
+through the file, or all if fewer) conforms exactly to it (schemas.detect). Once matched, every message is
 parsed; a non-conforming message is rejected and counted, never coerced.
 No match is not a failure: the recording is `skipped` (stored, cataloged,
 scanned, simply not tabulated).
 
 Consecutive repeat snapshots (same seq/ts/body, only `_t_publish_ns` differs:
 the 50 Hz publisher re-reading an unchanged DAQ snapshot) are dropped and
-counted in `rows_duplicate`. Re-parse is idempotent (the run is deleted first,
+counted in `rows_duplicate`. The per-message steps live in ingestion/pipeline.py,
+shared with the live compiler. Re-parse is idempotent (the run is deleted first,
 inside the same transaction as the inserts).
 """
 
@@ -26,26 +27,26 @@ import json
 import math
 import re
 import sqlite3
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
-from evil import catalog, db
+from evil import catalog, db, schemas
 from evil.classifiers import metrics as run_metrics
 from evil.classifiers.runner import tick
 from evil.geo import haversine_m
 from evil.ingest import insert_sample
+from evil.ingestion.pipeline import Envelope, SchemaStream
 from evil.ingestion.rosbag_file_source import decode_std_msgs_string
 from evil.registered_classifiers import ALL_CLASSIFIERS
-from evil.schemas import telemetry_v1 as v1
+from evil.schemas._strict import CAR
 
 STRING_TYPE = "std_msgs/msg/String"
 SAMPLE_HEAD = 50
 SAMPLE_SPREAD = 50
 PROGRESS_EVERY = 5000
-MAX_REJECT_SAMPLES = 5
+KNOWN_SCHEMAS = ", ".join(s.schema_id for s in schemas.SCHEMAS)
 
 ProgressFn = Callable[[float], None]
 
@@ -221,9 +222,11 @@ def _csv_rows(path: Path) -> Iterator[dict[str, str]]:
 
 # ---- matching ------------------------------------------------------------
 
-def _sample_conformance(items: list[tuple[dict | None, str | None]]) -> tuple[int, int]:
-    ok = sum(1 for payload, reason in items if reason is None and v1.conforms(payload))
-    return ok, len(items)
+def _coverage_entry(payloads: list) -> tuple[schemas.StrictSchema | None, dict]:
+    counts, total = schemas.coverage(payloads)
+    entry: dict = {sid: (n / total if total else 0.0) for sid, n in counts.items()}
+    entry["sampled"] = total
+    return schemas.detect(payloads), entry
 
 
 def match_db3(paths: list[Path]) -> tuple[Match | None, dict]:
@@ -236,31 +239,33 @@ def match_db3(paths: list[Path]) -> tuple[Match | None, dict]:
             if type_ != STRING_TYPE or not count:
                 continue
             decoded = [_decode_string_payload(d) for _ts, d in _db3_sample(path, name)]
-            ok, total = _sample_conformance(decoded)
-            coverage[name] = {v1.SCHEMA_ID: ok / total if total else 0.0, "sampled": total}
-            if total and ok == total and best is None:
-                best = Match(v1.SCHEMA_ID, name, total, ok)
+            schema, coverage[name] = _coverage_entry([p if r is None else None for p, r in decoded])
+            if schema is not None and best is None:
+                best = Match(schema.schema_id, name, len(decoded), len(decoded))
     return best, coverage
 
 
 def match_csv(path: Path) -> tuple[Match | None, dict]:
     header = _csv_header(path)
-    expected = v1.flat_keys() | {"timestamp"}
-    if set(header) != expected or len(header) != len(set(header)):
+    candidates = [s for s in schemas.SCHEMAS if set(header) == s.flat_keys() | {"timestamp"}]
+    if not candidates or len(header) != len(set(header)):
+        closest = min(schemas.SCHEMAS, key=lambda s: len(set(header) ^ (s.flat_keys() | {"timestamp"})))
+        expected = closest.flat_keys() | {"timestamp"}
         extra, missing = sorted(set(header) - expected)[:5], sorted(expected - set(header))[:5]
-        return None, {path.name: {v1.SCHEMA_ID: 0.0, "header_extra": extra, "header_missing": missing}}
+        entry = {sid: 0.0 for sid in schemas.BY_ID}
+        entry.update({"closest": closest.schema_id, "header_extra": extra, "header_missing": missing})
+        return None, {path.name: entry}
     rows = list(_csv_rows(path))  # CSV exports are tens of MB
     if not rows:
-        return None, {path.name: {v1.SCHEMA_ID: 0.0, "sampled": 0}}
+        return None, {path.name: {**{sid: 0.0 for sid in schemas.BY_ID}, "sampled": 0}}
     if len(rows) <= SAMPLE_HEAD + SAMPLE_SPREAD:
         picks = rows
     else:
         step = (len(rows) - SAMPLE_HEAD) / SAMPLE_SPREAD
         picks = rows[:SAMPLE_HEAD] + [rows[SAMPLE_HEAD + int(i * step)] for i in range(SAMPLE_SPREAD)]
-    decoded = [(p, r) for p, _ts, r in (_csv_row_to_payload(row) for row in picks)]
-    ok, total = _sample_conformance(decoded)
-    coverage = {path.name: {v1.SCHEMA_ID: ok / total, "sampled": total}}
-    return (Match(v1.SCHEMA_ID, path.name, total, ok) if ok == total else None), coverage
+    decoded = [p if r is None else None for p, _ts, r in (_csv_row_to_payload(row) for row in picks)]
+    schema, entry = _coverage_entry(decoded)
+    return (Match(schema.schema_id, path.name, len(decoded), len(decoded)) if schema else None), {path.name: entry}
 
 
 # ---- run ids and locations -----------------------------------------------
@@ -314,18 +319,18 @@ def _recording_files(cat: sqlite3.Connection, root: catalog.DataRoot, recording_
         "SELECT rel_path FROM recording_files WHERE recording_id = ? ORDER BY rel_path", (recording_id,))]
 
 
-def _messages(container: str, files: list[Path], stream: str) -> Iterator[tuple[float, dict | None, str | None]]:
-    """(record_ts_s, payload, reject_reason) for every message of the matched stream."""
+def _messages(container: str, files: list[Path], stream: str) -> Iterator[Envelope]:
+    """An envelope for every message of the matched stream (decode errors as `error`)."""
     if container == "csv":
         csv_file = next(f for f in files if f.name == stream or f.suffix.lower() == ".csv")
         for row in _csv_rows(csv_file):
             payload, ts, reason = _csv_row_to_payload(row)
-            yield (ts if ts is not None else 0.0), payload, reason
+            yield Envelope(ts if ts is not None else 0.0, payload, reason)
     else:
         for path in db3_paths(files):
             for ts, data in _db3_messages(path, stream):
                 payload, reason = _decode_string_payload(data)
-                yield ts, payload, reason
+                yield Envelope(ts, payload, reason)
 
 
 def parse_recording(
@@ -368,7 +373,7 @@ def _finish(cat: sqlite3.Connection, recording_id: str, r: ParseResult) -> None:
                    rows_ingested = ?, rows_duplicate = ?, rows_rejected = ?, reject_samples_json = ?,
                    parse_stats_json = ?, parse_error = ?
                WHERE recording_id = ?""",
-            (r.status, v1.PARSER_VERSION if r.status == "parsed" else None, r.schema_id, r.matched_stream,
+            (r.status, schemas.BY_ID[r.schema_id].parser_version if r.status == "parsed" else None, r.schema_id, r.matched_stream,
              r.rows_ingested if r.status == "parsed" else None, r.rows_duplicate if r.status == "parsed" else None,
              r.rows_rejected if r.status == "parsed" else None,
              json.dumps(r.reject_samples) if r.reject_samples else None,
@@ -392,9 +397,10 @@ def _parse(cat, root, rec, files, progress, parsed_db_path) -> ParseResult:
         cat.execute("UPDATE recordings SET schema_match_json = ? WHERE recording_id = ?",
                     (json.dumps(coverage), rec["recording_id"]))
     if match is None:
-        return ParseResult("skipped", message="no stream matches a known schema (evil.telemetry.v1)")
+        return ParseResult("skipped", message=f"no stream matches a known schema ({KNOWN_SCHEMAS})")
 
-    car = rec["car"] or v1.CAR
+    schema = schemas.BY_ID[match.schema_id]
+    car = rec["car"] or CAR
     target = parsed_db_path or catalog.parsed_db_path(root, car)
     target.parent.mkdir(parents=True, exist_ok=True)
     run_id = assign_run_id(cat, rec)
@@ -406,45 +412,25 @@ def _parse(cat, root, rec, files, progress, parsed_db_path) -> ParseResult:
         if container == "rosbag2-sqlite3" else 0
     parsed = db.connect(str(target))
     db.apply_schema(parsed)
-    stored = dup = rejected = conflicts = seen = 0
-    rejects: list[dict] = []
-    first_ts = last_ts = None
-    prev_key: str | None = None
-    prev_seq: int | None = None
+    stream = SchemaStream(schema, run_id)
+    c = stream.counters
     try:
         parsed.execute("BEGIN")
         db.delete_run(parsed, run_id)
-        for ts, payload, reason in _messages(container, files, match.stream):
-            seen += 1
-            if progress and seen % PROGRESS_EVERY == 0:
-                progress(min(0.95, seen / total) if total else 0.5)
-            if reason is None:
-                bad = v1.validate(payload)
-                reason = "; ".join(bad) if bad else None
-            if reason is not None:
-                rejected += 1
-                if len(rejects) < MAX_REJECT_SAMPLES:
-                    rejects.append({"index": seen - 1, "ts": ts, "reason": reason})
-                continue
-            key = v1.repeat_key(payload)
-            if key == prev_key:
-                dup += 1
-                continue
-            if prev_seq is not None and payload["seq"] == prev_seq:
-                conflicts += 1  # same DAQ seq, different body: kept, but worth knowing
-            prev_key, prev_seq = key, payload["seq"]
-            insert_sample(parsed, v1.to_sample(run_id, payload, ts))
-            stored += 1
-            first_ts = ts if first_ts is None else first_ts
-            last_ts = ts
-        if stored == 0:
+        for env in _messages(container, files, match.stream):
+            sample = stream.feed(env)
+            if progress and c.seen % PROGRESS_EVERY == 0:
+                progress(min(0.95, c.seen / total) if total else 0.5)
+            if sample is not None:
+                insert_sample(parsed, sample)
+        if c.stored == 0:
             parsed.rollback()
-            return ParseResult("failed", run_id, v1.SCHEMA_ID, match.stream, 0, dup, rejected, rejects,
-                               message="matched a schema but no message was valid")
+            return ParseResult("failed", run_id, schema.schema_id, match.stream, 0, c.duplicate, c.rejected,
+                               c.reject_samples, message="matched a schema but no message was valid")
         parsed.commit()
         if progress:
             progress(0.97)
-        tick(parsed, run_id, ALL_CLASSIFIERS, now_ts=last_ts + 3600.0)
+        tick(parsed, run_id, ALL_CLASSIFIERS, now_ts=c.last_ts + 3600.0)
         run_metrics.store_run_summary(parsed, run_id)
         gps = _gps_summary(parsed, run_id)
     except BaseException:
@@ -453,9 +439,11 @@ def _parse(cat, root, rec, files, progress, parsed_db_path) -> ParseResult:
     finally:
         parsed.close()
 
+    first_ts, last_ts = c.first_ts, c.last_ts
     _record_context(cat, rec, target, first_ts, last_ts, gps)
-    stats = {"messages_seen": seen, "seq_conflicts": conflicts}
-    return ParseResult("parsed", run_id, v1.SCHEMA_ID, match.stream, stored, dup, rejected, rejects, stats)
+    stats = {"messages_seen": c.seen, "seq_conflicts": c.seq_conflicts}
+    return ParseResult("parsed", run_id, schema.schema_id, match.stream, c.stored, c.duplicate, c.rejected,
+                       c.reject_samples, stats)
 
 
 def _record_context(cat, rec, target: Path, first_ts, last_ts, gps: dict | None) -> None:

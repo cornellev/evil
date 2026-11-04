@@ -1,12 +1,10 @@
 import io
 import json
-import sqlite3
-import time
 
 import pytest
 
 from evil import catalog, db, parser, scan
-from telemetry_fixtures import NAN, payload, v2_payload, write_csv, write_db3
+from telemetry_fixtures import payload, transitional_payload, v2_payload, write_csv, write_db3
 
 T0 = 1_775_000_000.0  # an April 2026 epoch
 
@@ -215,11 +213,54 @@ def test_a_bag_with_no_matching_stream_is_skipped_not_failed(tmp_path, root, cat
     assert not catalog.parsed_db_path(root, "uc26").exists()
 
 
-def test_the_later_v2_shape_is_stored_but_skipped(tmp_path, root, cat):
+def test_a_v2_bag_parses_with_errcount_and_duty_cycle_in_their_own_columns(tmp_path, root, cat):
     msgs = [(T0 + i * 0.02, v2_payload(seq=2 + 2 * i)) for i in range(5)]
+    msgs[2][1]["motor"]["duty_cycle"] = 0.42
+    rid = _upload(cat, root, {"b.db3": _bag(tmp_path, msgs)})
+
+    r = parser.parse_recording(root, rid)
+
+    rec = catalog.get_recording(cat, rid)
+    assert r.status == "parsed" and r.rows_ingested == 5
+    assert rec["schema_id"] == "evil.telemetry.v2" and rec["parser_version"] == "telemetry.v2/1"
+    p = _parsed(root)
+    assert {row[0] for row in p.execute("SELECT errcount FROM main_snapshot")} == {35}
+    assert tuple(p.execute("SELECT MAX(duty_cycle), COUNT(throttle) FROM motor").fetchone()) == (0.42, 0)
+
+
+def test_a_v1_bag_leaves_the_v2_columns_null(tmp_path, root, cat):
+    rid = _upload(cat, root, {"b.db3": _bag(tmp_path, _msgs(3))})
+    parser.parse_recording(root, rid)
+    p = _parsed(root)
+    assert p.execute("SELECT COUNT(errcount) FROM main_snapshot").fetchone()[0] == 0
+    assert tuple(p.execute("SELECT COUNT(duty_cycle), COUNT(throttle) FROM motor").fetchone()) == (0, 3)
+
+
+def test_the_apr10_transitional_shape_is_its_own_schema(tmp_path, root, cat):
+    msgs = [(T0 + i * 0.02, transitional_payload(seq=2 + 2 * i)) for i in range(4)]
+    rid = _upload(cat, root, {"bag_20260410-124638.db3": _bag(tmp_path, msgs)})
+    r = parser.parse_recording(root, rid)
+    assert r.status == "parsed" and r.schema_id == "evil.telemetry.v1-dutycycle"
+    assert _parsed(root).execute("SELECT COUNT(errcount) FROM main_snapshot").fetchone()[0] == 0
+
+
+def test_a_stream_mixing_v1_and_v2_matches_neither(tmp_path, root, cat):
+    msgs = [(T0 + i * 0.02, (payload if i % 2 else v2_payload)(seq=2 + 2 * i)) for i in range(10)]
     rid = _upload(cat, root, {"b.db3": _bag(tmp_path, msgs)})
     assert parser.parse_recording(root, rid).status == "skipped"
-    assert catalog.get_recording(cat, rid)["files"]  # still stored
+    cov = json.loads(catalog.get_recording(cat, rid)["schema_match_json"])["/spi_data"]
+    assert cov["evil.telemetry.v1"] == 0.5 and cov["evil.telemetry.v2"] == 0.5 and cov["sampled"] == 10
+
+
+def test_v1_messages_inside_a_v2_stream_are_rejected_not_coerced(tmp_path, root, cat, monkeypatch):
+    monkeypatch.setattr(parser, "SAMPLE_HEAD", 3)
+    monkeypatch.setattr(parser, "SAMPLE_SPREAD", 0)
+    msgs = [(T0 + i * 0.02, v2_payload(seq=2 + 2 * i)) for i in range(6)]
+    msgs[4] = (msgs[4][0], payload(seq=99))
+    rid = _upload(cat, root, {"b.db3": _bag(tmp_path, msgs)})
+    r = parser.parse_recording(root, rid)
+    assert r.status == "parsed" and r.rows_ingested == 5 and r.rows_rejected == 1
+    assert "errcount" in r.reject_samples[0]["reason"]
 
 
 def test_a_half_conforming_stream_does_not_match(tmp_path, root, cat):
@@ -266,13 +307,20 @@ def test_csv_with_the_v1_header_parses_including_nan(tmp_path, root, cat):
     assert p.execute("SELECT global_ts FROM main_snapshot ORDER BY seq").fetchone()[0] == pytest.approx(T0)
 
 
-def test_csv_with_a_different_header_is_skipped(tmp_path, root, cat):
+def test_csv_with_the_v2_header_parses(tmp_path, root, cat):
     items = [(T0 + i * 0.02, v2_payload(seq=2 + 2 * i)) for i in range(3)]
     rid = _upload(cat, root, {"0411.csv": write_csv(tmp_path / "x.csv", items)})
     r = parser.parse_recording(root, rid)
+    assert r.status == "parsed" and r.schema_id == "evil.telemetry.v2" and r.rows_ingested == 3
+
+
+def test_csv_with_an_unknown_header_is_skipped_and_names_the_closest_schema(tmp_path, root, cat):
+    items = [(T0 + i * 0.02, v2_payload(seq=2 + 2 * i)) for i in range(3)]
+    rid = _upload(cat, root, {"x.csv": write_csv(tmp_path / "x.csv", items, extra_header=["lap_marker"])})
+    r = parser.parse_recording(root, rid)
     assert r.status == "skipped"
-    cov = json.loads(catalog.get_recording(cat, rid)["schema_match_json"])
-    assert "errcount" in json.dumps(cov)
+    cov = json.loads(catalog.get_recording(cat, rid)["schema_match_json"])["x.csv"]
+    assert cov["closest"] == "evil.telemetry.v2" and cov["header_extra"] == ["lap_marker"]
 
 
 def test_loose_dashboard_csv_is_skipped(root, cat):
