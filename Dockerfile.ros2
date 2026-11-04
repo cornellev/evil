@@ -1,9 +1,9 @@
 # Real ROS2 image for the live compiler only -- mcp-server and upload use
 # the lighter python:3.12-slim Dockerfile since they never import
 # evil.ingestion.ros2_source (rclpy import is deferred to that module, see
-# scripts/run_live_compiler.py's main()). Base image ships /ros_entrypoint.sh,
-# which sources /opt/ros/humble/setup.bash before exec'ing CMD -- don't
-# override ENTRYPOINT or that sourcing is lost.
+# scripts/run_live_compiler.py's main()). ENTRYPOINT is docker/ros2_entrypoint.sh:
+# it sources /opt/ros/humble/setup.bash itself and, when DISCOVERY_SERVER_IP
+# is set, joins that Fast DDS discovery server (same as RED's backend).
 #
 # No apt-get/pip install here on purpose: the live compiler's whole import
 # chain (db, classifiers, ingest, ros2_source) is stdlib + rclpy/std_msgs,
@@ -15,10 +15,13 @@ WORKDIR /app
 
 COPY schema/ schema/
 COPY src/ src/
+COPY docker/ docker/
 
 ENV PYTHONPATH=/app/src
 ENV EVIL_DB_PATH=/data/parsed/uc26/evil_uc26.db
 
 VOLUME ["/data"]
+
+ENTRYPOINT ["/app/docker/ros2_entrypoint.sh"]
 
 CMD ["python3", "-m", "evil.scripts.run_live_compiler", "race-day-1"]

@@ -17,10 +17,9 @@
 # shape, but is NOT started by a bare `docker compose up` (see the "live"
 # profile below): it needs rclpy / a real ROS2 environment, so it builds
 # from Dockerfile.ros2 (ros:humble-ros-base) instead of this repo's default
-# python:3.12-slim Dockerfile. Uses host networking since ROS2's default DDS
-# discovery relies on multicast, which isn't reliable across an isolated
-# docker bridge network -- matches how it'd need to see the LAN/tailnet
-# directly on the real device anyway.
+# python:3.12-slim Dockerfile. Uses host networking so it can reach the car's
+# discovery server over the tailnet directly (and so multicast discovery
+# works when DISCOVERY_SERVER_IP is unset).
 services:
   mcp-server:
     build: .
@@ -122,6 +121,12 @@ services:
     environment:
       EVIL_DATA_ROOT: /data
       EVIL_DB_PATH: /data/parsed/uc26/evil_uc26.db
+      # Same discovery setup as RED (RaceEngineerDashboard docker-compose.yml):
+      # the car's DAQ is reached through a Fast DDS discovery server on
+      # domain 14. Leave DISCOVERY_SERVER_IP empty for multicast discovery.
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-14}
+      ROS_LOCALHOST_ONLY: "0"
+      DISCOVERY_SERVER_IP: ${DISCOVERY_SERVER_IP:-}
     volumes:
       - evil-data:/data
     command: ["python3", "-m", "evil.scripts.run_live_compiler", "race-day-1"]
