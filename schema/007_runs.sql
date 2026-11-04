@@ -33,3 +33,13 @@ CREATE TABLE IF NOT EXISTS live_raw (
     text     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_live_raw_run ON live_raw(run_id, id);
+
+-- Live only: one row, rewritten by the live compiler every ~2 s and on every session change,
+-- so readers (get_live_status, evil-ui's status panel) know whether the feed is alive even
+-- when nothing is recording. status_json: recording, run_id, session_mode, bag (configured /
+-- reachable / running), last_message_at, msgs_per_s, loss, overflow, unknown, per-run counters.
+CREATE TABLE IF NOT EXISTS live_heartbeat (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    updated_at  REAL NOT NULL,
+    status_json TEXT NOT NULL
+);

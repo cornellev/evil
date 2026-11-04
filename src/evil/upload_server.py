@@ -219,7 +219,7 @@ def _parse_when(value: str | None) -> float | None:
 @app.get("/recordings")
 async def list_recordings(since: str | None = None, until: str | None = None, category: str | None = None,
                           car: str | None = None, parse_status: str | None = None, source: str | None = None,
-                          limit: int = 100, offset: int = 0) -> list[dict]:
+                          kind: str | None = None, limit: int = 100, offset: int = 0) -> list[dict]:
     root = _root()
 
     def run():
@@ -227,7 +227,7 @@ async def list_recordings(since: str | None = None, until: str | None = None, ca
         try:
             return catalog.list_recordings(conn, since=_parse_when(since), until=_parse_when(until),
                                            category=category, car=car, parse_status=parse_status,
-                                           source=source, limit=limit, offset=offset)
+                                           source=source, kind=kind, limit=limit, offset=offset)
         finally:
             conn.close()
 

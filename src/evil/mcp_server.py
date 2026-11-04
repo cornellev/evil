@@ -7,7 +7,10 @@ next to the database file.
 Concurrency: each tool call opens its own short-lived read-only connection
 and runs the blocking sqlite call via a thread offload, so many concurrent
 callers can't serialize behind one shared connection or block the server's
-event loop. There is deliberately no single-in-flight lock here (unlike
+event loop. Two databases: the main one (uploads) and the car's live one (written by
+the live compiler, evil_<car>_live.db next to it). Run-scoped tools open whichever holds
+the run; list_runs merges both; read_only_sql sees the live one attached as `live`.
+There is deliberately no single-in-flight lock here (unlike
 tern-llm's /ask endpoint) -- that lock protects one scarce local LLM
 inference slot, which doesn't exist on this side: external MCP clients run
 their own model inference elsewhere, this server only ever does DB reads.
@@ -17,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 from typing import Any, Callable
 
 from mcp.server.mcpserver import MCPServer
@@ -29,9 +33,9 @@ from evil.tools.compare_turn_instances import compare_turn_instances
 from evil.tools.get_straight import get_straight
 from evil.tools.get_turn import get_turn
 from evil.tools.list_laps import list_laps
-from evil.tools.list_runs import list_runs
 from evil.tools.list_straights import list_straights
 from evil.tools.list_turns import list_turns
+from evil.tools.live_tools import get_live_status, get_live_window, list_runs_all, run_tier
 from evil.tools.catalog_tools import describe_recording, find_nas_files, list_recordings
 from evil.tools.read_only_sql import read_only_sql
 from evil.tools.segment_tools import list_track_segments
@@ -52,6 +56,62 @@ def _run_readonly(path: str, fn: Callable[..., Any], **kwargs: Any) -> Any:
         conn.close()
 
 
+def default_live_path(main_path: str) -> str:
+    """EVIL_LIVE_DB_PATH, else evil_<car>_live.db next to the main DB (catalog.live_db_path)."""
+    explicit = os.getenv("EVIL_LIVE_DB_PATH")
+    if explicit:
+        return explicit
+    p = Path(main_path)
+    return str(p.with_name(p.stem + "_live.db"))
+
+
+def _open_live(live_path: str):
+    return connect_readonly(live_path) if Path(live_path).exists() else None
+
+
+def _run_both(path: str, live_path: str, fn: Callable[..., Any], **kwargs: Any) -> Any:
+    """fn(main_conn, live_conn_or_None, **kwargs)."""
+    main = connect_readonly(path)
+    live = _open_live(live_path)
+    try:
+        return fn(main, live, **kwargs)
+    finally:
+        main.close()
+        if live is not None:
+            live.close()
+
+
+def _run_live(live_path: str, fn: Callable[..., Any], **kwargs: Any) -> Any:
+    live = _open_live(live_path)
+    try:
+        return fn(live, **kwargs)
+    finally:
+        if live is not None:
+            live.close()
+
+
+def _run_for_run(path: str, live_path: str, fn: Callable[..., Any], run_id: str, **kwargs: Any) -> Any:
+    """A run-scoped tool against whichever DB holds run_id (live runs are in the live DB)."""
+    live = _open_live(live_path)
+    try:
+        if live is not None and run_tier(live, run_id):
+            return fn(live, run_id=run_id, **kwargs)
+    finally:
+        if live is not None:
+            live.close()
+    return _run_readonly(path, fn, run_id=run_id, **kwargs)
+
+
+def _sql_with_live(path: str, live_path: str, query: str) -> Any:
+    conn = connect_readonly(path)
+    try:
+        if Path(live_path).exists():
+            conn.execute("ATTACH DATABASE ? AS live", (f"file:{live_path}?mode=ro",))
+        return read_only_sql(conn, query=query)
+    finally:
+        conn.close()
+
+
 def _run_catalog(catalog_path: str, fn: Callable[..., Any], **kwargs: Any) -> Any:
     """Like _run_readonly but over catalog.db. The MCP server never creates or
     writes the catalog; before the first upload there is none, and tools see None."""
@@ -67,10 +127,12 @@ def default_catalog_path() -> str:
     return os.getenv("EVIL_CATALOG_PATH") or str(catalog.data_root_from_env().catalog_db)
 
 
-def create_server(db_path: str | None = None, catalog_path: str | None = None) -> MCPServer:
+def create_server(db_path: str | None = None, catalog_path: str | None = None,
+                  live_db_path: str | None = None) -> MCPServer:
     """Factory (not a module-level singleton) so tests can point a server at
     a throwaway database instead of the production EVIL_DB_PATH."""
     path = db_path or DEFAULT_DB_PATH
+    live_path = live_db_path or default_live_path(path)
     cat_path = catalog_path or default_catalog_path()
     server = MCPServer("evil")
     server.middleware.append(ToolCallDetails())
@@ -81,7 +143,7 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None) -
         for one turn instance in a run, by turn name or official number. Defaults to the most recent occurrence.
         Official turns 1 and 2 are one segment, 'Turn 1-2'. Units: speeds m/s, energy Wh, distance m, durations s."""
         return await asyncio.to_thread(
-            _run_readonly, path, get_turn, run_id=run_id, turn_name=turn_name, occurrence=occurrence
+            _run_for_run, path, live_path, get_turn, run_id=run_id, turn_name=turn_name, occurrence=occurrence
         )
 
     @server.tool(name="get_straight")
@@ -90,7 +152,7 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None) -
         straight, by name (e.g. 'Straight 6-7' or '6-7'). Defaults to the most recent occurrence.
         list_track_segments shows which straights exist. Units: speeds m/s, energy Wh, distance m, durations s."""
         return await asyncio.to_thread(
-            _run_readonly, path, get_straight, run_id=run_id, straight_name=straight_name, occurrence=occurrence
+            _run_for_run, path, live_path, get_straight, run_id=run_id, straight_name=straight_name, occurrence=occurrence
         )
 
     @server.tool(name="list_track_segments")
@@ -103,28 +165,49 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None) -
         """Compare every instance of a named turn within a run (entry/exit speed, duration, energy,
         efficiency in mi/kWh) to answer what could be improved compared to earlier attempts. Units: speeds m/s, energy Wh, distance m, durations s."""
         return await asyncio.to_thread(
-            _run_readonly, path, compare_turn_instances, run_id=run_id, turn_name=turn_name, limit=limit
+            _run_for_run, path, live_path, compare_turn_instances, run_id=run_id, turn_name=turn_name, limit=limit
         )
 
     @server.tool(name="list_runs")
-    async def list_runs_handler() -> list[dict]:
-        """List every run_id, most recent first, with its lap count, time range, duration and whole-run
-        distance, energy and efficiency (mi/kWh), for browsing. sample_count is the number of raw
-        telemetry rows, not laps: use lap_count for laps. Units: speeds m/s, energy Wh, distance m, durations s."""
-        return await asyncio.to_thread(_run_readonly, path, list_runs)
+    async def list_runs_handler(include_live_twins: bool = False) -> list[dict]:
+        """List every run_id, the one being recorded now first (status 'recording'), then most recent
+        first, with its lap count, time range, duration and whole-run distance, energy and efficiency
+        (mi/kWh), for browsing. tier is 'upload' (a parsed recording) or 'live' (received live; approximate
+        until its upload lands). A live run whose full upload is parsed is hidden (linked_run_id on the
+        upload names it) unless include_live_twins. sample_count is the number of raw telemetry rows,
+        not laps: use lap_count for laps. Units: speeds m/s, energy Wh, distance m, durations s."""
+        return await asyncio.to_thread(_run_both, path, live_path, list_runs_all,
+                                       include_live_twins=include_live_twins)
+
+    @server.tool(name="get_live_status")
+    async def get_live_status_handler() -> dict:
+        """Right now: is the car's live feed alive, is a run being recorded (RED's record button), and
+        that run's latest speed (m/s), voltage (V), current (A), power (W), position, current lap and
+        segment, laps completed, and distance (m) / energy (Wh) / efficiency (mi/kWh) so far. Use for
+        'now', 'current lap', 'this lap', 'live' questions. Live numbers are approximate."""
+        return await asyncio.to_thread(_run_live, live_path, get_live_status)
+
+    @server.tool(name="get_live_window")
+    async def get_live_window_handler(seconds: float = 30.0, run_id: str | None = None,
+                                      max_points: int = 100) -> dict:
+        """The last `seconds` (max 600) of the run being recorded (or the latest live run, or run_id):
+        time, speed m/s, voltage V, current A, power W, lat/lon, steering angle, motor rpm, downsampled to
+        at most max_points rows (max 300). For 'how has the last minute gone' questions."""
+        return await asyncio.to_thread(_run_live, live_path, get_live_window, seconds=seconds, run_id=run_id,
+                                       max_points=max_points)
 
     @server.tool(name="list_turns")
     async def list_turns_handler(run_id: str, limit: int = 50, offset: int = 0) -> dict:
         """List every turn in a run, paginated, with duration, distance, energy and efficiency, for browsing. Units: speeds m/s, energy Wh, distance m, durations s."""
         return await asyncio.to_thread(
-            _run_readonly, path, list_turns, run_id=run_id, limit=limit, offset=offset
+            _run_for_run, path, live_path, list_turns, run_id=run_id, limit=limit, offset=offset
         )
 
     @server.tool(name="list_laps")
     async def list_laps_handler(run_id: str, limit: int = 50, offset: int = 0) -> dict:
         """List every lap in a run, paginated, with duration, distance, energy and efficiency, for browsing. Units: speeds m/s, energy Wh, distance m, durations s."""
         return await asyncio.to_thread(
-            _run_readonly, path, list_laps, run_id=run_id, limit=limit, offset=offset
+            _run_for_run, path, live_path, list_laps, run_id=run_id, limit=limit, offset=offset
         )
 
     @server.tool(name="list_straights")
@@ -132,7 +215,7 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None) -
         """List every straight in a run (named, like turns), paginated, with duration, distance, energy and
         efficiency, for browsing. Units: speeds m/s, energy Wh, distance m, durations s."""
         return await asyncio.to_thread(
-            _run_readonly, path, list_straights, run_id=run_id, limit=limit, offset=offset
+            _run_for_run, path, live_path, list_straights, run_id=run_id, limit=limit, offset=offset
         )
 
     @server.tool(name="compare_laps")
@@ -141,7 +224,7 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None) -
         mi/kWh, average speed) to answer what changed or what could be improved. delta is lap_b minus
         lap_a, not either lap's own value. Units: speeds m/s, energy Wh, distance m, durations s."""
         return await asyncio.to_thread(
-            _run_readonly, path, compare_laps, run_id=run_id, lap_a=lap_a, lap_b=lap_b
+            _run_for_run, path, live_path, compare_laps, run_id=run_id, lap_a=lap_a, lap_b=lap_b
         )
 
     @server.tool(name="find_nas_files")
@@ -182,9 +265,10 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None) -
     @server.tool(name="read_only_sql")
     async def read_only_sql_handler(query: str) -> list[dict]:
         """Run a single read-only SELECT against the EVIL database for questions
-        the other tools don't cover. No writes are possible regardless of the
+        the other tools don't cover. Live runs are in the attached `live` database
+        (e.g. live.main_snapshot, live.runs). No writes are possible regardless of the
         query text."""
-        return await asyncio.to_thread(_run_readonly, path, read_only_sql, query=query)
+        return await asyncio.to_thread(_sql_with_live, path, live_path, query)
 
     return server
 
