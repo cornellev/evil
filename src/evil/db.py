@@ -37,6 +37,14 @@ SCHEMA_VERSION = 3
 _ADDED_COLUMNS = (
     ("motor", "duty_cycle", "REAL"),
     ("main_snapshot", "errcount", "INTEGER"),
+    # laps: GPS glitch guard (classifiers/laps.py)
+    ("laps_open_state", "last_fix_t", "REAL"),
+    ("laps_open_state", "last_fix_lat", "REAL"),
+    ("laps_open_state", "last_fix_lon", "REAL"),
+    ("laps_open_state", "reject_streak", "INTEGER"),
+    ("laps_open_state", "reject_t", "REAL"),
+    ("laps_open_state", "reject_lat", "REAL"),
+    ("laps_open_state", "reject_lon", "REAL"),
 )
 _DERIVED_TABLES = ("turns", "turns_open_state", "straights", "laps", "laps_open_state", "classifier_cursor")
 
