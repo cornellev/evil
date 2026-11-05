@@ -169,15 +169,28 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None,
         )
 
     @server.tool(name="list_runs")
-    async def list_runs_handler(include_live_twins: bool = False) -> list[dict]:
+    async def list_runs_handler(include_live_twins: bool = False, location: str | None = None,
+                                category: str | None = None, since: float | None = None,
+                                until: float | None = None) -> list[dict]:
         """List every run_id, the one being recorded now first (status 'recording'), then most recent
-        first, with its lap count, time range, duration and whole-run distance, energy and efficiency
-        (mi/kWh), for browsing. tier is 'upload' (a parsed recording) or 'live' (received live; approximate
-        until its upload lands). A live run whose full upload is parsed is hidden (linked_run_id on the
-        upload names it) unless include_live_twins. sample_count is the number of raw telemetry rows,
-        not laps: use lap_count for laps. Units: speeds m/s, energy Wh, distance m, durations s."""
-        return await asyncio.to_thread(_run_both, path, live_path, list_runs_all,
-                                       include_live_twins=include_live_twins)
+        first, with its lap count, time range, duration, whole-run distance, energy and efficiency
+        (mi/kWh), location (e.g. 'IMS', 'B Lot') and category (competition/testing/b_lot/...), for
+        browsing and for comparing runs over time. Optional filters: location (e.g. 'B Lot'),
+        category, since/until (epoch seconds, on the run start): use them instead of SQL for questions
+        like 'efficiency of the B Lot runs over time'. tier is 'upload' (a parsed recording) or 'live'
+        (received live; approximate until its upload lands). A live run whose full upload is parsed is
+        hidden (linked_run_id on the upload names it) unless include_live_twins. sample_count is the
+        number of raw telemetry rows, not laps: use lap_count for laps. Units: speeds m/s, energy Wh,
+        distance m, durations s."""
+        def run() -> list[dict]:
+            cat = catalog.connect_catalog_readonly(cat_path)
+            try:
+                return _run_both(path, live_path, list_runs_all, include_live_twins=include_live_twins,
+                                 catalog=cat, location=location, category=category, since=since, until=until)
+            finally:
+                if cat is not None:
+                    cat.close()
+        return await asyncio.to_thread(run)
 
     @server.tool(name="get_live_status")
     async def get_live_status_handler() -> dict:
@@ -244,16 +257,17 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None,
         category: str | None = None,
         car: str | None = None,
         parse_status: str | None = None,
+        location: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[dict]:
         """List uploaded recordings, newest first (since/until are epoch seconds;
-        category is competition/testing/bench/sim/b_lot/other). Returns every candidate
-        with its date, category, car, location and parse state so similar ones can
-        be told apart; if several match, list them and ask which one is meant."""
+        category is competition/testing/bench/sim/b_lot/other; location is a place name such as
+        'IMS' or 'B Lot'). Returns every candidate with its date, category, car, location and parse
+        state so similar ones can be told apart; if several match, list them and ask which one is meant."""
         return await asyncio.to_thread(
             _run_catalog, cat_path, list_recordings, since=since, until=until, category=category,
-            car=car, parse_status=parse_status, limit=limit, offset=offset,
+            car=car, parse_status=parse_status, location=location, limit=limit, offset=offset,
         )
 
     @server.tool(name="describe_recording")

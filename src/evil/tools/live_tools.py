@@ -57,11 +57,46 @@ def _runs_of(conn: sqlite3.Connection, default_tier: str) -> list[dict[str, Any]
     return out
 
 
+def _norm(name: str | None) -> str:
+    """'B Lot', 'b lot', 'blot', 'B-Lot' all compare equal."""
+    return "".join(ch for ch in (name or "").lower() if ch.isalnum())
+
+
+def catalog_run_info(cat: sqlite3.Connection | None) -> dict[str, dict[str, Any]]:
+    """run_id -> {location, category} from the recording catalog (uploads and live captures are both
+    catalog rows, so both tiers get them). Empty without a catalog."""
+    if cat is None:
+        return {}
+    names = {r["location_id"]: r["name"] for r in cat.execute("SELECT location_id, name FROM named_locations")}
+    info: dict[str, dict[str, Any]] = {}
+    for row in cat.execute("SELECT run_id, location_id, category FROM recordings WHERE run_id IS NOT NULL "
+                           "ORDER BY uploaded_at"):
+        cur = info.setdefault(row["run_id"], {"location": None, "category": None})
+        cur["location"] = cur["location"] or names.get(row["location_id"])
+        cur["category"] = cur["category"] or row["category"]
+    return info
+
+
 def list_runs_all(main: sqlite3.Connection, live: sqlite3.Connection | None,
-                  include_live_twins: bool = False) -> list[dict[str, Any]]:
+                  include_live_twins: bool = False, catalog: sqlite3.Connection | None = None,
+                  location: str | None = None, category: str | None = None,
+                  since: float | None = None, until: float | None = None) -> list[dict[str, Any]]:
+    """Filters (all optional, off by default): location by name (case/space-insensitive, e.g. 'B Lot'),
+    category (competition/testing/b_lot/...), since/until on the run's start time (epoch s)."""
     runs = _runs_of(main, "upload")
     if live is not None:
         runs += [r for r in _runs_of(live, "live") if include_live_twins or not r["linked_run_id"]]
+    info = catalog_run_info(catalog)
+    for r in runs:
+        r.update(info.get(r["run_id"], {"location": None, "category": None}))
+    if location:
+        runs = [r for r in runs if _norm(r["location"]) == _norm(location)]
+    if category:
+        runs = [r for r in runs if r["category"] == category]
+    if since is not None:
+        runs = [r for r in runs if (r["start_ts"] or 0) >= since]
+    if until is not None:
+        runs = [r for r in runs if (r["start_ts"] or 0) < until]
     runs.sort(key=lambda r: (r["status"] != "recording", -(r["start_ts"] or 0)))
     return runs
 
