@@ -73,6 +73,18 @@ def test_list_recordings_gives_enough_detail_to_tell_candidates_apart(cat, popul
     assert catalog_tools.list_recordings(None) == []
 
 
+def test_list_recordings_filters_by_location_name(cat, populated):
+    run, _, later = populated
+    blot = catalog.add_location(cat, "B Lot", 42.446254, -76.46319, 300.0, default_category="b_lot")
+    with cat:
+        cat.execute("UPDATE recordings SET location_id = ? WHERE recording_id = ?", (blot, run))
+
+    for name in ("B Lot", "b lot", "blot", "B-LOT"):
+        assert [r["recording_id"] for r in catalog_tools.list_recordings(cat, location=name)] == [run]
+    assert catalog_tools.list_recordings(cat, location="Mars") == []
+    assert len(catalog_tools.list_recordings(cat)) == 3          # no filter = everything, as before
+
+
 def test_describe_recording(cat, root, populated):
     run, _, _ = populated
     with cat:

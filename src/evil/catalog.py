@@ -563,8 +563,8 @@ def get_recording(conn: sqlite3.Connection, recording_id: str) -> dict | None:
 
 def list_recordings(conn: sqlite3.Connection, *, since: float | None = None, until: float | None = None,
                     category: str | None = None, car: str | None = None, parse_status: str | None = None,
-                    source: str | None = None, kind: str | None = None, limit: int = 100,
-                    offset: int = 0) -> list[dict]:
+                    source: str | None = None, kind: str | None = None, location_id: int | None = None,
+                    limit: int = 100, offset: int = 0) -> list[dict]:
     """kind: 'upload' | 'live_capture' (None = both)."""
     where, args = [], []
     when = "COALESCE(recorded_start, uploaded_at)"
@@ -573,7 +573,7 @@ def list_recordings(conn: sqlite3.Connection, *, since: float | None = None, unt
     if until is not None:
         where.append(f"{when} < ?"); args.append(until)
     for column, value in (("category", category), ("car", car), ("parse_status", parse_status), ("source", source),
-                          ("kind", kind)):
+                          ("kind", kind), ("location_id", location_id)):
         if value:
             where.append(f"{column} = ?"); args.append(value)
     sql = "SELECT * FROM recordings"

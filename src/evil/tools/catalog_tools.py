@@ -25,19 +25,28 @@ def list_recordings(
     category: str | None = None,
     car: str | None = None,
     parse_status: str | None = None,
+    location: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Recordings, newest first, with enough detail to tell them apart. Several
     candidates are returned on purpose: the caller should list them and ask
-    which one is meant rather than silently picking."""
+    which one is meant rather than silently picking. location: a place name
+    ('B Lot', 'ims'; case and spaces ignored); an unknown name matches nothing."""
     if conn is None:
         return []
+    names = {r["location_id"]: r["name"] for r in conn.execute("SELECT location_id, name FROM named_locations")}
+    location_id = None
+    if location:
+        key = "".join(ch for ch in location.lower() if ch.isalnum())
+        matches = [lid for lid, name in names.items() if "".join(ch for ch in name.lower() if ch.isalnum()) == key]
+        if not matches:
+            return []
+        location_id = matches[0]
     rows = catalog.list_recordings(
         conn, since=since, until=until, category=category, car=car, parse_status=parse_status,
-        limit=limit, offset=offset,
+        location_id=location_id, limit=limit, offset=offset,
     )
-    names = {r["location_id"]: r["name"] for r in conn.execute("SELECT location_id, name FROM named_locations")}
     out = []
     for row in rows:
         item = {k: row[k] for k in _LIST_COLUMNS}

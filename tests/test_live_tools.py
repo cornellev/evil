@@ -138,6 +138,29 @@ def test_list_runs_merges_tiers_puts_recording_first_and_hides_linked_twins(worl
     assert (twin["tier"], twin["status"], twin["linked_run_id"]) == ("live", "closed", world["upload_run"])
 
 
+def test_list_runs_carries_location_and_category_and_filters_on_them(world):
+    root = catalog.DataRoot(world["live_path"].parents[2])
+    cat = catalog.connect_catalog(root)
+    try:
+        blot = catalog.add_location(cat, "B Lot", 42.446254, -76.46319, 300.0, default_category="b_lot")
+        with cat:
+            cat.execute("UPDATE recordings SET location_id = ?, category = 'b_lot' WHERE run_id = ?",
+                        (blot, world["upload_run"]))
+    finally:
+        cat.close()
+
+    runs = _call(world["server"], "list_runs")
+    assert all({"location", "category"} <= set(r) for r in runs)            # additive fields, every run
+    assert [r["tier"] for r in runs] == ["live", "upload"]                   # order and tiers unchanged
+    assert next(r for r in runs if r["run_id"] == world["upload_run"])["location"] == "B Lot"
+
+    assert [r["run_id"] for r in _call(world["server"], "list_runs", {"location": "b lot"})] == [world["upload_run"]]
+    assert [r["run_id"] for r in _call(world["server"], "list_runs", {"category": "b_lot"})] == [world["upload_run"]]
+    assert _call(world["server"], "list_runs", {"location": "IMS"}) == []
+    assert len(_call(world["server"], "list_runs", {"since": 0})) == 2
+    assert _call(world["server"], "list_runs", {"until": 0}) == []
+
+
 def test_run_scoped_tools_find_live_runs(world):
     runs = _call(world["server"], "list_runs")
     live_run = runs[0]["run_id"]
