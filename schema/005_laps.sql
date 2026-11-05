@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS laps_open_state (
     start_seq INTEGER NOT NULL,
     start_ts REAL NOT NULL,
     currently_inside INTEGER NOT NULL DEFAULT 0,
+    last_fix_t REAL, last_fix_lat REAL, last_fix_lon REAL,          -- last accepted fix (GPS glitch guard)
+    reject_streak INTEGER, reject_t REAL, reject_lat REAL, reject_lon REAL,
     PRIMARY KEY (run_id, line_id)
 );
 

@@ -26,6 +26,7 @@ from typing import Any, Iterable
 METERS_PER_MILE = 1609.344
 MAX_GAP_S = 5.0          # power readings further apart than this are not bridged
 MAX_JUMP_M = 200.0       # a GPS step longer than this is a glitch/dropout, not distance driven
+MAX_PLAUSIBLE_MPS = 40.0  # a GPS step faster than this is a glitch (the car does ~10 m/s; 40 = 89 mph)
 _A = 6378137.0
 _F = 1 / 298.257223563
 _E2 = _F * (2 - _F)
@@ -145,7 +146,9 @@ def path_distance_m(fixes: list[tuple[float, float, float]]) -> float:
         if t1 - t0 > MAX_GAP_S:
             continue
         d = tangent_distance_m(la0, lo0, la1, lo1)
-        if d <= MAX_JUMP_M:
+        dt = t1 - t0
+        # a multipath glitch is a jump there and back: both steps imply an impossible speed
+        if d <= MAX_JUMP_M and (d <= 1.0 or (dt > 0 and d / dt <= MAX_PLAUSIBLE_MPS)):
             total += d
     return total
 

@@ -39,10 +39,11 @@ def _drive_msgs(seconds, t0=T0, speed=8.0):
         t = t0 + k / HZ
         if k % HZ == 0:
             x, y = ring_point(k * speed / HZ)
-            fix = ll(x, y)
+            fix = (*ll(x, y), 1_000_000_000 + int((t - t0) * 1e6))
         p = payload(seq=2 + 2 * k, lat=fix[0], lon=fix[1], speed=speed, voltage=50.0, current=8.0,
                     publish_ns=int(t * 1e9))
         p["global_ts"] = 1_000_000_000 + int((t - t0) * 1e6)
+        p["gps"]["ts"] = fix[2]                 # as on the car: the fix's own time, repeated until the next fix
         out.append(decode_json(json.dumps(p), t))
     return out
 
