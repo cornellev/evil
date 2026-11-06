@@ -76,13 +76,14 @@ class SchemaStream:
         self._resume_key = (device_seq, device_global_ts_us)
         self._prev_seq = device_seq
 
-    def feed(self, env: Envelope) -> RawSample | None:
-        """The sample to store for this message, or None (rejected or a repeat)."""
+    def feed(self, env: Envelope, validated: bool = False) -> RawSample | None:
+        """The sample to store for this message, or None (rejected or a repeat).
+        validated: the caller already knows the payload conforms to this schema."""
         c = self.counters
         index = c.seen
         c.seen += 1
         reason = env.error
-        if reason is None:
+        if reason is None and not validated:
             bad = self.schema.validate(env.payload)
             reason = "; ".join(bad) if bad else None
         if reason is not None:
@@ -160,6 +161,13 @@ class LiveDetector:
 
     def feed(self, env: Envelope) -> Fed:
         fed = Fed()
+        # Hot path (locked, conforming, no switch pending): one validation per message.
+        if self.stream is not None and not self._pending and env.error is None \
+                and self.stream.schema.conforms(env.payload):
+            sample = self.stream.feed(env, validated=True)
+            if sample is not None:
+                fed.samples.append(sample)
+            return fed
         payload_schema = schemas.schema_of(env.payload) if env.error is None else None
 
         if self.stream is None:

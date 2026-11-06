@@ -137,24 +137,40 @@ def test_writes_are_committed_in_batches_and_loss_is_reported(conn):
 
 
 def test_a_slow_trickle_is_committed_within_the_batch_window(tmp_path):
-    """Fewer than batch_rows messages: the timer commits them, the reader sees them before the source ends."""
+    """Fewer than batch_rows messages: the batch timer commits them, so another connection
+    sees them while the source is still open (no sleeps to line up: the source waits for the
+    test before it ends)."""
     import sqlite3
+    import time as _time
 
     from evil import db
     path = str(tmp_path / "live.db")
     conn = db.connect(path)
     db.apply_schema(conn)
     envs = [Envelope(T0 + i * 0.02, payload(seq=2 + 2 * i, publish_ns=int((T0 + i * 0.02) * 1e9))) for i in range(3)]
-    envs.append(Envelope(T0 + 5, {"_t_publish_ns": int((T0 + 5) * 1e9)}))     # keeps the source open a while
-    compiler = LiveCompiler(conn, "live-1", ReplaySource(envs, delay_s=0.1), [SegmentsClassifier()],
-                            max_interval_s=10.0, lock_after=1, batch_rows=25, batch_s=0.05)
+    release = asyncio.Event()
+
+    class HeldSource:
+        async def envelopes(self):
+            for env in envs:
+                yield env
+            await release.wait()                    # stays open until the test has looked
+
+    compiler = LiveCompiler(conn, "live-1", HeldSource(), [SegmentsClassifier()], max_interval_s=10.0,
+                            lock_after=1, batch_rows=25, batch_s=0.05)
 
     async def scenario():
         task = asyncio.create_task(compiler.run())
-        await asyncio.sleep(0.38)            # 3 arrived by 0.3 s, timer fired by 0.35 s; 4th not until 0.4 s
         other = sqlite3.connect(path)
-        seen = other.execute("SELECT COUNT(*) FROM main_snapshot").fetchone()[0]
+        deadline = _time.monotonic() + 5.0
+        seen = 0
+        while _time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+            seen = other.execute("SELECT COUNT(*) FROM main_snapshot").fetchone()[0]
+            if seen == 3:
+                break
         other.close()
+        release.set()
         await task
         return seen
 
