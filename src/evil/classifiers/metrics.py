@@ -91,6 +91,7 @@ _SNAPSHOTS = """
     LEFT JOIN gps g ON g.id = ms.gps_id
     WHERE ms.run_id = ? AND ms.seq >= ? AND ms.seq <= ?
     ORDER BY ms.seq"""
+_SNAPSHOTS_AFTER = _SNAPSHOTS.replace("ms.seq >= ? AND ms.seq <= ?", "ms.seq > ?")
 
 
 def snapshot_time(row: sqlite3.Row) -> float:
@@ -109,18 +110,27 @@ def energy_kwh(samples: Iterable[tuple[float, float]], t0: float | None = None, 
     Samples further apart than MAX_GAP_S are not bridged."""
     total = 0.0
     prev: tuple[float, float] | None = None
-    for t, p in samples:
+    for cur in samples:
         if prev is not None:
-            a_t, a_p = prev
-            if t > a_t and t - a_t <= MAX_GAP_S:
-                lo = a_t if t0 is None else max(a_t, t0)
-                hi = t if t1 is None else min(t, t1)
-                if hi > lo:
-                    def at(x: float) -> float:
-                        return a_p + (p - a_p) * (x - a_t) / (t - a_t)
-                    total += trapezoid_kwh(at(lo), at(hi), lo, hi)
-        prev = (t, p)
+            total += _energy_step(prev, cur, t0, t1)
+        prev = cur
     return total
+
+
+def _energy_step(prev: tuple[float, float], cur: tuple[float, float], t0: float | None = None,
+                 t1: float | None = None) -> float:
+    """kWh between two consecutive (time_s, power_kw) samples (energy_kwh's one step)."""
+    (a_t, a_p), (t, p) = prev, cur
+    if not (t > a_t and t - a_t <= MAX_GAP_S):
+        return 0.0
+    lo = a_t if t0 is None else max(a_t, t0)
+    hi = t if t1 is None else min(t, t1)
+    if hi <= lo:
+        return 0.0
+
+    def at(x: float) -> float:
+        return a_p + (p - a_p) * (x - a_t) / (t - a_t)
+    return trapezoid_kwh(at(lo), at(hi), lo, hi)
 
 
 def distinct_fixes(rows: Iterable[sqlite3.Row]) -> list[tuple[float, float, float]]:
@@ -142,15 +152,22 @@ def distinct_fixes(rows: Iterable[sqlite3.Row]) -> list[tuple[float, float, floa
 def path_distance_m(fixes: list[tuple[float, float, float]]) -> float:
     """RED's distance: sum of tangent-plane steps between consecutive fixes, minus guarded glitches."""
     total = 0.0
-    for (t0, la0, lo0), (t1, la1, lo1) in zip(fixes, fixes[1:]):
-        if t1 - t0 > MAX_GAP_S:
-            continue
-        d = tangent_distance_m(la0, lo0, la1, lo1)
-        dt = t1 - t0
-        # a multipath glitch is a jump there and back: both steps imply an impossible speed
-        if d <= MAX_JUMP_M and (d <= 1.0 or (dt > 0 and d / dt <= MAX_PLAUSIBLE_MPS)):
-            total += d
+    for a, b in zip(fixes, fixes[1:]):
+        total += _distance_step(a, b)
     return total
+
+
+def _distance_step(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
+    """Metres between two consecutive distinct fixes (path_distance_m's one step)."""
+    (t0, la0, lo0), (t1, la1, lo1) = a, b
+    if t1 - t0 > MAX_GAP_S:
+        return 0.0
+    d = tangent_distance_m(la0, lo0, la1, lo1)
+    dt = t1 - t0
+    # a multipath glitch is a jump there and back: both steps imply an impossible speed
+    if d <= MAX_JUMP_M and (d <= 1.0 or (dt > 0 and d / dt <= MAX_PLAUSIBLE_MPS)):
+        return d
+    return 0.0
 
 
 def range_metrics(conn: sqlite3.Connection, run_id: str, start_seq: int, end_seq: int) -> dict[str, Any]:
@@ -159,23 +176,66 @@ def range_metrics(conn: sqlite3.Connection, run_id: str, start_seq: int, end_seq
     return summarize_rows(rows)
 
 
-def summarize_rows(rows: list[sqlite3.Row]) -> dict[str, Any]:
-    samples = []
-    for r in rows:
-        p = power_kw(r["current"], r["voltage"])
-        if p is not None:
-            samples.append((snapshot_time(r), p))
-    energy_wh = energy_kwh(samples) * 1000.0 if len(samples) >= 2 else None
-    fixes = distinct_fixes(rows)
-    distance = path_distance_m(fixes) if len(fixes) >= 2 else None
-    duration = (snapshot_time(rows[-1]) - snapshot_time(rows[0])) if len(rows) >= 2 else None
-    return {
-        "energy_wh": energy_wh,
-        "distance_m": distance,
-        "duration_s": duration,
-        "efficiency_mi_per_kwh": efficiency_mi_per_kwh(distance, energy_wh),
-        "avg_speed": (distance / duration) if distance is not None and duration and duration > 0 else None,
-    }
+def summarize_rows(rows: Iterable[sqlite3.Row]) -> dict[str, Any]:
+    return RunTotals().add(rows).result()
+
+
+class RunTotals:
+    """summarize_rows fed in pieces: rows (in seq order) can arrive across many add() calls and the
+    result is the same, bit for bit, as one summarize_rows over all of them. The live compiler keeps
+    one per open run so a summary refresh reads only the rows since the last one (a full rescan
+    every refresh grew with the run: memory and CPU, O(n^2) over a session)."""
+
+    def __init__(self) -> None:
+        self.last_seq: int | None = None
+        self._first_t: float | None = None
+        self._last_t: float | None = None
+        self._rows = 0
+        self._energy_kwh = 0.0
+        self._power_samples = 0
+        self._prev_power: tuple[float, float] | None = None
+        self._fix_key: tuple | None = None
+        self._prev_fix: tuple[float, float, float] | None = None
+        self._fixes = 0
+        self._distance_m = 0.0
+
+    def add(self, rows: Iterable[sqlite3.Row]) -> "RunTotals":
+        for r in rows:
+            t = snapshot_time(r)
+            if self._rows == 0:
+                self._first_t = t
+            self._last_t = t
+            self._rows += 1
+            self.last_seq = r["seq"]
+            p = power_kw(r["current"], r["voltage"])
+            if p is not None:
+                cur = (t, p)
+                if self._prev_power is not None:
+                    self._energy_kwh += _energy_step(self._prev_power, cur)
+                self._prev_power = cur
+                self._power_samples += 1
+            if valid_fix(r["lat"], r["lon"]):
+                k = (r["gps_us"], r["lat"], r["lon"]) if r["gps_us"] is not None else (r["lat"], r["lon"])
+                if k != self._fix_key:
+                    self._fix_key = k
+                    fix = (fix_time(r), r["lat"], r["lon"])
+                    if self._prev_fix is not None:
+                        self._distance_m += _distance_step(self._prev_fix, fix)
+                    self._prev_fix = fix
+                    self._fixes += 1
+        return self
+
+    def result(self) -> dict[str, Any]:
+        energy_wh = self._energy_kwh * 1000.0 if self._power_samples >= 2 else None
+        distance = self._distance_m if self._fixes >= 2 else None
+        duration = (self._last_t - self._first_t) if self._rows >= 2 else None
+        return {
+            "energy_wh": energy_wh,
+            "distance_m": distance,
+            "duration_s": duration,
+            "efficiency_mi_per_kwh": efficiency_mi_per_kwh(distance, energy_wh),
+            "avg_speed": (distance / duration) if distance is not None and duration and duration > 0 else None,
+        }
 
 
 def turn_count(conn: sqlite3.Connection, run_id: str, start_seq: int, end_seq: int) -> int:
@@ -186,13 +246,16 @@ def turn_count(conn: sqlite3.Connection, run_id: str, start_seq: int, end_seq: i
     ).fetchone()["n"]
 
 
-def store_run_summary(conn: sqlite3.Connection, run_id: str) -> dict[str, Any]:
+def store_run_summary(conn: sqlite3.Connection, run_id: str, totals: RunTotals | None = None) -> dict[str, Any]:
     """Whole-run totals (RED's 'average efficiency' = run distance / run energy), kept in run_summary so
-    list_runs does not rescan the run."""
-    bounds = conn.execute("SELECT MIN(seq) AS lo, MAX(seq) AS hi FROM main_snapshot WHERE run_id = ?", (run_id,)).fetchone()
-    if bounds["lo"] is None:
+    list_runs does not rescan the run. With `totals` (kept by the caller across calls) only rows after
+    totals.last_seq are read; rows are streamed, never all held at once."""
+    totals = totals if totals is not None else RunTotals()
+    after = totals.last_seq if totals.last_seq is not None else -1
+    totals.add(conn.execute(_SNAPSHOTS_AFTER, (run_id, after)))
+    if totals.last_seq is None:
         return {}
-    m = range_metrics(conn, run_id, bounds["lo"], bounds["hi"])
+    m = totals.result()
     with conn:
         conn.execute(
             """INSERT INTO run_summary (run_id, distance_m, energy_wh, efficiency_mi_per_kwh, duration_s, avg_speed)
