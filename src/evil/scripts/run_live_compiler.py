@@ -64,8 +64,8 @@ from evil.schemas._strict import StrictSchema
 log = logging.getLogger("evil.live")
 
 DEFAULT_MAX_INTERVAL_S = 5.0
-BATCH_ROWS = 25            # 0.5 s at 50 Hz
-BATCH_S = 0.5
+BATCH_ROWS = 250           # writes (rows + raw messages) per commit at most; at 50 Hz BATCH_S commits first
+BATCH_S = 0.5              # every write is committed within this (the freshness bound)
 STATUS_EVERY_S = 10.0
 GAP_S = 60.0               # gap mode: silence that ends a session
 POLL_S = 1.0               # bag service poll interval
@@ -73,6 +73,8 @@ UNREACHABLE_AFTER = 3      # consecutive failed polls before falling back to gap
 SUMMARY_EVERY_S = 10.0     # run_summary refresh while recording (data time)
 HEARTBEAT_EVERY_S = 2.0    # live_heartbeat row rewrite
 REBOOT_BACK_US = 1_000_000  # DAQ global_ts going back more than this (with seq going back) = reboot
+REBOOT_HOLDOFF_S = 30.0     # after a reboot split, no further split for this long: counters flipping
+                            # back and forth means two publishers on the topic, not a reboot storm
 
 
 class Session:
@@ -144,6 +146,9 @@ class LiveCompiler:
         self._flush_handle: asyncio.TimerHandle | None = None
         self._latest_ts: dict[str, float] = {}
         self._last_summary = 0.0
+        self._totals: dict[str, run_metrics.RunTotals] = {}   # incremental run_summary per open run
+        self._last_reboot_split: float | None = None
+        self.counter_jumps_ignored = 0
         self._last_heartbeat = 0.0
         self.last_message_at: float | None = None
         self.received = 0
@@ -151,6 +156,10 @@ class LiveCompiler:
         self.msgs_per_s = 0.0
         self._wake = asyncio.Event()
         db.apply_schema(conn)
+        # WAL + synchronous=NORMAL: commits stop fsyncing the WAL every time (measured 2.4 ms per
+        # commit, most of the cost at high rates). Still crash-safe (no corruption); a power cut
+        # can lose at most the last batch, which the onboard bag has anyway.
+        conn.execute("PRAGMA synchronous = NORMAL")
 
     # ---- state -----------------------------------------------------------
 
@@ -234,7 +243,7 @@ class LiveCompiler:
         has_rows = self._latest_ts.get(run_id) is not None or self.conn.execute(
             "SELECT 1 FROM main_snapshot WHERE run_id = ? LIMIT 1", (run_id,)).fetchone()
         if has_rows:
-            run_metrics.store_run_summary(self.conn, run_id)
+            run_metrics.store_run_summary(self.conn, run_id, self._totals.pop(run_id, None))
         stats = self._run_stats(run_id)
         meta = self._run_meta.get(run_id, {})
         with self.conn:
@@ -244,7 +253,31 @@ class LiveCompiler:
                        car_end = COALESCE(?, car_end), stats_json = ?, updated_at = ? WHERE run_id = ?""",
                 (reason, self._latest_ts.get(run_id), meta.get("started_at"), meta.get("car_start"),
                  meta.get("car_end"), json.dumps(stats), time.time(), run_id))
-        self._export(run_id, stats)
+        try:
+            self._export(run_id, stats)
+        except Exception:
+            # The run is closed and its raw messages stay in live_raw: export_pending() retries.
+            # An export problem must never stop the compiler from following the record button.
+            log.exception("exporting run %s as a live capture failed; will retry", run_id)
+
+    EXPORT_RETRY_S = 60.0
+
+    def export_pending(self) -> int:
+        """Retry exporting closed live runs that still have raw messages (a failed export, or
+        a crash between closing and exporting). Returns how many were exported."""
+        if self.data_root is None:
+            return 0
+        done = 0
+        for row in self.conn.execute(
+                "SELECT r.run_id, r.stats_json FROM runs r WHERE r.tier = 'live' AND r.status = 'closed' "
+                "AND r.recording_id IS NULL AND EXISTS (SELECT 1 FROM live_raw l WHERE l.run_id = r.run_id)"
+                ).fetchall():
+            try:
+                self._export(row["run_id"], json.loads(row["stats_json"] or "{}") or self._run_stats(row["run_id"]))
+                done += 1
+            except Exception:
+                log.exception("retrying the export of %s failed", row["run_id"])
+        return done
 
     def _run_stats(self, run_id: str) -> dict:
         st = self._streams.get(run_id)
@@ -390,13 +423,24 @@ class LiveCompiler:
     async def _poll_loop(self) -> None:
         while True:
             await asyncio.sleep(self.poll_s)
-            self.apply_bag_state(await self.bag.poll())
+            try:
+                self.apply_bag_state(await self.bag.poll())
+            except Exception:
+                # Never let one bad close/open stop the compiler from following the record button.
+                log.exception("handling the bag service state failed")
 
     async def _watch_loop(self) -> None:
-        """Gap mode: close a session after gap_s of silence."""
+        """Gap mode: close a session after gap_s of silence; retry pending exports."""
+        last_retry = time.monotonic()
         while True:
             await asyncio.sleep(min(1.0, self.gap_s / 4))
-            self.check_gap()
+            try:
+                self.check_gap()
+                if time.monotonic() - last_retry >= self.EXPORT_RETRY_S:
+                    last_retry = time.monotonic()
+                    self.export_pending()
+            except Exception:
+                log.exception("session watch failed")
 
     def check_gap(self) -> None:
         s = self.session
@@ -415,6 +459,16 @@ class LiveCompiler:
         prev, s.last_daq = s.last_daq, (seq, gts)
         return prev is not None and seq < prev[0] and gts < prev[1] - REBOOT_BACK_US
 
+    def _reboot_held_off(self) -> bool:
+        if self._last_reboot_split is None or time.monotonic() - self._last_reboot_split > REBOOT_HOLDOFF_S:
+            return False
+        self.counter_jumps_ignored += 1
+        if self.counter_jumps_ignored in (1, 100) or self.counter_jumps_ignored % 1000 == 0:
+            log.warning("DAQ counters went back again %d times within %.0f s of a reboot split: two "
+                        "publishers on the topic? not splitting again", self.counter_jumps_ignored,
+                        REBOOT_HOLDOFF_S)
+        return True
+
     def on_envelope(self, env: Envelope) -> None:
         self.loss.observe(env)
         self.last_message_at = env.ts
@@ -424,7 +478,8 @@ class LiveCompiler:
             if self.bag_mode:
                 return                              # not recording: RED's button decides
             s = self._open_session("gap", None, "first_message")
-        if self._is_reboot(s, env):
+        if self._is_reboot(s, env) and not self._reboot_held_off():
+            self._last_reboot_split = time.monotonic()
             log.warning("DAQ reboot detected (seq/global_ts went back) in run %s", s.run_id)
             mode, bag_id, last_daq = s.mode, s.bag_id, s.last_daq
             self._close_session("daq_reboot")
@@ -481,10 +536,13 @@ class LiveCompiler:
             except asyncio.TimeoutError:
                 pass
             self._wake.clear()
-            self._flush()            # tick() commits on this connection: close the batch first
-            self._tick_once()
-            if time.monotonic() - self._last_heartbeat >= HEARTBEAT_EVERY_S:
-                self.heartbeat()
+            try:
+                self._flush()            # tick() commits on this connection: close the batch first
+                self._tick_once()
+                if time.monotonic() - self._last_heartbeat >= HEARTBEAT_EVERY_S:
+                    self.heartbeat()
+            except Exception:
+                log.exception("classifier tick / heartbeat failed")
 
     def heartbeat(self) -> None:
         """Rewrite the live_heartbeat row (readers: get_live_status, evil-ui)."""
@@ -517,7 +575,8 @@ class LiveCompiler:
             latest = self._latest_ts.get(self.run_id)
             # every SUMMARY_EVERY_S of DATA time, like the classifiers: a 10x replay stays current
             if latest is not None and (latest - self._last_summary >= SUMMARY_EVERY_S or latest < self._last_summary):
-                run_metrics.store_run_summary(self.conn, self.run_id)
+                run_metrics.store_run_summary(self.conn, self.run_id,
+                                              self._totals.setdefault(self.run_id, run_metrics.RunTotals()))
                 self.conn.commit()
                 self._last_summary = latest
         self.tick_count += 1
@@ -537,6 +596,7 @@ class LiveCompiler:
             "bag": {"configured": self.bag is not None, "reachable": self.bag_failures < UNREACHABLE_AFTER,
                     "running": self.bag_state.running if self.bag_state else None},
             "clock_jumps": self.session.clock.clock_jumps if self.session else 0,
+            "counter_jumps_ignored": self.counter_jumps_ignored,
             "loss": self.loss.stats(),
             "source": self.source.stats() if hasattr(self.source, "stats") else {},
             "commits": self.commits,
@@ -567,6 +627,14 @@ class LiveCompiler:
                  asyncio.create_task(self._watch_loop())]
         if self.bag is not None:
             tasks.append(asyncio.create_task(self._poll_loop()))
+
+        def _died(task: asyncio.Task) -> None:
+            if not task.cancelled() and task.exception() is not None:
+                log.critical("background task %s died: %r", task.get_coro().__name__, task.exception(),
+                             exc_info=task.exception())
+        for task in tasks:
+            task.add_done_callback(_died)
+        self.export_pending()
         ended = False
         try:
             await self._consume()

@@ -14,6 +14,15 @@ set -eo pipefail
 source /opt/ros/humble/setup.bash
 set -u
 
+# rclpy writes logs under $ROS_HOME (default ~/.ros). Running as a non-root user (e.g. so
+# data files are not root-owned) leaves HOME=/ unwritable and rclpy.init fails with
+# "Failed to create log directory": fall back to /tmp.
+if [[ -z "${ROS_LOG_DIR:-}" ]] && ! mkdir -p "${ROS_HOME:-${HOME:-/}/.ros}/log" 2>/dev/null; then
+    export ROS_HOME=/tmp/ros
+    export ROS_LOG_DIR=/tmp/ros/log
+    mkdir -p "$ROS_LOG_DIR"
+fi
+
 if [[ -n "${DISCOVERY_SERVER_IP:-}" ]]; then
     port="${DISCOVERY_SERVER_PORT:-11811}"
     ip="$DISCOVERY_SERVER_IP"

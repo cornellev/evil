@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import sqlite3
 import http.server
 import json
 import threading
@@ -488,3 +489,60 @@ def test_the_client_talks_http():
         server.shutdown()
     dead = BagServiceClient(f"http://127.0.0.1:{server.server_port}", timeout_s=0.5)
     assert asyncio.run(dead.poll()).reachable is False
+
+
+def test_an_export_failure_does_not_stop_the_compiler_and_is_retried(root, monkeypatch):
+    """Found in the E2E stack 11-05: an exception while closing a run killed the bag-polling
+    task, and EVIL never opened another run. Now the close completes, the next recording
+    still opens a run, and the failed export is retried."""
+    conn = _live_conn(root)
+    c = _compiler(conn, Clock(), data_root=root, main_db=catalog.parsed_db_path(root, "uc26"))
+    real_register = catalog.register_live_capture
+    calls = {"n": 0}
+
+    def flaky(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_register(*a, **kw)
+
+    monkeypatch.setattr(catalog, "register_live_capture", flaky)
+
+    def steps():
+        c.apply_bag_state(RUNNING_A)
+        for i in range(10):
+            c.on_envelope(_msg(i))
+        c.apply_bag_state(STOPPED)                    # close -> the export fails
+        c.apply_bag_state(RUNNING_B)                  # the next recording still opens a run
+        assert c.run_id is not None
+        for i in range(10, 20):
+            c.on_envelope(_msg(i))
+        c.apply_bag_state(STOPPED)
+
+    _drive(steps)
+    a, b = _runs(conn)
+    assert a["status"] == b["status"] == "closed"
+    assert a["recording_id"] is None and b["recording_id"] is not None
+    assert conn.execute("SELECT COUNT(*) FROM live_raw WHERE run_id = ?", (a["run_id"],)).fetchone()[0] == 10
+    assert c.export_pending() == 1                    # the retry
+    assert conn.execute("SELECT recording_id FROM runs WHERE run_id = ?", (a["run_id"],)).fetchone()[0]
+    assert c.export_pending() == 0
+
+
+def test_two_interleaved_publishers_do_not_cause_a_reboot_storm(conn):
+    """Found in the E2E stack: two streams on one topic made every message look like a DAQ
+    reboot (a new empty run each time). One split, then the hold-off, then a warning."""
+    clock = Clock()
+    c = _compiler(conn, clock)
+
+    def steps():
+        c.apply_bag_state(RUNNING_A)
+        for i in range(40):                           # A: high counters; B: low counters, alternating
+            if i % 2:
+                c.on_envelope(_msg(i, seq=60_000 + 2 * i, gts=900_000_000 + i * 20_000))
+            else:
+                c.on_envelope(_msg(i, seq=100 + 2 * i, gts=5_000_000 + i * 20_000))
+        c.apply_bag_state(STOPPED)
+
+    _drive(steps)
+    assert len(_runs(conn)) <= 2 and c.counter_jumps_ignored > 10
