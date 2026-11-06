@@ -129,3 +129,28 @@ def test_no_energy_means_efficiency_is_none_not_a_division_error(conn):
                                                                           device_ts_us=k * 1_000_000), device_global_ts_us=k * 1_000_000))
     m = metrics.range_metrics(conn, "r", 1, 5)
     assert m["energy_wh"] is None and m["efficiency_mi_per_kwh"] is None and m["distance_m"] > 0
+
+
+def test_an_incremental_run_summary_equals_a_full_rescan_exactly(conn):
+    """The live compiler refreshes run_summary from only the rows since its last refresh
+    (RunTotals); that must give the same numbers, bit for bit, as reading the whole run,
+    including gaps, glitches and repeated GPS fixes that straddle a refresh boundary."""
+    rows = []
+    t = 0.0
+    for k in range(900):
+        t += 0.02 if k % 300 else metrics.MAX_GAP_S + 1            # a gap every 300 rows
+        gps_s = int(t)                                               # GPS repeats at 1 Hz
+        lat = 45.0 if k == 450 else 42.0 + gps_s * 1e-5              # one glitch
+        rows.append(RawSample("r", t, joulemeter=JoulemeterReading(t, 40.0 + k % 7, 10.0 - k % 3) if k % 5 else None,
+                              gps=GpsReading(t, lat, -76.0, 5.0, 0.0, device_ts_us=gps_s * 1_000_000),
+                              device_global_ts_us=int(t * 1e6)))
+    totals = metrics.RunTotals()
+    for start in range(0, 900, 137):                                 # refreshes at odd boundaries
+        with conn:
+            for s in rows[start:start + 137]:
+                ingest_sample(conn, s)
+        live = metrics.store_run_summary(conn, "r", totals)
+    full = metrics.store_run_summary(conn, "r")
+    assert live == full and full["energy_wh"] and full["distance_m"]
+    # a refresh with no new rows changes nothing
+    assert metrics.store_run_summary(conn, "r", totals) == full
