@@ -80,12 +80,17 @@ def catalog_run_info(cat: sqlite3.Connection | None) -> dict[str, dict[str, Any]
 def list_runs_all(main: sqlite3.Connection, live: sqlite3.Connection | None,
                   include_live_twins: bool = False, catalog: sqlite3.Connection | None = None,
                   location: str | None = None, category: str | None = None,
-                  since: float | None = None, until: float | None = None) -> list[dict[str, Any]]:
+                  since: float | None = None, until: float | None = None,
+                  run_id: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
     """Filters (all optional, off by default): location by name (case/space-insensitive, e.g. 'B Lot'),
-    category (competition/testing/b_lot/...), since/until on the run's start time (epoch s)."""
+    category (competition/testing/b_lot/...), since/until on the run's start time (epoch s), run_id
+    (just that run, live twin or not). limit: at most this many, after sorting (None = all)."""
     runs = _runs_of(main, "upload")
     if live is not None:
-        runs += [r for r in _runs_of(live, "live") if include_live_twins or not r["linked_run_id"]]
+        runs += [r for r in _runs_of(live, "live")
+                 if include_live_twins or run_id is not None or not r["linked_run_id"]]
+    if run_id is not None:
+        runs = [r for r in runs if r["run_id"] == run_id]
     info = catalog_run_info(catalog)
     for r in runs:
         r.update(info.get(r["run_id"], {"location": None, "category": None}))
@@ -98,7 +103,7 @@ def list_runs_all(main: sqlite3.Connection, live: sqlite3.Connection | None,
     if until is not None:
         runs = [r for r in runs if (r["start_ts"] or 0) < until]
     runs.sort(key=lambda r: (r["status"] != "recording", -(r["start_ts"] or 0)))
-    return runs
+    return runs if limit is None else runs[:max(1, limit)]
 
 
 def run_tier(live: sqlite3.Connection | None, run_id: str) -> bool:

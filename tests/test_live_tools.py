@@ -161,6 +161,19 @@ def test_list_runs_carries_location_and_category_and_filters_on_them(world):
     assert _call(world["server"], "list_runs", {"until": 0}) == []
 
 
+def test_list_runs_one_run_by_id_and_a_limit(world):
+    one = _call(world["server"], "list_runs", {"run_id": world["upload_run"]})
+    assert [r["run_id"] for r in one] == [world["upload_run"]]
+    twin_id = one[0]["linked_run_id"]
+    # asking for a run by id finds it even when it is a hidden live twin
+    assert [r["run_id"] for r in _call(world["server"], "list_runs", {"run_id": twin_id})] == [twin_id]
+    assert _call(world["server"], "list_runs", {"run_id": "nope"}) == []
+    # limit keeps the order (recording run first) and just cuts the tail
+    full = _call(world["server"], "list_runs", {"limit": 500})
+    assert _call(world["server"], "list_runs", {"limit": 1}) == full[:1]
+    assert full[0]["status"] == "recording"
+
+
 def test_run_scoped_tools_find_live_runs(world):
     runs = _call(world["server"], "list_runs")
     live_run = runs[0]["run_id"]
