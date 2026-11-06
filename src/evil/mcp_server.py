@@ -218,7 +218,10 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None,
 
     @server.tool(name="list_laps")
     async def list_laps_handler(run_id: str, limit: int = 50, offset: int = 0) -> dict:
-        """List every lap in a run, paginated, with duration, distance, energy and efficiency, for browsing. Units: speeds m/s, energy Wh, distance m, durations s."""
+        """List every lap in a run, paginated, with duration, distance, energy and efficiency, for browsing.
+        Laps do not cover the whole run (driving before the first and after the last line crossing is in
+        no lap), so they do not add up to the run's totals: for a run's energy, distance or efficiency use
+        list_runs. Units: speeds m/s, energy Wh, distance m, durations s."""
         return await asyncio.to_thread(
             _run_for_run, path, live_path, list_laps, run_id=run_id, limit=limit, offset=offset
         )
