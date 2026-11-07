@@ -67,6 +67,7 @@ DEFAULT_MAX_INTERVAL_S = 5.0
 BATCH_ROWS = 250           # writes (rows + raw messages) per commit at most; at 50 Hz BATCH_S commits first
 BATCH_S = 0.5              # every write is committed within this (the freshness bound)
 STATUS_EVERY_S = 10.0
+SILENCE_WARN_S = 5.0       # warn when a recording gets no data for this long
 GAP_S = 60.0               # gap mode: silence that ends a session
 POLL_S = 1.0               # bag service poll interval
 UNREACHABLE_AFTER = 3      # consecutive failed polls before falling back to gap mode
@@ -87,6 +88,8 @@ class Session:
         self.clock = LiveClock()
         self.run_id: str | None = None   # assigned when the session opens
         self.last_recv: float | None = None
+        self.opened_at: float | None = None   # compiler clock when the session opened
+        self.silent_warned = False       # "no data while recording" logged for the current silence
         self.last_daq: tuple[int, int] | None = None   # (seq, global_ts) of the last conforming message
 
 
@@ -189,6 +192,7 @@ class LiveCompiler:
 
     def _open_session(self, mode: str, bag_id: str | None, reason: str) -> Session:
         session = Session(mode, bag_id, None)
+        session.opened_at = self.now()
         session.detector = LiveDetector(lambda schema: self._on_lock(session, schema),
                                         lock_after=self.lock_after, switch_after=self.switch_after)
         self.session = session
@@ -362,6 +366,7 @@ class LiveCompiler:
 
     def _resume(self, row, last, last_recv) -> None:
         session = Session(row["session_mode"] or "gap", row["bag_id"], None)
+        session.opened_at = self.now()
         session.detector = LiveDetector(lambda schema: self._on_lock(session, schema),
                                         lock_after=self.lock_after, switch_after=self.switch_after)
         session.run_id = row["run_id"]
@@ -435,12 +440,28 @@ class LiveCompiler:
         while True:
             await asyncio.sleep(min(1.0, self.gap_s / 4))
             try:
+                self.check_silence()
                 self.check_gap()
                 if time.monotonic() - last_retry >= self.EXPORT_RETRY_S:
                     last_retry = time.monotonic()
                     self.export_pending()
             except Exception:
                 log.exception("session watch failed")
+
+    def check_silence(self) -> None:
+        """While a recording is open, warn once when the car has been silent for SILENCE_WARN_S
+        (car off the tailnet, DAQ down, discovery not matched), and note when data is back."""
+        s = self.session
+        if s is None:
+            return
+        since = s.last_recv if s.last_recv is not None else s.opened_at
+        if since is None:
+            return
+        quiet = self.now() - since
+        if quiet > SILENCE_WARN_S and not s.silent_warned:
+            s.silent_warned = True
+            log.warning("no data for %.0f s while recording run %s (car off the tailnet? DAQ or discovery "
+                        "server down?)", quiet, s.run_id)
 
     def check_gap(self) -> None:
         s = self.session
@@ -485,6 +506,9 @@ class LiveCompiler:
             self._close_session("daq_reboot")
             s = self._open_session(mode, bag_id, "daq_reboot")
             s.last_daq = last_daq
+        if s.silent_warned:
+            s.silent_warned = False
+            log.info("data back in run %s", s.run_id)
         s.last_recv = env.ts
         text = env.raw if env.raw is not None else json.dumps(env.payload)
         self.conn.execute("INSERT INTO live_raw (run_id, recv_ts, text) VALUES (?, ?, ?)", (s.run_id, env.ts, text))

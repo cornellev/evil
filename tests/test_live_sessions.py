@@ -546,3 +546,32 @@ def test_two_interleaved_publishers_do_not_cause_a_reboot_storm(conn):
 
     _drive(steps)
     assert len(_runs(conn)) <= 2 and c.counter_jumps_ignored > 10
+
+
+def test_a_silent_recording_warns_once_and_notes_when_data_is_back(conn, caplog):
+    """The car drops off mid-recording: one warning after SILENCE_WARN_S (not one per check),
+    one 'data back' when it returns; the run keeps recording throughout (bag mode)."""
+    import logging
+
+    clock = Clock()
+    c = _compiler(conn, clock)
+
+    def steps():
+        c.apply_bag_state(RUNNING_A)
+        clock.t = T0 + 3
+        c.check_silence()                                  # 3 s with no data yet: quiet is normal
+        c.on_envelope(_msg(0, t=clock.t))
+        clock.t += 6
+        for _ in range(3):
+            c.check_silence()                              # 6 s silent: warned exactly once
+        c.on_envelope(_msg(1, t=clock.t))                  # data back
+        clock.t += 6
+        c.check_silence()                                  # silent again: a new warning
+        return c.run_id
+
+    with caplog.at_level(logging.INFO, logger="evil.live"):
+        run = _drive(steps)
+    warnings = [r.getMessage() for r in caplog.records if "no data for" in r.getMessage()]
+    assert len(warnings) == 2 and run in warnings[0]
+    assert sum("data back" in r.getMessage() for r in caplog.records) == 1
+    assert run is not None and _runs(conn)[0]["status"] == "recording"
