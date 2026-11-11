@@ -112,6 +112,54 @@ services:
     command: ["python", "-m", "evil.worker"]
     restart: unless-stopped
 
+  # Team-knowledge search (cev-knowledge, see src/evil/knowledge/__init__.py): `knowledge` serves the MCP tools
+  # from knowledge.db and has NO Confluence token; `knowledge-indexer` is the only service that reads
+  # knowledge.env (KNOWLEDGE_CONFLUENCE_TOKEN, not in git) and copies the filtered `cev` space hourly.
+  # Own volume: nothing else in EVIL can see the index or the token.
+  knowledge:
+    build: .
+    ports:
+      - "8768:8768"
+    environment:
+      EVIL_KNOWLEDGE_DB: /knowledge/knowledge.db
+      EVIL_KNOWLEDGE_PORT: "8768"
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${EVIL_OTLP_ENDPOINT:-}
+      EVIL_WHOIS_URL: ${EVIL_WHOIS_URL:-}
+      PHOENIX_PROJECT_NAME: cev-knowledge
+    volumes:
+      - knowledge-data:/knowledge
+    command: ["python", "-m", "evil.knowledge.server"]
+    mem_limit: 512m
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  knowledge-indexer:
+    build: .
+    env_file:
+      - path: knowledge.env
+        required: false
+    environment:
+      EVIL_KNOWLEDGE_DB: /knowledge/knowledge.db
+      KNOWLEDGE_CONFLUENCE_URL: ${KNOWLEDGE_CONFLUENCE_URL:-https://confluence.cornell.edu}
+      KNOWLEDGE_SPACE: ${KNOWLEDGE_SPACE:-cev}
+      # nightly full pass at KNOWLEDGE_FULL_HOUR (default 3) in KNOWLEDGE_TZ (default America/New_York)
+    volumes:
+      - knowledge-data:/knowledge
+    command: ["python", "-m", "evil.knowledge.indexer"]
+    mem_limit: 512m
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
   live-compiler:
     build:
       context: .
@@ -142,3 +190,4 @@ services:
 
 volumes:
   evil-data:
+  knowledge-data:
