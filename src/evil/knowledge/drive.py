@@ -101,6 +101,12 @@ def _base_name(name: str) -> str:
     return n.lower()
 
 
+def file_url(meta: dict) -> str:
+    """The file's Drive link without Google's query string (usp=drivesdk, ouid=<owner's Google user id>, ...)."""
+    link = meta.get("webViewLink")
+    return link.split("?")[0].split("#")[0] if link else f"https://drive.google.com/open?id={meta['id']}"
+
+
 def is_link_only(meta: dict) -> bool:
     if CREDENTIAL_TITLE.search(meta.get("name", "")):
         return True
@@ -200,7 +206,7 @@ class DriveClient:
             "source": "drive",
             "id": meta["id"],
             "title": meta.get("name") or "Google Drive file",
-            "url": meta.get("webViewLink") or f"https://drive.google.com/open?id={meta['id']}",
+            "url": file_url(meta),
             "updated": meta.get("modifiedTime"),
             "breadcrumb": self.breadcrumb(meta),
             "excerpt": (LINK_ONLY_NOTE if credentials else
@@ -245,7 +251,7 @@ class DriveClient:
         if meta is None:
             return None
         doc = {"source": "drive", "id": meta["id"], "title": meta.get("name", ""),
-               "url": meta.get("webViewLink") or f"https://drive.google.com/open?id={meta['id']}",
+               "url": file_url(meta),
                "updated": meta.get("modifiedTime"), "breadcrumb": self.breadcrumb(meta, levels=3),
                "kind": "drive_doc", "sections": [], "text": "", "truncated": False, "drive_links": []}
         if CREDENTIAL_TITLE.search(meta.get("name", "")):
