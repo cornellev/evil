@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# cev-knowledge indexer secrets (Confluence token), NUC only
+knowledge.env

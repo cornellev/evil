@@ -177,6 +177,24 @@ Writes never go through MCP -- uploads, the worker and bulk ingestion are
 separate processes, same reasoning as why `read_only_sql` is generic-but-read-only:
 a bad write is a categorically worse failure than a bad read.
 
+## Team knowledge (cev-knowledge)
+
+A third MCP server next to `mcp-server` (:8765) and `mcp-raw` (:8767): search over the team's Confluence `cev`
+space for Tern and people's agents (plan: `harness/cev-knowledge-plan-2026-11.md`; code: `src/evil/knowledge/`).
+
+- `knowledge-indexer`: the only service with the Confluence token (`knowledge.env`, not in git:
+  `KNOWLEDGE_CONFLUENCE_TOKEN=...`). Copies the space into `knowledge.db` (volume `knowledge-data`): full pass on
+  first start and nightly (03:00 New York), incremental hourly. Filters run before anything is stored: restricted
+  pages and their children, label `no-tern`, credential-titled pages, credential lines/tables/sections, key-shaped
+  strings. Read-only by construction (GET requests only). One pass by hand:
+  `docker compose run --rm --no-deps -T knowledge-indexer python -m evil.knowledge.indexer --once [--full]`.
+- `knowledge` (:8768): exactly two tools, `search_team_knowledge` and `get_document`, served from the index only.
+  `GET /healthz` = page/chunk counts + last pass (503 until a pass succeeded).
+- Search is keyword (FTS5/BM25, title > heading > text, work logs / meeting notes pushed down, one section per page);
+  Drive links found in matching sections come back as link-only results. Embeddings, the glossary and live Drive
+  search are later phases of the plan.
+- Tests: `tests/test_knowledge.py` (fake Confluence), `tests/e2e/smoke_knowledge_server.sh` (real HTTP).
+
 ## Tracing (Phoenix)
 
 Every MCP tool call, from every client, can be traced to Arize Phoenix: arguments (the SQL, for
