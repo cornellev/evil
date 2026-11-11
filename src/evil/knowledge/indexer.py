@@ -59,7 +59,9 @@ def _now() -> datetime:
 
 def _index_page(conn, page: Page, now: datetime) -> tuple[int, int]:
     blocks, scrub_stats = scrub(textify(page.storage))
-    chunks = chunk(blocks)
+    # a page with no text of its own (a parent page, attachments or macros only) still gets a title-only entry, so
+    # it can be found by name: 115 of the first 559 pages had none
+    chunks = chunk(blocks) or [Chunk(0, "", "", [])]
     store.upsert_page(
         conn, page_id=page.id, title=page.title, url=page.url, space=page.space,
         breadcrumb=[t for _, t in page.ancestors], updated=page.updated, version=page.version,

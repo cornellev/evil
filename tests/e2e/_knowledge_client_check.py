@@ -37,7 +37,7 @@ async def main() -> int:
                 print("FAIL: reading a Drive document should be refused for now")
                 return 1
     health = json.loads(urllib.request.urlopen(f"{base}/healthz", timeout=5).read())
-    if not health.get("ok") or health.get("pages") != 3:
+    if not health.get("ok") or health.get("pages") != 4:      # 3 pages + the credentials link-only pointer
         print(f"FAIL: healthz {health}")
         return 1
     print(f"ok: {len(hits)} hits, healthz {health['pages']} pages / {health['chunks']} chunks")
