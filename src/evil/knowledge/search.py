@@ -17,7 +17,9 @@ import sqlite3
 from typing import Any
 
 TITLE_WEIGHT, HEADING_WEIGHT, TEXT_WEIGHT = 8.0, 3.0, 1.0
-KIND_FACTOR = {"page": 1.0, "work_log": 0.5, "meeting_notes": 0.6}
+KIND_FACTOR = {"page": 1.0, "work_log": 0.5, "meeting_notes": 0.6, "credentials_link_only": 1.0}
+LINK_ONLY_NOTE = ("This page holds team credentials, so its contents are not available here. Give the user the "
+                  "link; Confluence decides who can open it.")
 CANDIDATES = 200
 MAX_LIMIT = 10
 MAX_DRIVE_LINKS = 3
@@ -98,7 +100,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 5, sources: list[s
                 "breadcrumb": json.loads(r["breadcrumb"]),
                 "section": r["heading"],
                 "section_id": r["ordinal"],
-                "excerpt": r["excerpt"],
+                "excerpt": LINK_ONLY_NOTE if r["kind"] == "credentials_link_only" else r["excerpt"],
                 "score": round(score, 3),
                 "kind": r["kind"],
             })
@@ -126,6 +128,10 @@ def get_document(conn: sqlite3.Connection, page_id: str, section: str | int | No
     page = conn.execute("SELECT * FROM pages WHERE id = ?", (str(page_id),)).fetchone()
     if page is None:
         return None
+    if page["kind"] == "credentials_link_only":
+        return {"source": "confluence", "id": page["id"], "title": page["title"], "url": page["url"],
+                "updated": page["updated"], "breadcrumb": json.loads(page["breadcrumb"]), "kind": page["kind"],
+                "sections": [], "text": LINK_ONLY_NOTE, "truncated": False, "drive_links": []}
     chunks = conn.execute("SELECT ordinal, heading, text, drive_links FROM chunks WHERE page_id = ? ORDER BY ordinal",
                           (page["id"],)).fetchall()
     selected = chunks

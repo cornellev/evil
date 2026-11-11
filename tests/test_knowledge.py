@@ -16,7 +16,7 @@ import pytest
 from evil.knowledge import store
 from evil.knowledge.chunker import CHUNKER_VERSION, chunk, page_kind
 from evil.knowledge.confluence import BROWSER_USER_AGENT, ConfluenceClient, ConfluenceError, parse_page
-from evil.knowledge.filters import mentions_credential, scrub, skip_reason
+from evil.knowledge.filters import mentions_credential, redact_keys, scrub, skip_reason
 from evil.knowledge.indexer import _full_due, index_once
 from evil.knowledge.search import drive_file_id, fts_query, get_document, search
 from evil.knowledge.textify import textify
@@ -252,7 +252,7 @@ def test_full_pass_indexes_only_what_may_be_served(kdb):
     fake = FakeConfluence(corpus())
     r = index_once(conn, client_for(fake), "cev")
     assert r.mode == "full" and r.error is None and r.fetched == 7
-    assert store.page_ids(conn) == {"1", "2", "3"}
+    assert store.page_ids(conn) == {"1", "2", "3", "4"}          # 4 = the credentials page, as a link only
     assert r.skipped == 4 and r.scrubbed >= 3
     all_text = " ".join(row[0] for row in conn.execute("SELECT text FROM chunks"))
     assert "Hunter2" not in all_text and "toor" not in all_text and "private stuff" not in all_text
@@ -298,7 +298,7 @@ def test_failed_pass_keeps_the_last_good_index(kdb):
     index_once(conn, client_for(fake), "cev")
     broken = ConfluenceClient(BASE, "t", fetch=lambda u, h: (500, b""), retries=1, backoff_sec=0)
     r = index_once(conn, broken, "cev", full=True)
-    assert r.error and store.page_ids(conn) == {"1", "2", "3"}
+    assert r.error and store.page_ids(conn) == {"1", "2", "3", "4"}
     assert conn.execute("SELECT error FROM index_runs ORDER BY id DESC LIMIT 1").fetchone()[0]
 
 
@@ -404,4 +404,43 @@ def test_healthz_only_ok_after_a_successful_pass(tmp_path):
         index_once(conn, client_for(FakeConfluence(corpus())), "cev")
         conn.close()
         r = client.get("/healthz")
-        assert r.status_code == 200 and r.json()["pages"] == 3
+        assert r.status_code == 200 and r.json()["pages"] == 4
+
+
+def test_task_list_bookkeeping_is_not_text():
+    storage = ('<ac:task-list><ac:task><ac:task-id>7</ac:task-id>'
+               '<ac:task-uuid>3f2b9c1e-8a4d-4e6f-9b2a-1c3d5e7f9a0b</ac:task-uuid>'
+               '<ac:task-status>complete</ac:task-status><ac:task-body>Order the motor controller</ac:task-body>'
+               '</ac:task></ac:task-list>')
+    text = "\n".join(b.render() for b in textify(storage))
+    assert "Order the motor controller" in text
+    assert "3f2b9c1e" not in text and "complete" not in text
+
+
+def test_long_blobs_redacted_outside_urls_only():
+    secret = "q8WuWgs7Kd93LmXo2PzR5tY1vB6nH4jA0eCf"
+    assert redact_keys(f"token is {secret}") == "token is [redacted]"
+    url = "https://www.amazon.com/dp/B0X?dib=eyJ2IjoiMSJ9.fALLkylnMYFgxvyvU96vQgJ0dib_tag-is-very-long-indeed-xx"
+    assert redact_keys(f"bought it at {url} today") == f"bought it at {url} today"
+    assert redact_keys("https://maps.example.com/api?key=AIzaSyA1b2C3d4&x=1") == \
+        "https://maps.example.com/api?[redacted]&x=1"
+    assert redact_keys("postgres://cev:hunter2@db.example.com/x") == "postgres://[redacted]@db.example.com/x"
+
+
+def test_short_pw_with_a_value_is_a_credential():
+    assert mentions_credential("Pi login - user: cev, pw: abc")
+    assert not mentions_credential("PW stands for pulse width here")
+
+
+def test_credentials_page_is_a_link_only_pointer(kdb):
+    conn, _ = kdb
+    index_once(conn, client_for(FakeConfluence(corpus())), "cev")
+    hits = search(conn, "where is the nuc password")
+    top = [h for h in hits if h["id"] == "4"]
+    assert top and top[0]["kind"] == "credentials_link_only" and "toor" not in json.dumps(hits)
+    assert top[0]["url"].startswith("https://")
+    doc = get_document(conn, "4")
+    assert doc["kind"] == "credentials_link_only" and "toor" not in json.dumps(doc) and doc["sections"] == []
+    # unchanged on the next pass, and never read
+    r = index_once(conn, client_for(FakeConfluence(corpus())), "cev", full=True)
+    assert "4" in store.page_ids(conn) and r.error is None
