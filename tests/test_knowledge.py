@@ -477,3 +477,149 @@ def test_recency_breaks_near_ties_and_order_is_deterministic(kdb):
     first = [h["title"] for h in search(conn, "harness connector crimp", now=now)]
     assert first[:2] == ["New wiring notes", "Old wiring notes"]
     assert all([h["title"] for h in search(conn, "harness connector crimp", now=now)] == first for _ in range(5))
+
+
+# ---------------------------------------------------------------- embeddings (phase 3)
+
+from evil.knowledge import embeddings as emb  # noqa: E402
+
+_CONCEPTS = {  # word -> dimension: a toy "meaning" space for the fake embedder
+    "energy": 0, "joulemeter": 0, "power": 0, "consumption": 0, "shunt": 0, "voltage": 0,
+    "order": 1, "ordering": 1, "buy": 1, "purchase": 1, "vendor": 1, "components": 1, "parts": 1,
+    "worked": 2, "session": 2,
+}
+
+
+class FakeEmbed(emb.EmbedClient):
+    def __init__(self, model="fake-embed", down=False):
+        super().__init__(url="http://thor.invalid/embed", model=model)
+        self.down = down
+        self.calls = []
+
+    def embed(self, texts, timeout=emb.BATCH_TIMEOUT_SEC):
+        self.calls.append(len(texts))
+        if self.down:
+            raise emb.EmbedUnavailable("thor down")
+        import numpy as np
+        import zlib
+        out = np.zeros((len(texts), 16), dtype="float32")
+        for i, t in enumerate(texts):
+            for w in t.lower().replace(">", " ").split():
+                w = w.strip(".,:;?!()|")
+                d = _CONCEPTS.get(w)
+                if d is not None:
+                    out[i, d] += 1
+                elif w:                            # other words: weak, spread over the remaining dimensions
+                    out[i, 3 + zlib.crc32(w.encode()) % 13] += 0.1
+        return emb.normalize(out)
+
+
+def _embedded(conn, model="fake-embed"):
+    return conn.execute("SELECT count(*) FROM embeddings WHERE model = ?", (model,)).fetchone()[0]
+
+
+def test_embed_pending_embeds_each_section_once_and_follows_page_changes(kdb):
+    conn, _ = kdb
+    fake = FakeConfluence(corpus())
+    index_once(conn, client_for(fake), "cev")
+    chunks = conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
+    e = FakeEmbed()
+    assert emb.embed_pending(conn, e) == (chunks, 0) and _embedded(conn) == chunks
+    assert emb.embed_pending(conn, e) == (0, 0)                  # nothing new: no call at all
+    assert len(e.calls) == 1
+
+    fake.set(content(1, "Joulemeter", JOULEMETER + "<p>Now with a new shunt.</p>", version=2,
+                     when="2026-11-02T10:00:00.000-04:00"))
+    index_once(conn, client_for(fake), "cev", full=True)
+    assert _embedded(conn) < chunks                              # the old page's vectors went with its sections
+    done, left = emb.embed_pending(conn, e)
+    assert done == conn.execute("SELECT count(*) FROM chunks WHERE page_id = '1'").fetchone()[0] and left == 0
+    assert _embedded(conn) == conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
+
+
+def test_embed_pending_keeps_sections_pending_while_thor_is_down(indexed):
+    conn, _ = indexed
+    chunks = conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
+    assert emb.embed_pending(conn, FakeEmbed(down=True)) == (0, chunks) and _embedded(conn) == 0
+    assert emb.embed_pending(conn, FakeEmbed()) == (chunks, 0)
+
+
+def test_switching_models_rebuilds_the_vectors(indexed):
+    conn, _ = indexed
+    emb.embed_pending(conn, FakeEmbed())
+    emb.embed_pending(conn, FakeEmbed(model="other-embed"))
+    assert _embedded(conn) == 0 and _embedded(conn, "other-embed") > 0
+
+
+def test_meaning_match_finds_a_page_that_shares_no_keyword(indexed):
+    conn, _ = indexed
+    e = FakeEmbed()
+    emb.embed_pending(conn, e)
+    vectors = emb.load_vectors(conn, e.model)
+    query = "how do I buy components"
+    assert not [h for h in search(conn, query) if h["source"] == "confluence"]          # keywords alone: nothing
+    hits = search(conn, query, vectors=vectors, query_vec=e.embed_query(query))
+    assert hits[0]["title"] == "Ordering Guide"
+    assert "Hunter2" not in json.dumps(hits)
+    # and a keyword hit still leads when there is one
+    hits = search(conn, "joulemeter specs", vectors=vectors, query_vec=e.embed_query("joulemeter specs"))
+    assert hits[0]["title"] == "Joulemeter"
+
+
+def test_vector_cache_reloads_after_a_reindex_even_if_ids_are_reused(kdb):
+    conn, path = kdb
+    fake = FakeConfluence(corpus())
+    index_once(conn, client_for(fake), "cev")
+    e = FakeEmbed()
+    emb.embed_pending(conn, e)
+    cache = emb.VectorCache()
+    ro = store.connect_readonly(path)
+    first = cache.get(ro, e.model)
+    assert cache.get(ro, e.model) is first                       # unchanged index: same object
+    fake.set(content(4, "Software Important Usernames and Passwords", "<p>x</p>", version=2,
+                     when="2026-11-02T10:00:00.000-04:00"))
+    index_once(conn, client_for(fake), "cev", full=True)
+    emb.embed_pending(conn, e)
+    assert cache.get(ro, e.model) is not first
+    ro.close()
+
+
+def test_server_uses_meanings_when_thor_answers_and_keywords_when_not(indexed):
+    from evil.knowledge.server import create_knowledge_server
+    conn, path = indexed
+    emb.embed_pending(conn, FakeEmbed())
+    query = {"query": "how do I buy components"}
+
+    up = create_knowledge_server(str(path), embedder=FakeEmbed())
+    result = asyncio.run(up.call_tool("search_team_knowledge", query))
+    assert "Ordering Guide" in json.dumps(result.structured_content)
+
+    down = create_knowledge_server(str(path), embedder=FakeEmbed(down=True))
+    result = asyncio.run(down.call_tool("search_team_knowledge", query))
+    assert "Ordering Guide" not in json.dumps(result.structured_content)       # keyword-only, still answers
+    result = asyncio.run(down.call_tool("search_team_knowledge", {"query": "joulemeter"}))
+    assert "Joulemeter" in json.dumps(result.structured_content)
+
+
+def test_probe_returns_only_a_score(indexed):
+    from starlette.testclient import TestClient
+    from evil.knowledge.server import create_knowledge_server
+    conn, path = indexed
+    emb.embed_pending(conn, FakeEmbed())
+    app = create_knowledge_server(str(path), embedder=FakeEmbed()).streamable_http_app()
+    with TestClient(app) as client:
+        team = client.post("/probe", json={"query": "joulemeter energy"}).json()
+        other = client.post("/probe", json={"query": "weather tomorrow"}).json()
+        assert set(team) == {"top_score", "model"} and team["top_score"] > other["top_score"]
+        assert client.post("/probe", json={}).status_code == 400
+    off = create_knowledge_server(str(path), embedder=emb.EmbedClient(url="", model="x")).streamable_http_app()
+    with TestClient(off) as client:
+        assert client.post("/probe", json={"query": "joulemeter"}).status_code == 503
+
+
+def test_doc_and_query_text_use_each_models_format():
+    assert emb.query_text("embeddinggemma", "brakes").startswith("task: search result | query: ")
+    assert emb.query_text("qwen3-embedding:0.6b", "brakes").startswith("Instruct: ")
+    d = emb.doc_text("embeddinggemma", "Brake Fluid Sensor", ["CEV Home", "Electrical"], "Wiring", "x" * 9000)
+    assert d.startswith("title: Brake Fluid Sensor | text: CEV Home > Electrical > Brake Fluid Sensor > Wiring")
+    assert len(d) <= emb.DOC_MAX_CHARS
