@@ -126,6 +126,10 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${EVIL_OTLP_ENDPOINT:-}
       EVIL_WHOIS_URL: ${EVIL_WHOIS_URL:-}
       PHOENIX_PROJECT_NAME: cev-knowledge
+      # Meaning-based matches: Tern's /embed on thor (embeddings.py). Set KNOWLEDGE_EMBED_URL= (empty) in .env to
+      # turn them off; thor down -> keyword-only by itself. Same model in both services.
+      KNOWLEDGE_EMBED_URL: ${KNOWLEDGE_EMBED_URL-http://thor.tail4ccb95.ts.net:8000/embed}
+      KNOWLEDGE_EMBED_MODEL: ${KNOWLEDGE_EMBED_MODEL:-embeddinggemma}
     volumes:
       - knowledge-data:/knowledge
     command: ["python", "-m", "evil.knowledge.server"]
@@ -148,6 +152,8 @@ services:
       KNOWLEDGE_CONFLUENCE_URL: ${KNOWLEDGE_CONFLUENCE_URL:-https://confluence.cornell.edu}
       KNOWLEDGE_SPACE: ${KNOWLEDGE_SPACE:-cev}
       # nightly full pass at KNOWLEDGE_FULL_HOUR (default 3) in KNOWLEDGE_TZ (default America/New_York)
+      KNOWLEDGE_EMBED_URL: ${KNOWLEDGE_EMBED_URL-http://thor.tail4ccb95.ts.net:8000/embed}
+      KNOWLEDGE_EMBED_MODEL: ${KNOWLEDGE_EMBED_MODEL:-embeddinggemma}
     volumes:
       - knowledge-data:/knowledge
     command: ["python", "-m", "evil.knowledge.indexer"]

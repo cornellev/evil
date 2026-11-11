@@ -8,6 +8,10 @@
   (CQL reads dates in the token owner's time zone); pages whose version didn't change are skipped, so the
   margin costs a request or two, not a reindex.
 
+- **Embeddings** (after each pass): sections with no vector for KNOWLEDGE_EMBED_MODEL yet are embedded through
+  Tern's /embed on thor (embeddings.py). thor down -> they stay pending until the next pass; search is keyword-only
+  for them meanwhile. The first run embeds everything (~2k sections, about a minute).
+
 Only this process has the Confluence token (KNOWLEDGE_CONFLUENCE_TOKEN, from the NUC's knowledge.env). Logs carry
 ids, titles and counts, never page text.
 
@@ -25,6 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from evil.knowledge import embeddings as emb
 from evil.knowledge import store
 from evil.knowledge.chunker import CHUNKER_VERSION, LINK_ONLY_KIND, Chunk, chunk, page_kind
 from evil.knowledge.confluence import ConfluenceClient, Page, force_ipv4
@@ -181,6 +186,9 @@ def main(argv: list[str] | None = None) -> int:
     if os.getenv("KNOWLEDGE_FORCE_IPV4", "1") != "0":
         force_ipv4()
     conn = store.connect(args.db)
+    embedder = emb.EmbedClient()
+    if not embedder.enabled:
+        logger.info("KNOWLEDGE_EMBED_URL not set: no embeddings, search stays keyword-only")
 
     while True:
         if not token:
@@ -196,6 +204,9 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("%s pass: fetched %d, indexed %d, unchanged %d, removed %d, skipped %d, scrubbed %d, "
                     "%d request(s)%s", r.mode, r.fetched, r.indexed, r.unchanged, r.removed, r.skipped,
                     r.scrubbed, r.requests, f", error: {r.error}" if r.error else "")
+        if embedder.enabled:
+            done, left = emb.embed_pending(conn, embedder)
+            logger.info("embeddings (%s): %d section(s) embedded, %d pending", embedder.model, done, left)
         if args.once:
             return 1 if r.error else 0
         time.sleep(args.interval_sec)

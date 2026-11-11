@@ -3,7 +3,7 @@
 One writer (the indexer), readers open it read-only (the server), WAL so a reindex never blocks a search.
 Tables: pages, chunks, chunks_fts (FTS5 over title / heading / text, porter stemming), restricted (ids of pages
 with their own view restriction, so children are skipped on incremental runs too), meta, index_runs.
-Embeddings come in phase 3 (own table, keyed by chunk id + model).
+embeddings holds one vector per section for the current embedding model (embeddings.py); it goes with its section.
 """
 
 from __future__ import annotations
@@ -40,6 +40,12 @@ CREATE TABLE IF NOT EXISTS chunks (
     UNIQUE (page_id, ordinal)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(title, heading, text, tokenize = 'porter unicode61');
+CREATE TABLE IF NOT EXISTS embeddings (
+    chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    dims INTEGER NOT NULL,
+    vector BLOB NOT NULL             -- float32, L2-normalized
+);
 CREATE TABLE IF NOT EXISTS restricted (id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS index_runs (
     id INTEGER PRIMARY KEY,
@@ -134,12 +140,17 @@ def replace_restricted(conn: sqlite3.Connection, ids: set[str]) -> None:
 def stats(conn: sqlite3.Connection) -> dict:
     pages = conn.execute("SELECT count(*) FROM pages").fetchone()[0]
     chunks = conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
+    try:
+        embedded = conn.execute("SELECT model, count(*) FROM embeddings GROUP BY model").fetchall()
+    except sqlite3.OperationalError:      # read-only server on an index from before phase 3
+        embedded = []
     last = conn.execute("SELECT * FROM index_runs ORDER BY id DESC LIMIT 1").fetchone()
     last_ok = conn.execute("SELECT finished, mode FROM index_runs WHERE error IS NULL AND finished IS NOT NULL"
                            " ORDER BY id DESC LIMIT 1").fetchone()
     return {
         "pages": pages,
         "chunks": chunks,
+        "embedded": {m: n for m, n in embedded},
         "last_run": dict(last) if last else None,
         "last_success": last_ok["finished"] if last_ok else None,
     }
