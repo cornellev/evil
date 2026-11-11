@@ -4,6 +4,9 @@
   almost never satisfy); porter stemming matches "measuring" to "measure".
 - BM25 with title hits weighted highest, then headings, then text.
 - Work logs and meeting notes are pushed down (they match everything with one stray line).
+- Slight edges on top of BM25: a page whose title holds the query's words (BM25 alone let long reports that mention
+  "joulemeter" often outrank the Joulemeter page), and a recently updated page (fades over about a year).
+- Deterministic: ties are broken by last update, then page id, so the same query on the same index gives the same list.
 - One section per page by default: a page's best section represents it, so one long page can't fill the list.
 - Basic Drive fallback: Drive links found in the returned sections are listed after them as link-only hits (title =
   the link text). No Google access; nothing about the file is known beyond its link.
@@ -14,12 +17,18 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any
 
 TITLE_WEIGHT, HEADING_WEIGHT, TEXT_WEIGHT = 8.0, 3.0, 1.0
 KIND_FACTOR = {"page": 1.0, "work_log": 0.5, "meeting_notes": 0.6, "credentials_link_only": 1.0}
 LINK_ONLY_NOTE = ("This page holds team credentials, so its contents are not available here. Give the user the "
                   "link; Confluence decides who can open it.")
+TITLE_BOOST = 0.5           # x(1 + TITLE_BOOST * share of query words in the title)
+TITLE_EXACT_BOOST = 0.25    # and this much more when the title is just the query's words
+RECENCY_BOOST = 0.1         # x(1 + RECENCY_BOOST * 0.5 ** (age / half-life)): at most +10%
+RECENCY_HALF_LIFE_DAYS = 365
+EMPTY_PAGE_FACTOR = 0.3     # title-only entries are tiny, so BM25 overrates them on a single title word
 CANDIDATES = 200
 MAX_LIMIT = 10
 MAX_DRIVE_LINKS = 3
@@ -54,20 +63,61 @@ def fts_query(query: str, glossary: dict[str, list[str]] | None = None) -> str |
     return " OR ".join(terms) if terms else None
 
 
+def _stem(word: str) -> str:
+    """Crude plural/tense folding, enough to match "brakes" to the title "Brake Fluid Sensor"."""
+    for suffix in ("ing", "es", "ed", "s"):
+        if len(word) > len(suffix) + 3 and word.endswith(suffix):
+            return word[: -len(suffix)]
+    return word
+
+
+def _content_stems(text: str) -> list[str]:
+    out = []
+    for w in _TOKEN.findall(text.lower()):
+        w = w.strip("._+-")
+        if len(w) >= 2 and w not in STOPWORDS:
+            out.append(_stem(w))
+    return out
+
+
+def title_share(query_stems: set[str], title: str) -> float:
+    """Share of the query's words that are in the title (0..1)."""
+    if not query_stems:
+        return 0.0
+    return len(query_stems & set(_content_stems(title))) / len(query_stems)
+
+
+def title_factor(query_stems: set[str], title: str) -> float:
+    share = title_share(query_stems, title)
+    title_stems = set(_content_stems(title))
+    exact = TITLE_EXACT_BOOST if title_stems and title_stems <= query_stems and share == 1 else 0.0
+    return 1.0 + TITLE_BOOST * share + exact
+
+
+def recency_factor(updated: str, now: datetime) -> float:
+    try:
+        when = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return 1.0
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    age_days = max(0.0, (now - when).total_seconds() / 86400)
+    return 1.0 + RECENCY_BOOST * 0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS)
+
+
 def drive_file_id(url: str) -> str:
     m = _DRIVE_ID.search(url)
     return (m.group(1) or m.group(2)) if m else url
 
 
 def search(conn: sqlite3.Connection, query: str, limit: int = 5, sources: list[str] | None = None,
-           glossary: dict[str, list[str]] | None = None) -> list[dict[str, Any]]:
+           glossary: dict[str, list[str]] | None = None, now: datetime | None = None) -> list[dict[str, Any]]:
     sources = [s.lower() for s in (sources or ["confluence", "drive"])]
     limit = max(1, min(int(limit), MAX_LIMIT))
     match = fts_query(query, glossary)
     if match is None:
         return []
-    rows = conn.execute(
-        f"""SELECT c.id, c.page_id, c.ordinal, c.heading, c.drive_links,
+    sql = f"""SELECT c.id, c.page_id, c.ordinal, c.heading, c.drive_links, c.text = '' AS empty,
                    p.title, p.url, p.updated, p.breadcrumb, p.kind,
                    snippet(chunks_fts, 2, '', '', ' ... ', 48) AS excerpt,
                    bm25(chunks_fts, {TITLE_WEIGHT}, {HEADING_WEIGHT}, {TEXT_WEIGHT}) AS rank
@@ -75,16 +125,28 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 5, sources: list[s
             JOIN chunks c ON c.id = chunks_fts.rowid
             JOIN pages p ON p.id = c.page_id
             WHERE chunks_fts MATCH ?
-            ORDER BY rank LIMIT {CANDIDATES}""",
-        (match,),
-    ).fetchall()
+            ORDER BY rank, c.id LIMIT {CANDIDATES}"""
+    rows = conn.execute(sql, (match,)).fetchall()
 
+    now = now or datetime.now(timezone.utc)
+    query_stems = set(_content_stems(query))
     best: dict[str, tuple[float, sqlite3.Row]] = {}
     for r in rows:
         score = -r["rank"] * KIND_FACTOR.get(r["kind"], 1.0)     # bm25() is lower-is-better
+        if r["empty"] and r["kind"] != "credentials_link_only":
+            # only a title to go on: full weight when the query names the page, less on one stray title word
+            share = title_share(query_stems, r["title"])
+            score *= EMPTY_PAGE_FACTOR + (1 - EMPTY_PAGE_FACTOR) * share
         if r["page_id"] not in best or score > best[r["page_id"]][0]:
             best[r["page_id"]] = (score, r)
-    ranked = sorted(best.values(), key=lambda t: t[0], reverse=True)[:limit]
+    scored = []
+    for score, r in best.values():          # page-level edges: the same for every section of a page
+        score *= title_factor(query_stems, r["title"]) * recency_factor(r["updated"], now)
+        scored.append((round(score, 6), r))
+    scored.sort(key=lambda t: t[1]["page_id"])
+    scored.sort(key=lambda t: t[1]["updated"] or "", reverse=True)
+    scored.sort(key=lambda t: t[0], reverse=True)               # stable: ties keep newer-first, then id order
+    ranked = scored[:limit]
 
     hits: list[dict[str, Any]] = []
     drive: list[dict[str, Any]] = []
@@ -100,7 +162,8 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 5, sources: list[s
                 "breadcrumb": json.loads(r["breadcrumb"]),
                 "section": r["heading"],
                 "section_id": r["ordinal"],
-                "excerpt": LINK_ONLY_NOTE if r["kind"] == "credentials_link_only" else r["excerpt"],
+                "excerpt": (LINK_ONLY_NOTE if r["kind"] == "credentials_link_only"
+                            else r["excerpt"] or "(no text of its own: likely a parent page, or attachments only)"),
                 "score": round(score, 3),
                 "kind": r["kind"],
             })

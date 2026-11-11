@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 from evil.knowledge.textify import Block, drive_links
 
-CHUNKER_VERSION = "2"      # bump to re-chunk every page on the next pass (2: task ids out of text, URL-aware keys)
+CHUNKER_VERSION = "3"      # bump to re-chunk every page on the next pass (3: title-only entry for empty pages)
 # credentials pages: title + link only, never their text (filters.skip_reason "credentials title")
 LINK_ONLY_KIND = "credentials_link_only"
 

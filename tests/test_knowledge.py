@@ -444,3 +444,36 @@ def test_credentials_page_is_a_link_only_pointer(kdb):
     # unchanged on the next pass, and never read
     r = index_once(conn, client_for(FakeConfluence(corpus())), "cev", full=True)
     assert "4" in store.page_ids(conn) and r.error is None
+
+
+def _ranking_corpus():
+    long_report = "<h2>Data acquisition</h2><p>" + " ".join(["The joulemeter feeds the DAQ."] * 30) + "</p>"
+    return [
+        content(30, "DAQ 2019-20 Technical Report", long_report),
+        content(31, "Joulemeter", "<p>Measures race energy. Shunt and ADC.</p>"),
+        content(32, "Kiwi Kruiser", '<ac:structured-macro ac:name="children"/>'),        # parent page, no text
+        content(33, "Old wiring notes", "<p>harness connector crimp</p>", when="2019-01-01T10:00:00.000-05:00"),
+        content(34, "New wiring notes", "<p>harness connector crimp</p>", when="2026-11-01T10:00:00.000-04:00"),
+    ]
+
+
+def test_title_edge_beats_a_long_report_mentioning_the_word(kdb):
+    conn, _ = kdb
+    index_once(conn, client_for(FakeConfluence(_ranking_corpus())), "cev")
+    assert search(conn, "joulemeter")[0]["title"] == "Joulemeter"
+
+
+def test_page_without_text_is_findable_by_title(kdb):
+    conn, _ = kdb
+    index_once(conn, client_for(FakeConfluence(_ranking_corpus())), "cev")
+    hits = search(conn, "kiwi kruiser")
+    assert hits[0]["title"] == "Kiwi Kruiser" and "no text of its own" in hits[0]["excerpt"]
+
+
+def test_recency_breaks_near_ties_and_order_is_deterministic(kdb):
+    conn, _ = kdb
+    index_once(conn, client_for(FakeConfluence(_ranking_corpus())), "cev")
+    now = datetime(2026, 11, 11, tzinfo=timezone.utc)
+    first = [h["title"] for h in search(conn, "harness connector crimp", now=now)]
+    assert first[:2] == ["New wiring notes", "Old wiring notes"]
+    assert all([h["title"] for h in search(conn, "harness connector crimp", now=now)] == first for _ in range(5))
