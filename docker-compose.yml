@@ -130,8 +130,12 @@ services:
       # turn them off; thor down -> keyword-only by itself. Same model in both services.
       KNOWLEDGE_EMBED_URL: ${KNOWLEDGE_EMBED_URL-http://thor.tail4ccb95.ts.net:8000/embed}
       KNOWLEDGE_EMBED_MODEL: ${KNOWLEDGE_EMBED_MODEL:-embeddinggemma}
+      # Live Google Drive (drive.py): the service account key, root-owned mode 600 in ./secrets (not in git). No key
+      # file = Drive off. Only this service mounts it; the indexer never sees it.
+      KNOWLEDGE_DRIVE_KEY_FILE: /run/secrets/knowledge/drive-key.json
     volumes:
       - knowledge-data:/knowledge
+      - ./secrets:/run/secrets/knowledge:ro
     command: ["python", "-m", "evil.knowledge.server"]
     mem_limit: 512m
     read_only: true

@@ -623,3 +623,222 @@ def test_doc_and_query_text_use_each_models_format():
     d = emb.doc_text("embeddinggemma", "Brake Fluid Sensor", ["CEV Home", "Electrical"], "Wiring", "x" * 9000)
     assert d.startswith("title: Brake Fluid Sensor | text: CEV Home > Electrical > Brake Fluid Sensor > Wiring")
     assert len(d) <= emb.DOC_MAX_CHARS
+
+
+# ---------------------------------------------------------------- live Google Drive (phase 4)
+
+from evil.knowledge import drive as drive_mod  # noqa: E402
+
+G = "application/vnd.google-apps."
+# DRIVE_URL (the Joulemeter page's link) points at this id
+DECK_ID = "1AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+
+
+class _Resp:
+    def __init__(self, status=200, body=None, content=b""):
+        self.status_code, self._body, self.content = status, body, content
+
+    def json(self):
+        return self._body
+
+
+class FakeDrive:
+    """Drive v3 as the client uses it: files.list (q), files.get (meta / alt=media), files.export."""
+
+    def __init__(self, down=False):
+        self.down = down
+        self.calls = []
+        self.files = {
+            DECK_ID: {"id": DECK_ID, "name": "Joulemeter PDR", "mimeType": G + "presentation", "parents": ["fJ"],
+                      "modifiedTime": "2025-10-01T00:00:00Z", "webViewLink": "https://docs.google.com/p/deck"},
+            "d1": {"id": "d1", "name": "FA18 Joulemeter Report", "mimeType": G + "document", "parents": ["fJ"],
+                   "modifiedTime": "2019-01-01T00:00:00Z", "webViewLink": "https://docs.google.com/d/d1"},
+            "d1pdf": {"id": "d1pdf", "name": "FA18 Joulemeter Report.pdf(1)", "mimeType": "application/pdf",
+                      "size": "5000", "parents": ["fJ"], "modifiedTime": "2019-01-02T00:00:00Z"},
+            "cad": {"id": "cad", "name": "joulemeter enclosure.SLDPRT", "mimeType": "application/octet-stream",
+                    "size": "900000", "parents": ["fJ"], "modifiedTime": "2019-02-01T00:00:00Z"},
+            "pw": {"id": "pw", "name": "Lab Passwords", "mimeType": G + "document", "parents": ["fE"],
+                   "modifiedTime": "2024-01-01T00:00:00Z"},
+            "big": {"id": "big", "name": "Huge joulemeter datasheet.pdf", "mimeType": "application/pdf",
+                    "size": str(80 * 1024 * 1024), "parents": ["fJ"]},
+            "sheet": {"id": "sheet", "name": "Pinout", "mimeType": G + "spreadsheet", "parents": ["fJ"]},
+            "fJ": {"id": "fJ", "name": "Joulemeter", "mimeType": G + "folder", "parents": ["fE"]},
+            "fE": {"id": "fE", "name": "Electrical", "mimeType": G + "folder", "parents": ["root"]},
+        }
+        self.exports = {
+            "d1": (b"# Joulemeter report\n\nMeasures pack energy at 10 Hz.\n\n## Lab access\n\nWifi password: "
+                   b"hunter22\n\n## Results\n\n| Item | Value |\n|---|---|\n| Range | 0-60 V |\n"),
+            "sheet": b"Pin,Signal\n1,VBAT\n2,GND\nwifi password,hunter22\n",
+        }
+
+    def get(self, url, params=None, timeout=None, **kw):
+        self.calls.append((url, dict(params or {})))
+        if self.down:
+            raise ConnectionError("no route to googleapis")
+        tail = url[len(drive_mod.API):].strip("/")
+        if not tail:
+            q = params["q"]
+            terms = [t for t in re.findall(r"fullText contains '([^']+)'", q)]
+            hits = [f for f in self.files.values() if f["mimeType"] != G + "folder"
+                    and all(t in f["name"].lower() for t in terms)]
+            return _Resp(body={"files": hits})
+        fid, _, op = tail.partition("/")
+        if fid not in self.files:
+            return _Resp(404)
+        if op == "export":
+            return _Resp(content=self.exports[fid])
+        if params.get("alt") == "media":
+            return _Resp(content=b"plain text")
+        return _Resp(body=self.files[fid])
+
+
+import re  # noqa: E402
+
+
+def test_drive_search_collapses_copies_and_marks_what_can_be_read():
+    fake = FakeDrive()
+    hits = drive_mod.DriveClient(session=fake).search("joulemeter", limit=5)
+    names = [h["title"] for h in hits]
+    assert "FA18 Joulemeter Report" in names and "FA18 Joulemeter Report.pdf(1)" not in names     # one copy
+    kinds = {h["title"]: h["kind"] for h in hits}
+    assert kinds["Joulemeter PDR"] == "drive_doc"
+    assert kinds["joulemeter enclosure.SLDPRT"] == "drive_link_only"
+    assert kinds["Huge joulemeter datasheet.pdf"] == "drive_link_only"
+    assert hits[0]["breadcrumb"] == ["Electrical", "Joulemeter"] and hits[0]["source"] == "drive"
+    q = [p["q"] for u, p in fake.calls if "q" in p][0]
+    assert "fullText contains 'joulemeter'" in q and "trashed = false" in q
+
+
+def test_drive_query_escapes_quotes_and_drops_stopwords():
+    assert drive_mod._terms("where is the BMS doc for the car?") == ["bms", "car"]
+    assert drive_mod.drive_query(["o'brien", "a\\b"]) == (
+        "fullText contains 'o\\'brien' and fullText contains 'a\\\\b' and trashed = false")
+
+
+def test_drive_read_filters_credentials_like_confluence():
+    client = drive_mod.DriveClient(session=FakeDrive())
+    doc = client.read("d1")
+    assert "10 Hz" in doc["text"] and "0-60 V" in doc["text"]
+    assert "hunter22" not in doc["text"] and "## Lab access" in doc["text"]     # heading kept, the value gone
+    sheet = client.read("sheet")
+    assert "VBAT" in sheet["text"] and "hunter22" not in sheet["text"]
+
+
+def test_drive_credentials_and_binaries_are_never_downloaded():
+    fake = FakeDrive()
+    client = drive_mod.DriveClient(session=fake)
+    assert client.read("pw")["kind"] == "credentials_link_only"
+    assert client.read("cad")["kind"] == "drive_link_only"
+    assert "too large" in client.read("big")["text"]
+    assert not [u for u, p in fake.calls if u.endswith("/export") or p.get("alt") == "media"]
+    assert client.read("nope") is None
+
+
+def test_drive_long_documents_come_in_parts():
+    fake = FakeDrive()
+    fake.exports["d1"] = ("# Report\n\n" + "\n\n".join(f"paragraph {i} " + "x" * 100 for i in range(400))).encode()
+    client = drive_mod.DriveClient(session=fake)
+    first = client.read("d1")
+    assert first["truncated"] and len(first["sections"]) >= 3 and "paragraph 0 " in first["text"]
+    second = client.read("d1", "2")
+    assert "paragraph 0 " not in second["text"] and second["text"]
+
+
+def test_drive_down_backs_off_instead_of_failing_every_call():
+    fake = FakeDrive(down=True)
+    client = drive_mod.DriveClient(session=fake)
+    with pytest.raises(drive_mod.DriveUnavailable):
+        client.search("joulemeter")
+    n = len(fake.calls)
+    with pytest.raises(drive_mod.DriveUnavailable, match="recently"):
+        client.search("joulemeter")
+    assert len(fake.calls) == n                                  # no second network call within the minute
+
+
+def test_server_merges_drive_after_confluence_and_upgrades_linked_files(indexed):
+    from evil.knowledge.server import create_knowledge_server
+    _, path = indexed
+    server = create_knowledge_server(str(path), drive=drive_mod.DriveClient(session=FakeDrive()))
+    hits = asyncio.run(server.call_tool("search_team_knowledge", {"query": "joulemeter"})).structured_content["result"]
+    sources = [h["source"] for h in hits]
+    assert sources[0] == "confluence" and hits[0]["title"] == "Joulemeter"
+    assert sources == sorted(sources, key=lambda s: s == "drive")             # all Drive hits after Confluence
+    drive_hits = [h for h in hits if h["source"] == "drive"]
+    assert len(drive_hits) <= 3
+    assert drive_hits[0]["id"] == DECK_ID and drive_hits[0]["title"] == "Joulemeter PDR"     # linked deck, real name
+    assert drive_hits[0]["via"]["title"] == "Joulemeter" and drive_hits[0]["kind"] == "drive_doc"
+    doc = asyncio.run(server.call_tool("get_document", {"source": "drive", "id": "d1"}))
+    assert "10 Hz" in doc.content[0].text and "hunter22" not in doc.content[0].text
+
+
+def test_server_search_survives_drive_being_down(indexed):
+    from evil.knowledge.server import create_knowledge_server
+    _, path = indexed
+    server = create_knowledge_server(str(path), drive=drive_mod.DriveClient(session=FakeDrive(down=True)))
+    hits = asyncio.run(server.call_tool("search_team_knowledge", {"query": "joulemeter"})).structured_content["result"]
+    assert hits[0]["title"] == "Joulemeter"
+    assert [h for h in hits if h["source"] == "drive" and h["kind"] == "drive_link_only"]    # the page's link stays
+    with pytest.raises(Exception, match="link"):
+        asyncio.run(server.call_tool("get_document", {"source": "drive", "id": "d1"}))
+
+
+def test_drive_read_writes_nothing_to_disk(monkeypatch, tmp_path):
+    import builtins
+    real_open = builtins.open
+
+    def guarded(file, mode="r", *a, **k):
+        assert not any(c in mode for c in "wax+"), f"Drive code tried to write {file}"
+        return real_open(file, mode, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", guarded)
+    monkeypatch.chdir(tmp_path)
+    client = drive_mod.DriveClient(session=FakeDrive())
+    client.search("joulemeter")
+    client.read("d1")
+    client.read("sheet")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_drive_reads_uploaded_powerpoint_by_slide_and_merges_copy_of():
+    import io as _io
+    import zipfile as _zip
+    buf = _io.BytesIO()
+    a = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+    with _zip.ZipFile(buf, "w") as z:
+        for n, words in ((1, ["Joulemeter V1.4", "Design review"]), (2, ["Shunt: 100 A", "Login: cev / hunter22"]),
+                         (10, ["Next steps"])):
+            body = "".join(f"<a:p><a:r><a:t>{w}</a:t></a:r></a:p>" for w in words)
+            z.writestr(f"ppt/slides/slide{n}.xml", f"<p:sld {a} xmlns:p='p'><p:txBody>{body}</p:txBody></p:sld>")
+    fake = FakeDrive()
+    fake.files["pp"] = {"id": "pp", "name": "Joulemeter V1.4 PDR/CDR.pptx", "mimeType": drive_mod.PPTX,
+                        "size": str(len(buf.getvalue())), "parents": ["fJ"]}
+    fake.files["pp2"] = dict(fake.files["pp"], id="pp2", name="Copy of Joulemeter V1.4 PDR/CDR.pptx")
+    real_get = fake.get
+    fake.get = lambda url, params=None, timeout=None, **kw: (
+        _Resp(content=buf.getvalue()) if url.endswith("/pp") and (params or {}).get("alt") == "media"
+        else real_get(url, params, timeout))
+    client = drive_mod.DriveClient(session=fake)
+    doc = client.read("pp")
+    assert doc["kind"] == "drive_doc"
+    t = doc["text"]
+    assert t.index("## Slide 1") < t.index("## Slide 2") < t.index("## Slide 10")       # numeric slide order
+    assert "Shunt: 100 A" in t and "hunter22" not in t
+    names = [h["title"] for h in client.search("pdr", limit=5)]
+    assert len([n for n in names if "PDR/CDR" in n]) == 1
+
+
+def test_drive_slow_download_becomes_a_link_not_a_timeout(monkeypatch):
+    class Slow(_Resp):
+        def iter_content(self, n):
+            for _ in range(100):
+                yield b"x" * 10
+    fake = FakeDrive()
+    real_get = fake.get
+    fake.get = lambda url, params=None, timeout=None, **kw: (
+        Slow() if (params or {}).get("alt") == "media" else real_get(url, params, timeout))
+    clock = iter(range(0, 10_000, 10))                    # every check is 10 s later
+    monkeypatch.setattr(drive_mod.time, "monotonic", lambda: next(clock))
+    client = drive_mod.DriveClient(session=fake)
+    doc = client.read("d1pdf")
+    assert doc["kind"] == "drive_link_only" and "too slow" in doc["text"]
+    assert client.search("joulemeter")                    # a slow file doesn't mark Drive as down

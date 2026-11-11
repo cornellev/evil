@@ -16,3 +16,8 @@ tzdata
 
 # cev-knowledge: cosine similarity over the section embeddings (~2k x 768 floats, in memory).
 numpy>=2.3,<3
+
+# cev-knowledge live Google Drive (drive.py): service-account auth, Drive REST, text from small PDFs.
+google-auth>=2.40,<3
+requests>=2.32,<3
+pypdf>=6,<8
