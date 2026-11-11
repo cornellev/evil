@@ -16,7 +16,9 @@ _URL = re.compile(r"https?://[^\s\"'<>\]\)]+")
 
 _HEADINGS = {f"h{i}": i for i in range(1, 7)}
 _BLOCK_TAGS = {"p", "div", "li", "blockquote", "pre", "ac:task-body", "dd", "dt", "caption"}
-_SKIP_TAGS = {"ac:parameter", "ac:image", "script", "style", "ri:attachment"}
+# task-id / task-uuid / task-status: task-list bookkeeping ("1", a UUID, "complete"), not text
+_SKIP_TAGS = {"ac:parameter", "ac:image", "script", "style", "ri:attachment",
+              "ac:task-id", "ac:task-uuid", "ac:task-status"}
 _CODE_MACROS = {"code", "noformat"}
 
 

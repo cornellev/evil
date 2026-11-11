@@ -26,7 +26,7 @@ _STRONG = re.compile(
 )
 # Words that are fine in normal prose ("log in to RED"): only count them next to a value
 # marker such as "Login: cev" or "token = ...". Not "pin" or "pass": pinout tables ("Pin 1: VCC") and "Pass 2: ..." are everywhere here.
-_WEAK = re.compile(r"\b(log[\s-]?ins?|tokens?)\b", re.I)
+_WEAK = re.compile(r"\b(log[\s-]?ins?|tokens?|pw|pwds?)\b", re.I)
 _VALUE_MARKER = re.compile(r"[:=]")
 CREDENTIAL_TITLE = re.compile(r"\b(passwords?|credentials?|logins?|secrets?)\b", re.I)
 
@@ -37,9 +37,14 @@ KEY_SHAPED = [
     re.compile(r"\bxox[abpr]-[A-Za-z0-9-]{10,}\b"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)"),
     re.compile(r"(?<=://)[^/\s:@]+:[^/\s@]+(?=@)"),                       # user:pass@ in URLs
-    # long mixed letter+digit blobs, but not ids inside URLs (Drive file ids are 33-44 chars)
-    re.compile(r"(?<![/=?&A-Za-z0-9+_-])(?=[A-Za-z0-9+_-]*\d)(?=[A-Za-z0-9+_-]*[A-Za-z])[A-Za-z0-9+_-]{32,}={0,2}"),
+    # secrets passed in a URL query (?key=..., &access_token=...)
+    re.compile(r"(?<=[?&])(?:key|api_?key|token|access_token|auth|secret|client_secret|password|pass|pwd|sig|"
+               r"signature)=[^&#\s]+", re.I),
 ]
+# Long mixed letter+digit blobs. Applied outside URLs only: inside one they are file ids, tracking parameters and
+# percent-encoding (the first real pass redacted 30 such URL pieces and no secret).
+LONG_BLOB = re.compile(r"(?<![A-Za-z0-9+_-])(?=[A-Za-z0-9+_-]*\d)(?=[A-Za-z0-9+_-]*[A-Za-z])[A-Za-z0-9+_-]{32,}={0,2}")
+_URL = re.compile(r"https?://[^\s\"'<>\]\)]+")
 REDACTED = "[redacted]"
 
 
@@ -80,11 +85,22 @@ def skip_reason(page: Page, restricted_ids: set[str], space: str) -> str | None:
 
 
 def redact_keys(text: str, stats: ScrubStats | None = None) -> str:
+    count = 0
     for pattern in KEY_SHAPED:
         text, n = pattern.subn(REDACTED, text)
-        if stats is not None:
-            stats.keys += n
-    return text
+        count += n
+    parts, last = [], 0
+    for m in _URL.finditer(text):
+        outside, n = LONG_BLOB.subn(REDACTED, text[last:m.start()])
+        parts += [outside, m.group(0)]
+        count += n
+        last = m.end()
+    outside, n = LONG_BLOB.subn(REDACTED, text[last:])
+    parts.append(outside)
+    count += n
+    if stats is not None:
+        stats.keys += count
+    return "".join(parts)
 
 
 def scrub(blocks: list[Block]) -> tuple[list[Block], ScrubStats]:

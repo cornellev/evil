@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from evil.knowledge import store
-from evil.knowledge.chunker import CHUNKER_VERSION, chunk, page_kind
+from evil.knowledge.chunker import CHUNKER_VERSION, LINK_ONLY_KIND, Chunk, chunk, page_kind
 from evil.knowledge.confluence import ConfluenceClient, Page, force_ipv4
 from evil.knowledge.filters import scrub, skip_reason
 from evil.knowledge.textify import textify
@@ -71,6 +71,16 @@ def _index_page(conn, page: Page, now: datetime) -> tuple[int, int]:
     return len(chunks), scrub_stats.total
 
 
+def _index_link_only(conn, page: Page, now: datetime) -> None:
+    store.upsert_page(
+        conn, page_id=page.id, title=page.title, url=page.url, space=page.space,
+        breadcrumb=[t for _, t in page.ancestors], updated=page.updated, version=page.version,
+        labels=page.labels, kind=LINK_ONLY_KIND, chunker_version=CHUNKER_VERSION,
+        indexed_at=now.isoformat(), chunks=[Chunk(0, "", "", [])],
+    )
+    logger.info("page %s %r: credentials page, stored as a link only", page.id, page.title)
+
+
 def index_once(conn, client: ConfluenceClient, space: str, full: bool | None = None,
                now: datetime | None = None) -> RunResult:
     """One pass. `full=None` decides by itself: full on the first run or after a chunker change."""
@@ -99,6 +109,13 @@ def index_once(conn, client: ConfluenceClient, space: str, full: bool | None = N
         for p in pages:
             seen.add(p.id)
             reason = skip_reason(p, restricted, space)
+            if reason == "credentials title":
+                # a pointer only: title + link, the body is never read, so "where's the router password" finds the
+                # page and Confluence decides who can open it
+                result.skipped += 1
+                if store.page_state(conn, p.id) != (p.version, CHUNKER_VERSION):
+                    _index_link_only(conn, p, now)
+                continue
             if reason:
                 if store.delete_page(conn, p.id):
                     result.removed += 1
