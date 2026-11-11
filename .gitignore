@@ -219,3 +219,5 @@ __marimo__/
 
 # cev-knowledge indexer secrets (Confluence token), NUC only
 knowledge.env
+# cev-knowledge Drive service account key (root-owned on the NUC)
+secrets/
