@@ -842,3 +842,10 @@ def test_drive_slow_download_becomes_a_link_not_a_timeout(monkeypatch):
     doc = client.read("d1pdf")
     assert doc["kind"] == "drive_link_only" and "too slow" in doc["text"]
     assert client.search("joulemeter")                    # a slow file doesn't mark Drive as down
+
+
+def test_drive_links_drop_google_tracking_params():
+    from evil.knowledge.drive import file_url
+    link = "https://docs.google.com/presentation/d/abc/edit?usp=drivesdk&ouid=1035&rtpof=true&sd=true"
+    assert file_url({"id": "abc", "webViewLink": link}) == "https://docs.google.com/presentation/d/abc/edit"
+    assert file_url({"id": "abc"}) == "https://drive.google.com/open?id=abc"
