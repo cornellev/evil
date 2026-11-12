@@ -8,6 +8,14 @@
   (CQL reads dates in the token owner's time zone); pages whose version didn't change are skipped, so the
   margin costs a request or two, not a reindex.
 
+- **Attachments** (after the pages, phase 6): files attached to indexed pages, minus images (screenshots shown on
+  their page: 93% of the space's ~2,000). PDF / Word / PowerPoint files up to 10 MB are downloaded and indexed as text
+  (same scrub and chunker as pages, the first section says which page they are on); everything else, and anything
+  bigger, is an entry with name, type, size and link only. An attachment is indexed only while its page is (a
+  restricted, `no-tern`, credentials or deleted page takes its attachments with it); a credentials-named file is a
+  link-only pointer and is never downloaded. Listing all attachments is ~11 requests, done on full passes and while
+  downloads are still pending; hourly passes list only changed ones. Downloads get a time budget per pass (the
+  NUC's link is slow); what doesn't fit waits for the next pass.
 - **Embeddings** (after each pass): sections with no vector for KNOWLEDGE_EMBED_MODEL yet are embedded through
   Tern's /embed on thor (embeddings.py). thor down -> they stay pending until the next pass; search is keyword-only
   for them meanwhile. The first run embeds everything (~2k sections, about a minute).
@@ -21,6 +29,7 @@ Run: `python -m evil.knowledge.indexer` (loop) or `--once [--full]`.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -32,9 +41,10 @@ from zoneinfo import ZoneInfo
 from evil.knowledge import embeddings as emb
 from evil.knowledge import store
 from evil.knowledge.chunker import CHUNKER_VERSION, LINK_ONLY_KIND, Chunk, chunk, page_kind
-from evil.knowledge.confluence import ConfluenceClient, Page, force_ipv4
-from evil.knowledge.filters import scrub, skip_reason
-from evil.knowledge.textify import textify
+from evil.knowledge.confluence import Attachment, ConfluenceClient, ConfluenceError, Page, force_ipv4
+from evil.knowledge.extract import LABEL, READABLE, blocks_for
+from evil.knowledge.filters import CREDENTIAL_TITLE, mentions_credential, redact_keys, scrub, skip_reason
+from evil.knowledge.textify import Block, textify
 
 logger = logging.getLogger("evil.knowledge.indexer")
 
@@ -43,6 +53,9 @@ DEFAULT_URL = os.getenv("KNOWLEDGE_CONFLUENCE_URL", "https://confluence.cornell.
 DEFAULT_SPACE = os.getenv("KNOWLEDGE_SPACE", "cev")
 INCREMENTAL_MARGIN = timedelta(hours=26)
 LOCAL_TZ = ZoneInfo(os.getenv("KNOWLEDGE_TZ", "America/New_York"))   # for the nightly full hour
+ATTACHMENT_MAX_BYTES = int(os.getenv("KNOWLEDGE_ATTACHMENT_MAX_BYTES", str(10 * 1024 * 1024)))
+ATTACHMENT_BUDGET_SEC = float(os.getenv("KNOWLEDGE_ATTACHMENT_BUDGET_SEC", "900"))   # downloads per pass
+ATTACHMENTS_VERSION = "1"     # bump to re-read every attachment on the next pass
 
 
 @dataclass
@@ -55,6 +68,9 @@ class RunResult:
     skipped: int = 0
     scrubbed: int = 0
     requests: int = 0
+    attachments_indexed: int = 0
+    attachments_removed: int = 0
+    attachments_pending: int = 0
     error: str | None = None
 
 
@@ -86,6 +102,84 @@ def _index_link_only(conn, page: Page, now: datetime) -> None:
         indexed_at=now.isoformat(), chunks=[Chunk(0, "", "", [])],
     )
     logger.info("page %s %r: credentials page, stored as a link only", page.id, page.title)
+
+
+def _size(n: int) -> str:
+    return f"{n / 1e6:.1f} MB" if n >= 100_000 else f"{max(1, round(n / 1e3))} KB"
+
+
+def _type_label(att: Attachment) -> str:
+    if att.media_type in LABEL:
+        return LABEL[att.media_type]
+    ext = att.title.rsplit(".", 1)[-1].upper() if "." in att.title else ""
+    return f"{ext} file" if ext and len(ext) <= 5 else "file"
+
+
+def _attachment_state(att: Attachment) -> tuple[int, str]:
+    return att.version, f"a{ATTACHMENTS_VERSION}-{CHUNKER_VERSION}"
+
+
+def sync_attachments(conn, client: ConfluenceClient, space: str, full: bool, since: datetime | None,
+                     now: datetime, result: RunResult) -> None:
+    pending_before = int(store.get_meta(conn, "attachments_pending") or "0")
+    listing_full = full or pending_before > 0 or store.get_meta(conn, "attachments_version") != ATTACHMENTS_VERSION
+    deadline = time.monotonic() + ATTACHMENT_BUDGET_SEC
+    seen: set[str] = set()
+    pending = 0
+    for att in client.attachments(space, None if listing_full else since):
+        if att.media_type.startswith("image/"):
+            continue
+        parent = None
+        if att.page_id:
+            parent = conn.execute("SELECT title, breadcrumb, kind FROM pages WHERE id = ? AND parent IS NULL",
+                                  (att.page_id,)).fetchone()
+        if parent is None or parent["kind"] == LINK_ONLY_KIND:     # its page isn't served, so neither is the file
+            if store.delete_page(conn, att.id):
+                result.attachments_removed += 1
+            continue
+        seen.add(att.id)
+        version, state = _attachment_state(att)
+        if store.page_state(conn, att.id) == (version, state):
+            continue
+        breadcrumb = [*json.loads(parent["breadcrumb"]), parent["title"]]
+        comment = "" if mentions_credential(att.comment) else redact_keys(att.comment)
+        about = f'{_type_label(att)} attached to the page "{parent["title"]}" ({_size(att.size)}).' + (
+            f" {comment}" if comment else "")
+        kind, chunks = "attachment_link_only", [Chunk(0, "", about, [])]
+        if CREDENTIAL_TITLE.search(att.title):
+            kind, chunks = LINK_ONLY_KIND, [Chunk(0, "", "", [])]          # never downloaded
+        elif att.media_type in READABLE and att.size <= ATTACHMENT_MAX_BYTES:
+            if time.monotonic() > deadline:
+                pending += 1
+                continue
+            try:
+                blocks = blocks_for(att.media_type, client.download(att))
+            except ConfluenceError as exc:              # try again next pass; a stored older version stays
+                logger.warning("attachment %s %r: %s", att.id, att.title, exc)
+                pending += 1
+                continue
+            except Exception as exc:                    # a file the extractor can't parse: link only
+                logger.info("attachment %s %r: not readable as text (%s)", att.id, att.title, type(exc).__name__)
+                blocks = []
+            clean, scrub_stats = scrub(blocks)
+            if scrub_stats.total:
+                result.scrubbed += scrub_stats.total
+                logger.info("attachment %s %r: removed %d credential item(s)", att.id, att.title, scrub_stats.total)
+            if chunk(clean):                            # a scanned PDF has no text: stays link only
+                kind, chunks = "attachment", chunk([Block("para", about), *clean])
+        store.upsert_page(
+            conn, page_id=att.id, title=att.title, url=att.url, space=space.lower(), breadcrumb=breadcrumb,
+            updated=att.updated, version=version, labels=[], kind=kind, chunker_version=state,
+            indexed_at=now.isoformat(), chunks=chunks, parent=att.page_id,
+        )
+        result.attachments_indexed += 1
+    if listing_full:
+        for gone in store.attachment_ids(conn) - seen:
+            store.delete_page(conn, gone)
+            result.attachments_removed += 1
+    result.attachments_pending = pending
+    store.set_meta(conn, "attachments_pending", str(pending))
+    store.set_meta(conn, "attachments_version", ATTACHMENTS_VERSION)
 
 
 def index_once(conn, client: ConfluenceClient, space: str, full: bool | None = None,
@@ -151,6 +245,14 @@ def index_once(conn, client: ConfluenceClient, space: str, full: bool | None = N
         conn.rollback()
         result.error = f"{type(exc).__name__}: {exc}"
         logger.error("index pass failed: %s", result.error)
+    else:
+        try:                              # pages are committed; attachments can fail on their own
+            sync_attachments(conn, client, space, full, since, now, result)
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            result.error = f"attachments: {type(exc).__name__}: {exc}"
+            logger.error("attachment pass failed: %s", result.error)
     result.requests = client.requests_made - requests_before
     conn.execute(
         "UPDATE index_runs SET finished = ?, fetched = ?, indexed = ?, unchanged = ?, removed = ?, skipped = ?,"
@@ -201,9 +303,10 @@ def main(argv: list[str] | None = None) -> int:
         now = _now()
         full = True if args.full else (None if args.once else (_full_due(conn, now, args.full_hour) or None))
         r = index_once(conn, client, DEFAULT_SPACE, full=full, now=now)
-        logger.info("%s pass: fetched %d, indexed %d, unchanged %d, removed %d, skipped %d, scrubbed %d, "
-                    "%d request(s)%s", r.mode, r.fetched, r.indexed, r.unchanged, r.removed, r.skipped,
-                    r.scrubbed, r.requests, f", error: {r.error}" if r.error else "")
+        logger.info("%s pass: fetched %d, indexed %d, unchanged %d, removed %d, skipped %d, scrubbed %d; "
+                    "attachments indexed %d, removed %d, pending %d; %d request(s)%s", r.mode, r.fetched,
+                    r.indexed, r.unchanged, r.removed, r.skipped, r.scrubbed, r.attachments_indexed,
+                    r.attachments_removed, r.attachments_pending, r.requests, f", error: {r.error}" if r.error else "")
         if embedder.enabled:
             done, left = emb.embed_pending(conn, embedder)
             logger.info("embeddings (%s): %d section(s) embedded, %d pending", embedder.model, done, left)
