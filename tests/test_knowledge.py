@@ -42,12 +42,17 @@ def content(pid, title, body, *, version=1, labels=(), ancestors=(), restricted=
 
 
 class FakeConfluence:
-    """Answers /rest/api/content/search with the current pages, paginated; records every request."""
+    """Answers /rest/api/content/search with the current pages (or attachments, for `type = attachment`),
+    paginated, and attachment downloads; records every request."""
 
-    def __init__(self, pages=None, page_size=2):
+    def __init__(self, pages=None, page_size=2, attachments=None):
         self.pages = {p["id"]: p for p in (pages or [])}
+        self.attachments = {a["id"]: a for a in (attachments or [])}
+        self.files: dict[str, bytes] = {}          # download path -> bytes
+        self.fail_downloads = 0
         self.page_size = page_size
         self.requests = []
+        self.downloads = []
 
     def set(self, page):
         self.pages[page["id"]] = page
@@ -57,9 +62,16 @@ class FakeConfluence:
 
     def __call__(self, url, headers):
         self.requests.append((url, headers))
+        path = urllib.parse.urlparse(url).path
+        if path.startswith("/download/"):
+            self.downloads.append(path)
+            if self.fail_downloads:
+                self.fail_downloads -= 1
+                return 500, b""
+            return (200, self.files[path]) if path in self.files else (404, b"")
         q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
         start, limit = int(q["start"][0]), int(q["limit"][0])
-        items = list(self.pages.values())
+        items = list((self.attachments if "type = attachment" in q["cql"][0] else self.pages).values())
         if "lastmodified >=" in q["cql"][0]:
             since = q["cql"][0].split('lastmodified >= "')[1].split('"')[0]
             since_dt = datetime.strptime(since, "%Y/%m/%d %H:%M")
@@ -849,3 +861,132 @@ def test_drive_links_drop_google_tracking_params():
     link = "https://docs.google.com/presentation/d/abc/edit?usp=drivesdk&ouid=1035&rtpof=true&sd=true"
     assert file_url({"id": "abc", "webViewLink": link}) == "https://docs.google.com/presentation/d/abc/edit"
     assert file_url({"id": "abc"}) == "https://drive.google.com/open?id=abc"
+
+
+# ---------------------------------------------------------------- attachments (phase 6)
+
+PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+
+def _pptx(slides):
+    import io as _io
+    import zipfile as _zip
+    buf = _io.BytesIO()
+    a = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+    with _zip.ZipFile(buf, "w") as z:
+        for n, words in enumerate(slides, 1):
+            body = "".join(f"<a:p><a:r><a:t>{w}</a:t></a:r></a:p>" for w in words)
+            z.writestr(f"ppt/slides/slide{n}.xml", f"<p:sld {a} xmlns:p='p'><p:txBody>{body}</p:txBody></p:sld>")
+    return buf.getvalue()
+
+
+def attachment(aid, page_id, title, mime, size=50_000, version=1, when="2026-11-01T10:00:00.000-04:00", comment=""):
+    return {
+        "id": aid, "type": "attachment", "title": title,
+        "version": {"number": version, "when": when},
+        "container": {"id": str(page_id), "type": "page"},
+        "metadata": {"mediaType": mime},
+        "extensions": {"mediaType": mime, "fileSize": size, "comment": comment},
+        "_links": {"webui": f"/pages/viewpageattachments.action?pageId={page_id}&preview={title}",
+                   "download": f"/download/attachments/{page_id}/{aid}?version={version}"},
+    }
+
+
+DECK = _pptx([["Joulemeter PDR", "Shunt amplifier gain 50 V/V"], ["Bench login: cev / hunter22"]])
+
+
+def att_fake():
+    fake = FakeConfluence(corpus(), attachments=[
+        attachment("att1", 1, "Joulemeter PDR.pptx", PPTX_MIME, size=len(DECK)),
+        attachment("att2", 1, "image2023-10-1_12-0-0.png", "image/png"),
+        attachment("att3", 1, "firmware v2.zip", "application/zip", size=3_200_000, comment="build from main"),
+        attachment("att4", 1, "router passwords.pdf", "application/pdf"),
+        attachment("att5", 1, "huge scan.pdf", "application/pdf", size=40_000_000),
+        attachment("att6", 10, "private.pptx", PPTX_MIME),                  # on the restricted page
+        attachment("att7", 12, "opted out.pptx", PPTX_MIME),                # on the no-tern page
+    ])
+    fake.files["/download/attachments/1/att1"] = DECK
+    return fake
+
+
+def test_attachments_indexed_under_their_page_with_the_page_filters(kdb):
+    conn, _ = kdb
+    fake = att_fake()
+    r = index_once(conn, client_for(fake), "cev")
+    assert r.error is None
+    kinds = dict(conn.execute("SELECT id, kind FROM pages WHERE parent IS NOT NULL").fetchall())
+    # the screenshot is left out; files on skipped pages too
+    assert kinds == {"att1": "attachment", "att3": "attachment_link_only", "att4": "credentials_link_only",
+                     "att5": "attachment_link_only"}
+    assert fake.downloads == ["/download/attachments/1/att1"]     # not the credentials file, the zip or the 40 MB pdf
+    assert store.page_ids(conn) == {"1", "2", "3", "4"}           # attachments are not counted as pages
+    assert store.stats(conn)["attachments"] == 4
+    all_text = " ".join(row[0] for row in conn.execute("SELECT text FROM chunks"))
+    assert "Shunt amplifier gain" in all_text and "hunter22" not in all_text
+
+    hits = search(conn, "shunt amplifier gain deck", sources=["confluence"])
+    deck = next(h for h in hits if h["id"] == "att1")
+    assert deck["breadcrumb"][-1] == "Joulemeter" and deck["kind"] == "attachment"
+    doc = get_document(conn, "att1")
+    assert 'attached to the page "Joulemeter"' in doc["text"] and "Slide 1" in doc["text"]
+    zip_hit = next(h for h in search(conn, "firmware zip", sources=["confluence"]) if h["id"] == "att3")
+    assert "ZIP file" in zip_hit["excerpt"] and "3.2 MB" in zip_hit["excerpt"]
+    assert search(conn, "router passwords", sources=["confluence"])[0]["excerpt"].startswith("This page holds")
+
+
+def test_attachments_follow_their_page_and_versions(kdb):
+    conn, _ = kdb
+    fake = att_fake()
+    t0 = datetime(2026, 11, 2, 12, tzinfo=timezone.utc)
+    index_once(conn, client_for(fake), "cev", now=t0)
+    fake.downloads.clear()
+    # unchanged: nothing downloaded again
+    index_once(conn, client_for(fake), "cev", now=t0 + timedelta(hours=1))
+    assert fake.downloads == []
+    # a new version is re-read
+    deck2 = _pptx([["Joulemeter PDR rev B", "Shunt amplifier gain 20 V/V"]])
+    fake.attachments["att1"] = attachment("att1", 1, "Joulemeter PDR.pptx", PPTX_MIME, size=len(deck2), version=2,
+                                          when="2026-11-03T09:00:00.000-04:00")
+    fake.files["/download/attachments/1/att1"] = deck2
+    index_once(conn, client_for(fake), "cev", now=t0 + timedelta(days=1))
+    assert "20 V/V" in get_document(conn, "att1")["text"]
+    # a file deleted from Confluence goes on the next full pass
+    fake.attachments.pop("att3")
+    index_once(conn, client_for(fake), "cev", full=True, now=t0 + timedelta(days=1, hours=1))
+    assert "att3" not in store.attachment_ids(conn)
+    # the page opts out -> its attachments go with it, also on an hourly pass
+    fake.set(content(1, "Joulemeter", JOULEMETER, version=2, labels=["no-tern"], when="2026-11-04T09:00:00.000-04:00"))
+    index_once(conn, client_for(fake), "cev", now=t0 + timedelta(days=2))
+    assert store.attachment_ids(conn) == set()
+
+
+def test_failed_attachment_download_is_retried_next_pass(kdb):
+    conn, _ = kdb
+    fake = att_fake()
+    fake.fail_downloads = 3                      # the client doesn't retry downloads; one failure is enough
+    t0 = datetime(2026, 11, 2, 12, tzinfo=timezone.utc)
+    r = index_once(conn, client_for(fake), "cev", now=t0)
+    assert r.error is None and r.attachments_pending == 1 and "att1" not in store.attachment_ids(conn)
+    fake.fail_downloads = 0
+    r = index_once(conn, client_for(fake), "cev", now=t0 + timedelta(hours=1))   # hourly, but lists everything again
+    assert r.attachments_pending == 0 and "att1" in store.attachment_ids(conn)
+
+
+def test_page_update_keeps_its_attachments_and_old_index_gets_the_column(kdb):
+    conn, path = kdb
+    fake = att_fake()
+    t0 = datetime(2026, 11, 2, 12, tzinfo=timezone.utc)
+    index_once(conn, client_for(fake), "cev", now=t0)
+    fake.set(content(1, "Joulemeter", JOULEMETER.replace("10 Hz", "50 Hz"), version=2,
+                     when="2026-11-03T09:00:00.000-04:00"))
+    fake.downloads.clear()
+    index_once(conn, client_for(fake), "cev", now=t0 + timedelta(days=1))
+    assert "att1" in store.attachment_ids(conn) and fake.downloads == []
+
+    old = store.connect(path.parent / "old.db")
+    old.execute("ALTER TABLE pages DROP COLUMN parent")
+    old.commit()
+    old.close()
+    again = store.connect(path.parent / "old.db")
+    assert "parent" in {r[1] for r in again.execute("PRAGMA table_info(pages)")}
+    again.close()

@@ -12,6 +12,8 @@
   query (see fuse). Finds pages for questions asked in other words than the page uses. Off or thor down -> the
   keyword ranking alone, unchanged.
 - One section per page by default: a page's best section represents it, so one long page can't fill the list.
+- Confluence attachments (PDFs, decks, docs on a page) are results like pages: kind "attachment" (text indexed,
+  readable with get_document) or "attachment_link_only" (name, type, size, link); breadcrumb ends with their page.
 - Basic Drive fallback: Drive links found in the returned sections are listed after them as link-only hits (title =
   the link text). No Google access; nothing about the file is known beyond its link.
 """
@@ -25,7 +27,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 TITLE_WEIGHT, HEADING_WEIGHT, TEXT_WEIGHT = 8.0, 3.0, 1.0
-KIND_FACTOR = {"page": 1.0, "work_log": 0.5, "meeting_notes": 0.6, "credentials_link_only": 1.0}
+# attachments a little below pages, so a page usually ranks above the files attached to it
+KIND_FACTOR = {"page": 1.0, "work_log": 0.5, "meeting_notes": 0.6, "credentials_link_only": 1.0,
+               "attachment": 0.9, "attachment_link_only": 0.9}
 LINK_ONLY_NOTE = ("This page holds team credentials, so its contents are not available here. Give the user the "
                   "link; Confluence decides who can open it.")
 TITLE_BOOST = 0.5           # x(1 + TITLE_BOOST * share of query words in the title)

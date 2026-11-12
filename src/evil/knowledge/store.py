@@ -3,6 +3,7 @@
 One writer (the indexer), readers open it read-only (the server), WAL so a reindex never blocks a search.
 Tables: pages, chunks, chunks_fts (FTS5 over title / heading / text, porter stemming), restricted (ids of pages
 with their own view restriction, so children are skipped on incremental runs too), meta, index_runs.
+Confluence attachments are rows of `pages` too (kind attachment / attachment_link_only, `parent` = their page).
 embeddings holds one vector per section for the current embedding model (embeddings.py); it goes with its section.
 """
 
@@ -26,7 +27,8 @@ CREATE TABLE IF NOT EXISTS pages (
     updated TEXT NOT NULL,
     version INTEGER NOT NULL,
     labels TEXT NOT NULL,            -- JSON list
-    kind TEXT NOT NULL,              -- page | work_log | meeting_notes
+    kind TEXT NOT NULL,              -- page | work_log | meeting_notes | credentials_link_only | attachment[_link_only]
+    parent TEXT,                     -- attachments: the page they are attached to (deleted with it)
     chunker_version TEXT NOT NULL,
     indexed_at TEXT NOT NULL
 );
@@ -71,6 +73,9 @@ def connect(path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    if "parent" not in {r[1] for r in conn.execute("PRAGMA table_info(pages)")}:      # index from before phase 6
+        conn.execute("ALTER TABLE pages ADD COLUMN parent TEXT")
+        conn.commit()
     return conn
 
 
@@ -96,25 +101,37 @@ def page_state(conn: sqlite3.Connection, page_id: str) -> tuple[int, str] | None
 
 
 def page_ids(conn: sqlite3.Connection) -> set[str]:
-    return {r[0] for r in conn.execute("SELECT id FROM pages")}
+    """Pages only (not attachments)."""
+    return {r[0] for r in conn.execute("SELECT id FROM pages WHERE parent IS NULL")}
 
 
-def delete_page(conn: sqlite3.Connection, page_id: str) -> bool:
+def _delete_rows(conn: sqlite3.Connection, page_id: str) -> bool:
     ids = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE page_id = ?", (page_id,))]
     conn.executemany("DELETE FROM chunks_fts WHERE rowid = ?", [(i,) for i in ids])
     cur = conn.execute("DELETE FROM pages WHERE id = ?", (page_id,))
     return cur.rowcount > 0
 
 
+def delete_page(conn: sqlite3.Connection, page_id: str) -> bool:
+    """Removes a page (or an attachment) and the attachments of that page."""
+    for (child,) in conn.execute("SELECT id FROM pages WHERE parent = ?", (page_id,)).fetchall():
+        _delete_rows(conn, child)
+    return _delete_rows(conn, page_id)
+
+
+def attachment_ids(conn: sqlite3.Connection) -> set[str]:
+    return {r[0] for r in conn.execute("SELECT id FROM pages WHERE parent IS NOT NULL")}
+
+
 def upsert_page(conn: sqlite3.Connection, *, page_id: str, title: str, url: str, space: str, breadcrumb: list[str],
                 updated: str, version: int, labels: list[str], kind: str, chunker_version: str, indexed_at: str,
-                chunks: Iterable[Chunk]) -> int:
-    delete_page(conn, page_id)
+                chunks: Iterable[Chunk], parent: str | None = None) -> int:
+    _delete_rows(conn, page_id)           # its attachments stay: they have their own versions
     conn.execute(
-        "INSERT INTO pages (id, title, url, space, breadcrumb, updated, version, labels, kind, chunker_version, indexed_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO pages (id, title, url, space, breadcrumb, updated, version, labels, kind, chunker_version,"
+        " indexed_at, parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (page_id, title, url, space, json.dumps(breadcrumb), updated, version, json.dumps(labels), kind,
-         chunker_version, indexed_at),
+         chunker_version, indexed_at, parent),
     )
     n = 0
     for c in chunks:
@@ -138,7 +155,11 @@ def replace_restricted(conn: sqlite3.Connection, ids: set[str]) -> None:
 
 
 def stats(conn: sqlite3.Connection) -> dict:
-    pages = conn.execute("SELECT count(*) FROM pages").fetchone()[0]
+    pages = conn.execute("SELECT count(*) FROM pages WHERE parent IS NULL").fetchone()[0]
+    try:
+        attachments = conn.execute("SELECT count(*) FROM pages WHERE parent IS NOT NULL").fetchone()[0]
+    except sqlite3.OperationalError:      # read-only server on an index from before phase 6
+        attachments = 0
     chunks = conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
     try:
         embedded = conn.execute("SELECT model, count(*) FROM embeddings GROUP BY model").fetchall()
@@ -149,6 +170,7 @@ def stats(conn: sqlite3.Connection) -> dict:
                            " ORDER BY id DESC LIMIT 1").fetchone()
     return {
         "pages": pages,
+        "attachments": attachments,
         "chunks": chunks,
         "embedded": {m: n for m, n in embedded},
         "last_run": dict(last) if last else None,

@@ -1,7 +1,7 @@
 """The cev-knowledge MCP server (`knowledge` service, :8768; Tailscale Service `cev-knowledge`).
 
 Exactly two tools, kept small on purpose (people's agents pay context for every tool):
-- search_team_knowledge: Confluence `cev` sections (+ Drive links found in them) for a question
+- search_team_knowledge: Confluence `cev` sections and attachments (+ Drive files) for a question
 - get_document: one page, or one section of it, as text
 
 Confluence results come only from knowledge.db, opened read-only per call; this process has no Confluence token.
@@ -115,7 +115,9 @@ def create_knowledge_server(db_path: str | None = None, embedder: emb.EmbedClien
     async def search_team_knowledge(query: str, sources: list[str] | None = None, limit: int = 5) -> list[dict]:
         """Search the team's Confluence space and shared Google Drive for a question or keywords. Returns Confluence
         pages first (the best section of each: title, url, last updated, section heading, an excerpt), then up to 3
-        Drive files (files linked from those pages first, then Drive's own matches). Short keyword queries work best;
+        Drive files (files linked from those pages first, then Drive's own matches). Confluence results include files
+        attached to pages: kind "attachment" (readable with get_document) or "attachment_link_only" (name, type and
+        link only); their breadcrumb ends with the page they are on. Short keyword queries work best;
         team jargon works (joulemeter, RED, BMS). `sources`: any of "confluence", "drive" (default both). Drive
         results with kind "drive_doc" can be read with get_document; "drive_link_only" ones (photos, CAD, big files)
         are links only. Use get_document to read a page, section or Drive file in full."""
