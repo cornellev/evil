@@ -32,6 +32,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -115,6 +116,14 @@ def _type_label(att: Attachment) -> str:
     return f"{ext} file" if ext and len(ext) <= 5 else "file"
 
 
+# photos Confluence doesn't type as images (iPhone HEIC came through as octet-stream, 11-12)
+IMAGE_EXT = re.compile(r"\.(png|jpe?g|gif|heic|heif|webp|bmp|tiff?|svg)$", re.I)
+
+
+def _is_image(att: Attachment) -> bool:
+    return att.media_type.startswith("image/") or bool(IMAGE_EXT.search(att.title))
+
+
 def _attachment_state(att: Attachment) -> tuple[int, str]:
     return att.version, f"a{ATTACHMENTS_VERSION}-{CHUNKER_VERSION}"
 
@@ -127,7 +136,7 @@ def sync_attachments(conn, client: ConfluenceClient, space: str, full: bool, sin
     seen: set[str] = set()
     pending = 0
     for att in client.attachments(space, None if listing_full else since):
-        if att.media_type.startswith("image/"):
+        if _is_image(att):                  # dropped from the index by the next full listing if stored earlier
             continue
         parent = None
         if att.page_id:
