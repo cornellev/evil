@@ -899,6 +899,7 @@ def att_fake():
     fake = FakeConfluence(corpus(), attachments=[
         attachment("att1", 1, "Joulemeter PDR.pptx", PPTX_MIME, size=len(DECK)),
         attachment("att2", 1, "image2023-10-1_12-0-0.png", "image/png"),
+        attachment("att8", 1, "IMG_1295.HEIC", "application/octet-stream"),   # a photo Confluence doesn't type
         attachment("att3", 1, "firmware v2.zip", "application/zip", size=3_200_000, comment="build from main"),
         attachment("att4", 1, "router passwords.pdf", "application/pdf"),
         attachment("att5", 1, "huge scan.pdf", "application/pdf", size=40_000_000),
