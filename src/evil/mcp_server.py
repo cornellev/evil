@@ -170,14 +170,15 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None,
 
     @server.tool(name="list_runs")
     async def list_runs_handler(include_live_twins: bool = False, location: str | None = None,
-                                category: str | None = None, since: float | None = None,
-                                until: float | None = None, run_id: str | None = None,
+                                category: str | None = None, since: float | str | None = None,
+                                until: float | str | None = None, run_id: str | None = None,
                                 limit: int = 20) -> list[dict]:
         """List runs, the one being recorded now first (status 'recording'), then most recent first,
         with its lap count, time range, duration, whole-run distance, energy and efficiency (mi/kWh),
         location (e.g. 'IMS', 'B Lot') and category (competition/testing/b_lot/...). Returns at most
         `limit` runs (default 20, max 500): for one run pass run_id; for older or specific runs use
-        the filters location (e.g. 'B Lot'), category, since/until (epoch seconds, on the run start)
+        the filters location (e.g. 'B Lot'), category, since/until on the run start (a date like
+        '2026-04-01', UTC, or epoch seconds; a date-only until includes that day)
         instead of SQL, e.g. 'efficiency of the B Lot runs over time'. tier is 'upload' (a parsed recording) or 'live'
         (received live; approximate until its upload lands). A live run whose full upload is parsed is
         hidden (linked_run_id on the upload names it) unless include_live_twins. sample_count is the

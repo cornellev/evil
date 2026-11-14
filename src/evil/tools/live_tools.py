@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from evil import track
@@ -77,14 +78,34 @@ def catalog_run_info(cat: sqlite3.Connection | None) -> dict[str, dict[str, Any]
     return info
 
 
+def _epoch(value: float | str | None, end_of_day: bool = False) -> float | None:
+    """Epoch seconds, or an ISO date / datetime string ("2026-04-01", UTC), for list_runs' since/until: a small
+    model computing epoch seconds gets the year wrong (seen 11-14: "runs from April" -> April 2025, then 2024).
+    A date-only `until` covers that whole day."""
+    if value is None or isinstance(value, (int, float)):
+        return value
+    text = str(value).strip()
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    date_only = len(text) <= 10
+    return dt.timestamp() + (86400 if end_of_day and date_only else 0)
+
+
 def list_runs_all(main: sqlite3.Connection, live: sqlite3.Connection | None,
                   include_live_twins: bool = False, catalog: sqlite3.Connection | None = None,
                   location: str | None = None, category: str | None = None,
-                  since: float | None = None, until: float | None = None,
+                  since: float | str | None = None, until: float | str | None = None,
                   run_id: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
     """Filters (all optional, off by default): location by name (case/space-insensitive, e.g. 'B Lot'),
-    category (competition/testing/b_lot/...), since/until on the run's start time (epoch s), run_id
-    (just that run, live twin or not). limit: at most this many, after sorting (None = all)."""
+    category (competition/testing/b_lot/...), since/until on the run's start time (epoch s or an ISO date,
+    UTC; a date-only until includes that day), run_id (just that run, live twin or not). limit: at most this
+    many, after sorting (None = all)."""
+    since, until = _epoch(since), _epoch(until, end_of_day=True)
     runs = _runs_of(main, "upload")
     if live is not None:
         runs += [r for r in _runs_of(live, "live")
