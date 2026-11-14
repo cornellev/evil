@@ -165,9 +165,6 @@ class VectorIndex:
         order = sorted(idx.tolist(), key=lambda i: (-float(sims[i]), int(self.chunk_ids[i])))
         return [(int(self.chunk_ids[i]), float(sims[i])) for i in order]
 
-    def best(self, query_vec: np.ndarray) -> float:
-        return float((self.matrix @ query_vec).max()) if len(self.chunk_ids) else 0.0
-
 
 def load_vectors(conn: sqlite3.Connection, model: str) -> VectorIndex:
     rows = conn.execute("SELECT chunk_id, vector FROM embeddings WHERE model = ? ORDER BY chunk_id", (model,)).fetchall()

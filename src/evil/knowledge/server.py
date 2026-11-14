@@ -11,9 +11,7 @@ anyone in the space can write a page, so the instructions tell agents never to f
 `GET /healthz` reports index size, embedded sections and the last index pass.
 
 Searches are keyword + meaning (embeddings.py) when KNOWLEDGE_EMBED_URL is set and thor answers; otherwise keyword
-only, and the span says so (`knowledge.ranking`). `POST /probe {"query"}` -> `{"top_score"}`: how close the best
-section is to a question (cosine, no content). It is the cheap team-vs-general hint for Tern's mode router; not an
-MCP tool, and it returns nothing about what matched.
+only, and the span says so (`knowledge.ranking`).
 """
 
 from __future__ import annotations
@@ -61,7 +59,6 @@ def _with_index(db_path: str, fn) -> Any:
         conn.close()
 
 
-PROBE_MAX_CHARS = 2000
 MAX_DRIVE_HITS = 3
 _pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="drive")
 
@@ -153,30 +150,6 @@ def create_knowledge_server(db_path: str | None = None, embedder: emb.EmbedClien
         stats = await asyncio.to_thread(_with_index, path, store.stats)
         ok = stats["last_success"] is not None          # an empty file is not an index
         return JSONResponse({"ok": ok, **stats}, status_code=200 if ok else 503)
-
-    @server.custom_route("/probe", methods=["POST"])
-    async def probe(request: Request) -> JSONResponse:
-        try:
-            body = await request.json()
-            query = str(body["query"])[:PROBE_MAX_CHARS]
-        except Exception:
-            return JSONResponse({"error": 'expected {"query": "..."}'}, status_code=400)
-        if not Path(path).exists() or not embedder.enabled:
-            return JSONResponse({"error": "embeddings unavailable"}, status_code=503)
-
-        def run(conn):
-            vectors = cache.get(conn, embedder.model)
-            if vectors is None or len(vectors.chunk_ids) == 0:
-                return None
-            return vectors.best(embedder.embed_query(query))
-
-        try:
-            top = await asyncio.to_thread(_with_index, path, run)
-        except emb.EmbedUnavailable:
-            top = None
-        if top is None:
-            return JSONResponse({"error": "embeddings unavailable"}, status_code=503)
-        return JSONResponse({"top_score": round(top, 4), "model": embedder.model})
 
     return server
 

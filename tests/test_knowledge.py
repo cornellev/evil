@@ -613,22 +613,6 @@ def test_server_uses_meanings_when_thor_answers_and_keywords_when_not(indexed):
     assert "Joulemeter" in json.dumps(result.structured_content)
 
 
-def test_probe_returns_only_a_score(indexed):
-    from starlette.testclient import TestClient
-    from evil.knowledge.server import create_knowledge_server
-    conn, path = indexed
-    emb.embed_pending(conn, FakeEmbed())
-    app = create_knowledge_server(str(path), embedder=FakeEmbed()).streamable_http_app()
-    with TestClient(app) as client:
-        team = client.post("/probe", json={"query": "joulemeter energy"}).json()
-        other = client.post("/probe", json={"query": "weather tomorrow"}).json()
-        assert set(team) == {"top_score", "model"} and team["top_score"] > other["top_score"]
-        assert client.post("/probe", json={}).status_code == 400
-    off = create_knowledge_server(str(path), embedder=emb.EmbedClient(url="", model="x")).streamable_http_app()
-    with TestClient(off) as client:
-        assert client.post("/probe", json={"query": "joulemeter"}).status_code == 503
-
-
 def test_doc_and_query_text_use_each_models_format():
     assert emb.query_text("embeddinggemma", "brakes").startswith("task: search result | query: ")
     assert emb.query_text("qwen3-embedding:0.6b", "brakes").startswith("Instruct: ")
