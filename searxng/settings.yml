@@ -1,0 +1,44 @@
+# SearXNG for Tern's web_search (tern-next-steps roadmap step 3a; engines decided 11-06). Published on the NUC's
+# localhost only and reached over the tailnet as the Tailscale Service svc:cev-search, so it is never an open search
+# proxy on the car LAN. The secret comes from SEARXNG_SECRET in the NUC's .env. Only queries leave CEV: Tern strips
+# personal details and internal links from them before they get here (tern-llm web.py).
+use_default_settings:
+  engines:
+    keep_only:
+      - bing
+      - duckduckgo
+      - wikipedia
+      - brave        # answered 429 to plain requests from both NUC and thor (11-14): SearXNG suspends it if it blocks
+
+engines:
+  - name: bing
+    disabled: false          # off in SearXNG's defaults
+  - name: mojeek             # not in SearXNG's default list at all
+    engine: mojeek
+    shortcut: mjk
+    categories: [general, web]
+    disabled: false
+
+general:
+  instance_name: "cev-search"
+  enable_metrics: false
+
+server:
+  secret_key: "set-by-SEARXNG_SECRET"
+  limiter: false        # one trusted caller (Tern), reached only over the tailnet
+  public_instance: false
+  image_proxy: false
+  method: "GET"
+
+search:
+  safe_search: 1        # moderate
+  autocomplete: ""
+  formats:
+    - json
+
+outgoing:
+  request_timeout: 4.0
+  max_request_timeout: 6.0
+
+ui:
+  static_use_hash: true

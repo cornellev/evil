@@ -146,6 +146,26 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
 
+  # Web search for Tern (tern-llm web.py; roadmap step 3a). Localhost only: Tern on thor reaches it through the
+  # Tailscale Service svc:cev-search (tailscale serve --service=svc:cev-search --https=443 --bg http://localhost:8769).
+  search:
+    image: searxng/searxng:2026.10.29-c15647b5a
+    ports:
+      - "127.0.0.1:8769:8080"
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?set SEARXNG_SECRET in .env (openssl rand -hex 32)}
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    mem_limit: 512m
+    tmpfs:
+      - /tmp
+      - /var/cache/searxng
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "SETGID", "SETUID"]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
   knowledge-indexer:
     build: .
     env_file:
