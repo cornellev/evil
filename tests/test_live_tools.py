@@ -230,13 +230,17 @@ def test_without_a_live_db_everything_still_works(tmp_path):
 
 def test_list_runs_since_until_take_iso_dates(world):
     from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
     from evil.tools.live_tools import _epoch
-    assert _epoch("2026-04-01") == datetime(2026, 4, 1, tzinfo=timezone.utc).timestamp()
-    assert _epoch("2026-04-30", end_of_day=True) == datetime(2026, 5, 1, tzinfo=timezone.utc).timestamp()
-    assert _epoch("2026-04-30T12:00:00", end_of_day=True) == datetime(2026, 4, 30, 12, tzinfo=timezone.utc).timestamp()
+    et = ZoneInfo("America/New_York")
+    assert _epoch("2026-04-01") == datetime(2026, 4, 1, tzinfo=et).timestamp()
+    assert _epoch("2026-04-30", end_of_day=True) == datetime(2026, 5, 1, tzinfo=et).timestamp()
+    assert _epoch("2026-03-08", end_of_day=True) - _epoch("2026-03-08") == 23 * 3600     # DST day: 23 h
+    assert _epoch("2026-04-30T12:00:00", end_of_day=True) == datetime(2026, 4, 30, 12, tzinfo=et).timestamp()
+    assert _epoch("2026-04-30T12:00:00+00:00") == datetime(2026, 4, 30, 12, tzinfo=timezone.utc).timestamp()
     assert _epoch("1775000000") == 1775000000.0 and _epoch(5) == 5
     runs = _call(world["server"], "list_runs")
     start = min(r["start_ts"] for r in runs)
-    day = datetime.fromtimestamp(start, timezone.utc).date().isoformat()
+    day = datetime.fromtimestamp(start, et).date().isoformat()
     assert len(_call(world["server"], "list_runs", {"since": day, "until": day})) >= 1
     assert _call(world["server"], "list_runs", {"until": "1970-01-01"}) == []

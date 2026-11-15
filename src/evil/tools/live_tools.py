@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from evil import track
@@ -79,9 +79,9 @@ def catalog_run_info(cat: sqlite3.Connection | None) -> dict[str, dict[str, Any]
 
 
 def _epoch(value: float | str | None, end_of_day: bool = False) -> float | None:
-    """Epoch seconds, or an ISO date / datetime string ("2026-04-01", UTC), for list_runs' since/until: a small
-    model computing epoch seconds gets the year wrong (seen 11-14: "runs from April" -> April 2025, then 2024).
-    A date-only `until` covers that whole day."""
+    """Epoch seconds, or an ISO date / datetime string ("2026-04-01", Eastern like the run ids' dates), for
+    list_runs' since/until: a small model computing epoch seconds gets the year wrong (seen 11-14: "runs from
+    April" -> April 2025, then 2024). A date-only `until` covers that whole day."""
     if value is None or isinstance(value, (int, float)):
         return value
     text = str(value).strip()
@@ -90,10 +90,19 @@ def _epoch(value: float | str | None, end_of_day: bool = False) -> float | None:
     except ValueError:
         pass
     dt = datetime.fromisoformat(text)
+    if len(text) <= 10 and end_of_day:
+        dt += timedelta(days=1)                  # calendar day, so a DST change doesn't shift it by an hour
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    date_only = len(text) <= 10
-    return dt.timestamp() + (86400 if end_of_day and date_only else 0)
+        dt = dt.replace(tzinfo=_local_tz())
+    return dt.timestamp()
+
+
+def _local_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("America/New_York")
+    except Exception:  # tzdata missing: UTC, as the parser does
+        return timezone.utc
 
 
 def list_runs_all(main: sqlite3.Connection, live: sqlite3.Connection | None,
@@ -103,7 +112,7 @@ def list_runs_all(main: sqlite3.Connection, live: sqlite3.Connection | None,
                   run_id: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
     """Filters (all optional, off by default): location by name (case/space-insensitive, e.g. 'B Lot'),
     category (competition/testing/b_lot/...), since/until on the run's start time (epoch s or an ISO date,
-    UTC; a date-only until includes that day), run_id (just that run, live twin or not). limit: at most this
+    Eastern; a date-only until includes that day), run_id (just that run, live twin or not). limit: at most this
     many, after sorting (None = all)."""
     since, until = _epoch(since), _epoch(until, end_of_day=True)
     runs = _runs_of(main, "upload")

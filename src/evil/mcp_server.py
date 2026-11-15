@@ -178,7 +178,7 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None,
         location (e.g. 'IMS', 'B Lot') and category (competition/testing/b_lot/...). Returns at most
         `limit` runs (default 20, max 500): for one run pass run_id; for older or specific runs use
         the filters location (e.g. 'B Lot'), category, since/until on the run start (a date like
-        '2026-04-01', UTC, or epoch seconds; a date-only until includes that day)
+        '2026-04-01', Eastern like the run ids, or epoch seconds; a date-only until includes that day)
         instead of SQL, e.g. 'efficiency of the B Lot runs over time'. tier is 'upload' (a parsed recording) or 'live'
         (received live; approximate until its upload lands). A live run whose full upload is parsed is
         hidden (linked_run_id on the upload names it) unless include_live_twins. sample_count is the
