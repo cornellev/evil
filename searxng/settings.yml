@@ -9,6 +9,11 @@ use_default_settings:
       - duckduckgo
       - wikipedia
       - brave        # answered 429 to plain requests from both NUC and thor (11-14): SearXNG suspends it if it blocks
+      # 11-15: Bing alone answered "who won the 2026 US midterm elections" with dictionary pages for "won", while
+      # DuckDuckGo was on a CAPTCHA and Brave suspended. More engines, so one can't sink a search. Google, Qwant
+      # and Yep refused (access denied / HTTP error) from the NUC.
+      - yahoo
+      - mwmbl
       # Pictures for Tern's image_search on Discord (user 11-15). Tern asks for these with safesearch=2 (strict).
       - bing images
       - duckduckgo images
@@ -21,6 +26,10 @@ engines:
   - name: bing images
     disabled: false
   - name: wikicommons.images
+    disabled: false
+  - name: yahoo
+    disabled: false
+  - name: mwmbl
     disabled: false
   - name: mojeek             # not in SearXNG's default list at all
     engine: mojeek
