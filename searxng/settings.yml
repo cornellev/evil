@@ -9,10 +9,19 @@ use_default_settings:
       - duckduckgo
       - wikipedia
       - brave        # answered 429 to plain requests from both NUC and thor (11-14): SearXNG suspends it if it blocks
+      # Pictures for Tern's image_search on Discord (user 11-15). Tern asks for these with safesearch=2 (strict).
+      - bing images
+      - duckduckgo images
+      - brave.images
+      - wikicommons.images
 
 engines:
   - name: bing
     disabled: false          # off in SearXNG's defaults
+  - name: bing images
+    disabled: false
+  - name: wikicommons.images
+    disabled: false
   - name: mojeek             # not in SearXNG's default list at all
     engine: mojeek
     shortcut: mjk
