@@ -96,6 +96,21 @@ def test_recording_schema_gives_what_the_first_query_needs(cat, root, bag, tmp_p
     assert len(c["sample_rows"]) == 3 and q(cat, root, rid, c["example"])["rows"]
 
 
+def test_comma_separated_text_topics_come_with_a_field_query(cat, root, tmp_path):
+    from telemetry_fixtures import encode_cdr_string
+    path = write_db3(tmp_path / "serial.db3",
+                     {"/serial_msg": [(T0 + i, encode_cdr_string(f"{i},{i * 0.5:.5f},625000.0")) for i in range(5)]})
+    rid = _store(cat, root, {"serial.db3": path})
+    serial = rawquery.recording_schema(cat, root, rid, limits=FAST)["topics"][0]
+    assert serial["fields"] == 3 and serial["sample_text"].startswith("0,0.00000")
+    assert [r[1] for r in q(cat, root, rid, serial["example"])["rows"]] == [0.0, 0.5, 1.0, 1.5, 2.0]
+
+
+def test_a_wrong_table_points_to_recording_schema(cat, root, bag):
+    with pytest.raises(rawquery.RawQueryError, match=r"no such table: csv.*topics\(id.*call recording_schema first"):
+        q(cat, root, bag, "SELECT COUNT(*) FROM csv")
+
+
 def test_recording_schema_says_why_it_failed(root, cat, bag):
     from mcp.server.mcpserver.exceptions import ToolError
     server = create_raw_server(str(root.path), limits=FAST)

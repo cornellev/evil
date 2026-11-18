@@ -107,7 +107,14 @@ def query_recording_sql(cat: sqlite3.Connection | None, root: catalog.DataRoot, 
     kind, path, label = resolve_recording_target(cat, root, recording_id, file)
     base = limits or QueryLimits()
     lim = QueryLimits(**{**base.__dict__, "max_rows": max(1, min(int(limit), 1000))})
-    result = run_sql(kind, path, sql, limits=lim, tables=None if kind != "csv" else ("csv",))
+    try:
+        result = run_sql(kind, path, sql, limits=lim, tables=None if kind != "csv" else ("csv",))
+    except RawQueryError as exc:
+        if "no such table" in str(exc) or "no such column" in str(exc):     # seen 11-18: `csv` guessed on a bag
+            tables = "one table, csv" if kind == "csv" else "topics(id, name, type) and messages(id, topic_id, timestamp, data)"
+            raise RawQueryError(f"{exc}. This file has {tables}: call recording_schema first for its columns, "
+                                "topics and JSON paths.") from exc
+        raise
     result["file"] = label
     result["table_hint"] = "table `csv`" if kind == "csv" else "rosbag2 tables: topics, messages (data is CDR; use cdr_string(data))"
     return result
@@ -193,7 +200,16 @@ def recording_schema(cat: sqlite3.Connection | None, root: catalog.DataRoot, rec
                 entry["example"] = (f"SELECT timestamp, json_extract(cdr_string(data), '{first}') FROM messages "
                                     f"WHERE topic_id = {int(topic_id)} ORDER BY timestamp LIMIT 20")
             elif text:
-                entry["sample_text"] = str(text[0][0])[:200]
+                sample = str(text[0][0])
+                entry["sample_text"] = sample[:200]
+                if "," in sample and not sample.lstrip().startswith(("{", "[")):
+                    # Comma-separated text (older bags, seen 11-18): how to pull out a field, here the 2nd.
+                    entry["fields"] = sample.count(",") + 1
+                    entry["example"] = (
+                        f"WITH t AS (SELECT timestamp, cdr_string(data) || ',' AS s FROM messages WHERE topic_id = "
+                        f"{int(topic_id)}), f1 AS (SELECT timestamp, substr(s, instr(s, ',') + 1) AS rest FROM t) "
+                        "SELECT timestamp, CAST(substr(rest, 1, instr(rest, ',') - 1) AS REAL) AS field2 FROM f1 "
+                        "ORDER BY timestamp LIMIT 20")
         out_topics.append(entry)
     return {"recording_id": recording_id, "file": label, "tables": "topics(id, name, type), messages(id, topic_id, "
             "timestamp, data)", "topics": out_topics,
