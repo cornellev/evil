@@ -80,6 +80,29 @@ def test_a_csv_is_one_table_named_csv(cat, root, tmp_path):
     assert q(cat, root, rid, 'SELECT "rpm_front.rpm_left" FROM csv LIMIT 1')["rows"] == [[None]]   # NaN -> NULL
 
 
+def test_recording_schema_gives_what_the_first_query_needs(cat, root, bag, tmp_path):
+    # user 11-18: raw files should be as queryable in one shot as the parsed tables
+    s = rawquery.recording_schema(cat, root, bag, limits=FAST)
+    spi = next(t for t in s["topics"] if t["topic"] == "/spi_data")
+    assert spi["type"] == "std_msgs/msg/String" and spi["json_paths"]["$.gps.lat"] == 42.0
+    assert q(cat, root, bag, spi["example"])["rows"]                    # the example runs as written
+    chatter = next(t for t in s["topics"] if t["topic"] == "/chatter")
+    assert chatter["json_paths"] == {"$.note": "hi"} and "nanoseconds" in s["note"]
+    assert rawquery._json_paths({"a": float("nan"), "b": [1, 2]}) == [("$.a", None), ("$.b[0]", 1)]
+    path = write_csv(tmp_path / "x.csv", [(T0 + i, payload(seq=2 + 2 * i, speed=float(i))) for i in range(6)])
+    rid = _store(cat, root, {"0409.csv": path})
+    c = rawquery.recording_schema(cat, root, rid, limits=FAST)
+    assert c["table"] == "csv" and "filtered.speed" in c["columns"] and c["row_count"] == 6
+    assert len(c["sample_rows"]) == 3 and q(cat, root, rid, c["example"])["rows"]
+
+
+def test_recording_schema_says_why_it_failed(root, cat, bag):
+    from mcp.server.mcpserver.exceptions import ToolError
+    server = create_raw_server(str(root.path), limits=FAST)
+    with pytest.raises(ToolError, match="not found"):
+        asyncio.run(server.call_tool("recording_schema", {"recording_id": "nope"}))
+
+
 def test_split_bags_choose_a_file_by_name(cat, root, tmp_path):
     a = write_db3(tmp_path / "bag_0.db3", {"/a": [(T0, {"x": 1})]})
     b = write_db3(tmp_path / "bag_1.db3", {"/b": [(T0, {"x": 2})]})
@@ -287,7 +310,7 @@ def cat_conn(root):
 def test_raw_server_exposes_exactly_the_raw_tools_and_none_of_the_curated_ones(root, cat, bag):
     server = create_raw_server(str(root.path), limits=FAST)
     names = {t.name for t in asyncio.run(server.list_tools())}
-    assert names == {"query_recording_sql", "catalog_sql"}
+    assert names == {"query_recording_sql", "catalog_sql", "recording_schema"}
     from evil.mcp_server import create_server
     curated = {t.name for t in asyncio.run(create_server(db_path=str(root.path / "x.db"), catalog_path=str(root.catalog_db)).list_tools())}
     assert not (names & curated)

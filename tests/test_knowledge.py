@@ -223,6 +223,23 @@ def test_chunker_splits_by_heading_merges_small_and_splits_large():
     assert len(c_parts) >= 2 and all(c.words <= 600 for c in c_parts)
 
 
+def test_merged_sections_keep_every_heading_and_two_columns_stay_apart():
+    # seen 11-17: Software Home's two layout columns merged under "Autonomy > Current Members", so a member listed in
+    # the Telemetry column was read as Autonomy; the "Leads: ..." headings (nothing under them) were dropped
+    page = ('<ac:layout><ac:layout-section ac:type="two_equal"><ac:layout-cell><h2><ac:link><ri:page '
+            'ri:content-title="Autonomy" /></ac:link></h2><h3>Leads: Cam M, Lucas L</h3><h3>Current Members:</h3>'
+            + "".join(f"<p>Auto Person{i}</p>" for i in range(4)) + '<h3><strong>Alumni:</strong></h3>'
+            + "".join(f"<p>Old Person{i}</p>" for i in range(8)) + '</ac:layout-cell><ac:layout-cell><h2><ac:link>'
+            '<ri:page ri:content-title="Telemetry Home" /></ac:link></h2><h3>Leads: Rhea A, Katie X</h3>'
+            '<h3>Members:</h3>' + "".join(f"<p>Telem Person{i}</p>" for i in range(7))
+            + '</ac:layout-cell></ac:layout-section></ac:layout>')
+    [only] = chunk(textify(page))
+    assert only.heading == "Autonomy · Telemetry Home"
+    assert "Leads: Cam M, Lucas L" in only.text and "Leads: Rhea A, Katie X" in only.text
+    assert only.text.index("Telemetry Home > Members:") < only.text.index("Telem Person0")
+    assert only.text.index("Autonomy > Alumni:") < only.text.index("Old Person0") < only.text.index("Telemetry Home")
+
+
 def test_chunker_never_splits_a_table_and_keeps_drive_links():
     rows = "".join(f"<tr><td>r{i}</td><td>{'x ' * 20}</td></tr>" for i in range(40))
     chunks = chunk(textify(f"<h1>T</h1><table>{rows}</table><p><a href='{DRIVE_URL}'>deck</a></p>"))
@@ -380,6 +397,8 @@ def test_get_document_whole_page_section_and_unknown(indexed):
     sec = get_document(conn, "2", "2026-10-03")
     assert "2026-10-03" in sec["text"] and "2026-10-01" not in sec["text"]
     assert get_document(conn, "999") is None
+    # by title (seen 11-17: id="Tailscale"), any case; a title matching nothing or several pages is not a page
+    assert get_document(conn, "joulemeter")["id"] == "1" and get_document(conn, "No Such Page") is None
 
 
 # ---------------------------------------------------------------- server

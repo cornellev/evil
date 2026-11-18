@@ -2,6 +2,9 @@
 
 - A new section starts at every heading (h1-h4); h5/h6 stay inside their parent section.
 - Sections under ~40 words are merged into the next one (a heading with one line under it isn't worth a result).
+  A merged section is labelled with the heading path its parts share, and each part's own heading stays in its
+  text as a line (seen 11-17: Software Home's two layout columns, Autonomy and Telemetry, merged under "Autonomy >
+  Current Members", so a Telemetry member read as Autonomy). Headings with nothing under them ("Leads: A, B") count.
 - Sections over ~600 words are split at block boundaries into ~400-word pieces; a table is never split.
 - Work logs and meeting notes get the same treatment: their dated headings become the sections, so one entry
   is one result instead of the whole 100-version page.
@@ -15,7 +18,7 @@ from dataclasses import dataclass, field
 
 from evil.knowledge.textify import Block, drive_links
 
-CHUNKER_VERSION = "3"      # bump to re-chunk every page on the next pass (3: title-only entry for empty pages)
+CHUNKER_VERSION = "4"      # bump to re-chunk every page on the next pass (4: merged sections keep every heading)
 # credentials pages: title + link only, never their text (filters.skip_reason "credentials title")
 LINK_ONLY_KIND = "credentials_link_only"
 
@@ -53,6 +56,29 @@ def _words(block: Block) -> int:
     return len(block.render().split())
 
 
+def _join(group: list[tuple[str, list[Block]]]) -> tuple[str, list[Block]]:
+    """One section from several small ones: the heading path they share (or, sharing none, each part's top heading),
+    each part's own heading as a line."""
+    if len(group) == 1:
+        return group[0]
+    paths = [h.split(" > ") if h else [] for h, _ in group]
+    prefix: list[str] = []
+    for parts in zip(*paths):
+        if len(set(parts)) != 1:
+            break
+        prefix.append(parts[0])
+    body: list[Block] = []
+    for parts, (_, part) in zip(paths, group):
+        rest = parts[len(prefix):]
+        if rest:
+            body.append(Block("para", " > ".join(rest)))
+        body.extend(part)
+    if prefix:
+        return " > ".join(prefix), body
+    # nothing shared: every part's top heading, so a work log's dates and a page's columns are all findable
+    return " · ".join(dict.fromkeys(p[0] for p in paths if p)), body
+
+
 def chunk(blocks: list[Block]) -> list[Chunk]:
     sections: list[tuple[str, list[Block]]] = []
     path: list[tuple[int, str]] = []
@@ -60,7 +86,7 @@ def chunk(blocks: list[Block]) -> list[Chunk]:
     current_heading = ""
     for block in blocks:
         if block.kind == "heading" and block.level <= MAX_SECTION_LEVEL:
-            if current:
+            if current or current_heading:       # an empty section keeps its heading (it may be the content)
                 sections.append((current_heading, current))
             path = [(lvl, t) for lvl, t in path if lvl < block.level] + [(block.level, block.text)]
             current_heading = " > ".join(t for _, t in path)
@@ -88,26 +114,19 @@ def chunk(blocks: list[Block]) -> list[Chunk]:
         if part:
             pieces.append((heading, part))
 
-    merged: list[tuple[str, list[Block]]] = []
-    carry: tuple[str, list[Block]] | None = None
+    groups: list[list[tuple[str, list[Block]]]] = []
+    group: list[tuple[str, list[Block]]] = []
     for heading, body in pieces:
-        if carry is not None:
-            carry_heading, carry_body = carry
-            # the merged section keeps the next section's heading as a line, so its text still says where it is
-            joint = [Block("para", heading.split(" > ")[-1])] if heading and heading != carry_heading else []
-            heading = carry_heading or heading
-            body = carry_body + joint + body
-            carry = None
-        if sum(_words(b) for b in body) < MIN_WORDS:
-            carry = (heading, body)
-            continue
-        merged.append((heading, body))
-    if carry is not None:
-        if merged:
-            h, b = merged[-1]
-            merged[-1] = (h, b + carry[1])
+        group.append((heading, body))
+        if sum(_words(b) for _, part in group for b in part) >= MIN_WORDS:
+            groups.append(group)
+            group = []
+    if group:
+        if groups:
+            groups[-1].extend(group)
         else:
-            merged.append(carry)
+            groups.append(group)
+    merged = [_join(g) for g in groups]
 
     chunks = []
     for i, (heading, body) in enumerate(merged):

@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any, Callable
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from evil import catalog
 from evil.db import connect_readonly
@@ -37,7 +39,8 @@ from evil.tools.list_straights import list_straights
 from evil.tools.list_turns import list_turns
 from evil.tools.live_tools import get_live_status, get_live_window, list_runs_all, run_tier
 from evil.tools.catalog_tools import describe_recording, find_nas_files, list_recordings
-from evil.tools.read_only_sql import read_only_sql
+from evil.tools.read_only_sql import (SAMPLES_NOTES, SCHEMA_NOTES, add_samples, explain_error, read_only_sql,
+                                      schema_summary)
 from evil.tools.segment_tools import list_track_segments
 
 DEFAULT_DB_PATH = os.getenv("EVIL_DB_PATH", "evil.db")
@@ -102,14 +105,41 @@ def _run_for_run(path: str, live_path: str, fn: Callable[..., Any], run_id: str,
     return _run_readonly(path, fn, run_id=run_id, **kwargs)
 
 
-def _sql_with_live(path: str, live_path: str, query: str) -> Any:
+def _connect_with_live(path: str, live_path: str):
     conn = connect_readonly(path)
+    if Path(live_path).exists():
+        conn.execute("ATTACH DATABASE ? AS live", (f"file:{live_path}?mode=ro",))
+    add_samples(conn)
+    return conn
+
+
+def _sql_with_live(path: str, live_path: str, query: str) -> Any:
+    conn = _connect_with_live(path, live_path)
     try:
-        if Path(live_path).exists():
-            conn.execute("ATTACH DATABASE ? AS live", (f"file:{live_path}?mode=ro",))
         return read_only_sql(conn, query=query)
+    except (sqlite3.Error, ValueError) as exc:
+        # An anticipated failure: the model reads the reason and the real names (seen 11-18: masked as "Error
+        # executing tool read_only_sql", it couldn't correct "no such column: speed" and gave up).
+        raise ToolError(explain_error(conn, exc)) from exc
     finally:
         conn.close()
+
+
+def _sql_description(path: str, live_path: str) -> str:
+    """read_only_sql's description with the schema in it, read from the database when the server starts."""
+    text = ("Run a single read-only SELECT against the EVIL database for questions the other tools don't cover "
+            "(top speed and where, throttle presses, power on a lap, anything per sample). No writes are possible. "
+            + SAMPLES_NOTES + "\n" + SCHEMA_NOTES)
+    if not Path(path).exists():
+        return text
+    try:
+        conn = _connect_with_live(path, live_path)
+        try:
+            return text + "\nTables and columns:\n" + schema_summary(conn)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return text
 
 
 def _run_catalog(catalog_path: str, fn: Callable[..., Any], **kwargs: Any) -> Any:
@@ -282,12 +312,8 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None,
         and message counts), time range, location, and how parsing went."""
         return await asyncio.to_thread(_run_catalog, cat_path, describe_recording, recording_id=recording_id)
 
-    @server.tool(name="read_only_sql")
+    @server.tool(name="read_only_sql", description=_sql_description(path, live_path))
     async def read_only_sql_handler(query: str) -> list[dict]:
-        """Run a single read-only SELECT against the EVIL database for questions
-        the other tools don't cover. Live runs are in the attached `live` database
-        (e.g. live.main_snapshot, live.runs). No writes are possible regardless of the
-        query text."""
         return await asyncio.to_thread(_sql_with_live, path, live_path, query)
 
     return server

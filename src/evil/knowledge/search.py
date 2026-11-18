@@ -269,9 +269,26 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 5, sources: list[s
     return hits + drive
 
 
+def _page_by_title(conn: sqlite3.Connection, title: str) -> sqlite3.Row | None:
+    """A page asked for by its title instead of its id (seen 11-17: get_document(id="Tailscale") failed, and the
+    answer came from a search excerpt): the exact title, else the one title that contains it."""
+    title = title.strip()
+    if not title or title.isdigit():
+        return None
+    exact = conn.execute("SELECT * FROM pages WHERE lower(title) = lower(?)", (title,)).fetchall()
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        return None
+    like = conn.execute("SELECT * FROM pages WHERE lower(title) LIKE '%' || lower(?) || '%' LIMIT 2", (title,)).fetchall()
+    return like[0] if len(like) == 1 else None
+
+
 def get_document(conn: sqlite3.Connection, page_id: str, section: str | int | None = None,
                  max_chars: int = DOCUMENT_MAX_CHARS) -> dict[str, Any] | None:
     page = conn.execute("SELECT * FROM pages WHERE id = ?", (str(page_id),)).fetchone()
+    if page is None:
+        page = _page_by_title(conn, str(page_id))
     if page is None:
         return None
     if page["kind"] == "credentials_link_only":

@@ -109,7 +109,7 @@ def create_knowledge_server(db_path: str | None = None, embedder: emb.EmbedClien
                                  vectors=vectors if query_vec is not None else None, query_vec=query_vec)
 
     @server.tool(name="search_team_knowledge")
-    async def search_team_knowledge(query: str, sources: list[str] | None = None, limit: int = 5) -> list[dict]:
+    async def search_team_knowledge(query: str, sources: list[str] | str | None = None, limit: int = 5) -> list[dict]:
         """Search the team's Confluence space and shared Google Drive for a question or keywords. Returns Confluence
         pages first (the best section of each: title, url, last updated, section heading, an excerpt), then up to 3
         Drive files (files linked from those pages first, then Drive's own matches). Confluence results include files
@@ -118,12 +118,14 @@ def create_knowledge_server(db_path: str | None = None, embedder: emb.EmbedClien
         team jargon works (joulemeter, RED, BMS). `sources`: any of "confluence", "drive" (default both). Drive
         results with kind "drive_doc" can be read with get_document; "drive_link_only" ones (photos, CAD, big files)
         are links only. Use get_document to read a page, section or Drive file in full."""
+        if isinstance(sources, str):           # "confluence" as text (seen 11-17: a validation error, then a retry)
+            sources = [x.strip() for x in sources.split(",") if x.strip()]
         return await asyncio.to_thread(_with_index, path, lambda c: _search(c, query, limit, sources))
 
     @server.tool(name="get_document")
     async def get_document(source: str, id: str, section: str | None = None) -> dict:
         """Read one document found by search_team_knowledge: `source` ("confluence" or "drive") and `id` from a
-        result, `section` (optional) = a result's section_id or part of a section heading (Drive: the part number).
+        result (a Confluence page's exact title works too), `section` (optional) = a result's section_id or part of a section heading (Drive: the part number).
         Returns the text (capped; ask for one section or part of a long document), the url, last updated, and the
         list of sections or parts."""
         if source.lower() == "drive":

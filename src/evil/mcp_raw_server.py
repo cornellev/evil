@@ -56,7 +56,7 @@ def create_raw_server(data_root: str | None = None, limits: rawquery.QueryLimits
     @server.tool(name="query_recording_sql")
     async def query_recording_sql_handler(recording_id: str, sql: str, file: str | None = None, limit: int = 200) -> dict:
         """Run ONE read-only SELECT against a stored recording, by recording_id (from
-        list_recordings). A rosbag2 .db3 exposes its own tables (topics, messages: `data` is a
+        list_recordings; call recording_schema first for its columns or JSON paths). A rosbag2 .db3 exposes its own tables (topics, messages: `data` is a
         CDR blob; cdr_string(data) decodes a std_msgs/String message to text, so
         json_extract(cdr_string(data), '$.gps.lat') works on JSON-in-String topics). A CSV is
         one table named `csv`. `file` picks one file of a split bag (original name). Returns
@@ -67,6 +67,18 @@ def create_raw_server(data_root: str | None = None, limits: rawquery.QueryLimits
                     cat, root, recording_id, sql, file=file, limit=limit, limits=limits)))
         except rawquery.RawQueryError as exc:
             raise ToolError(str(exc)) from exc    # an anticipated failure: the agent reads the reason
+
+    @server.tool(name="recording_schema")
+    async def recording_schema_handler(recording_id: str, file: str | None = None) -> dict:
+        """How to query a stored recording (by recording_id from list_recordings) before query_recording_sql: a
+        CSV's columns, sample rows and row count; a bag's topics with their types and message counts, and for JSON
+        topics the json_extract paths with example values. Each comes with a query that works as written."""
+        try:
+            return await asyncio.to_thread(
+                lambda: _with_catalog(root, lambda cat: rawquery.recording_schema(cat, root, recording_id,
+                                                                                   file=file, limits=limits)))
+        except rawquery.RawQueryError as exc:
+            raise ToolError(str(exc)) from exc
 
     @server.tool(name="catalog_sql")
     async def catalog_sql_handler(sql: str, limit: int = 200) -> dict:
