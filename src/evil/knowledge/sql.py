@@ -16,6 +16,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from evil.knowledge.drive import kind_label
+from evil.knowledge.search import STOPWORDS, TEAM_WORDS, _TOKEN, _stem
 from evil.tools.read_only_sql import read_only_sql
 
 TIMEZONE = "America/New_York"
@@ -38,6 +39,11 @@ NOTES = (
     "SELECT path || ' > ' || title AS folder FROM docs WHERE kind = 'folder' AND title LIKE '%Onboarding%' AND "
     "path LIKE '%Telemetry%', and what's in it with WHERE path = '<that folder>' (every type: slides, docs, "
     "shortcuts, files), not words of titles.\n"
+    "What a doc is about is in its text more than its title (a deck titled 'Onboarding 2' lists the freshman "
+    "projects): filter topics with matches(text, 'words'), which ignores case and plurals and knows the team's "
+    "spellings (freshman / freshmen / frosh, elec / electrical): WHERE d.id IN (SELECT doc_id FROM sections WHERE "
+    "matches(text, 'freshman projects')) OR matches(d.title || ' ' || d.path, 'freshman projects'). Never LIKE "
+    "on title words alone for a topic.\n"
     "To open a row afterwards with get_document, select its id and source (get_document(source, id)).\n"
     "View sections: doc_id (= docs.id), section_id, heading, text.\n"
     "Compare times with datetime('now', '-14 days'). Examples: what changed on Confluence in the last 2 weeks: SELECT "
@@ -85,8 +91,34 @@ def _type(mime: str | None, name: str | None, source: str) -> str | None:
     return kind_label(mime, name or "")
 
 
+def _words(text: str) -> set[str]:
+    return {_stem(w.strip("._+-")) for w in _TOKEN.findall((text or "").lower())}
+
+
+_QUERY_CACHE: dict[str, list[set[str]]] = {}
+
+
+def matches(text: str | None, query: str | None) -> int:
+    """1 when every content word of `query` is in `text`, with the same stemming and team word variants as search
+    (freshman / freshmen / frosh, elec / electrical ...): the way to filter on what docs say, not just titles (seen
+    11-18: "mech freshman projects" matched title words and missed "UC27 Freshman Project Master Doc")."""
+    if not text or not query:
+        return 0
+    need = _QUERY_CACHE.get(query)
+    if need is None:
+        need = []
+        for w in _TOKEN.findall(query.lower()):
+            w = w.strip("._+-")
+            if len(w) >= 2 and w not in STOPWORDS:
+                need.append({_stem(v) for v in [w, *TEAM_WORDS.get(w, [])]})
+        _QUERY_CACHE[query] = need
+    have = _words(text)
+    return int(all(alts & have for alts in need))
+
+
 def add_views(conn: sqlite3.Connection) -> None:
     conn.create_function("local_time", 1, _local, deterministic=True)
+    conn.create_function("matches", 2, matches, deterministic=True)
     conn.create_function("_path", 1, _path, deterministic=True)
     conn.create_function("_type", 3, _type, deterministic=True)
     conn.execute(f"""CREATE TEMP VIEW IF NOT EXISTS docs AS

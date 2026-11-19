@@ -1233,3 +1233,19 @@ def test_a_named_subteam_pushes_down_other_subteams_docs():
     assert subteam_factor("electrical freshman projects", "FA26 Freshmen Project Specs", elec) == 1.0
     assert subteam_factor("freshman projects", "UC27 Freshman Project Master Doc", mech) == 1.0     # none named
     assert subteam_factor("elec freshman projects", "General Team", json.dumps(["CEV Home"])) == 1.0   # no subteam
+
+
+def test_sql_matches_finds_topics_in_the_text_with_team_spellings(indexed):
+    conn, path = indexed
+    fake = _drive_fake()
+    fake.files["frosh"] = {"id": "frosh", "name": "UC27 Master Doc", "mimeType": G + "document",
+                           "parents": ["fJ"], "modifiedTime": "2026-11-18T00:00:00Z"}
+    fake.exports["frosh"] = b"# Frosh Projects\n\nClevis: mount the shock.\n"
+    drive_index.sync_drive(conn, _drive_client(fake))
+    conn.commit()
+    ro = store.connect_readonly(path)
+    rows = sql_mod.run(ro, "SELECT d.title FROM docs d WHERE d.id IN (SELECT doc_id FROM sections WHERE "
+                           "matches(text, 'freshman projects'))")
+    assert rows == [{"title": "UC27 Master Doc"}]
+    assert sql_mod.matches("Freshmen Project Specs", "freshman project") == 1
+    assert sql_mod.matches("Freshmen Specs", "freshman project") == 0
