@@ -58,6 +58,17 @@ def test_tool_call_span_carries_arguments_result_and_client(evil_db_path):
     assert a["evil.result.bytes"] > 0
     assert a["evil.client.name"] == "test-client"
     assert a["evil.client.version"] == "1.2"
+    # roadmap 5b: the row says which server and tool, the status says whether it worked
+    assert span.name == "mcp tool: get_turn"
+    assert span.status.status_code.name == "OK"
+    assert json.loads(a["metadata"]) == {"client": "test-client"}
+
+
+def test_a_tool_error_is_an_error_span(evil_db_path):
+    _call(create_server(db_path=evil_db_path), "read_only_sql", {"query": "DELETE FROM runs"})
+
+    (span,) = _tool_spans()
+    assert span.status.status_code.name == "ERROR"
 
 
 def test_list_results_record_a_row_count(evil_db_path):

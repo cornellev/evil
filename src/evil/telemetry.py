@@ -21,6 +21,7 @@ from typing import Any
 
 import anyio
 from opentelemetry import trace
+from opentelemetry.trace import StatusCode
 
 from evil import tailnet
 
@@ -60,6 +61,11 @@ def _sampler():
     return ToolCallsOnly()
 
 
+# Which server this is, for span names ("evil-mcp tool: list_runs"): an MCP-only chain (Claude Code, Cursor) starts
+# at this span, so its row in Phoenix should say which server and tool (roadmap 5b, user 11-19).
+_SERVICE = "mcp"
+
+
 def setup_tracing(service_name: str) -> bool:
     """Installs an OTLP/HTTP exporter as the global tracer provider. Returns whether it did."""
     if not (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")):
@@ -74,6 +80,8 @@ def setup_tracing(service_name: str) -> bool:
         # Phoenix files spans into a project by this resource attribute.
         "openinference.project.name": os.getenv(PROJECT_ENV, DEFAULT_PROJECT),
     })
+    global _SERVICE
+    _SERVICE = service_name
     provider = TracerProvider(resource=resource, sampler=_sampler())
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
     trace.set_tracer_provider(provider)
@@ -130,7 +138,9 @@ class ToolCallDetails:
             return await call_next(ctx)
 
         params = ctx.params or {}
+        client: dict[str, Any] = {}
         try:
+            span.update_name(f"{_SERVICE} tool: {params.get('name')}")
             span.set_attributes({
                 "openinference.span.kind": "TOOL",
                 "tool.name": str(params.get("name")),
@@ -157,10 +167,23 @@ class ToolCallDetails:
         except Exception:  # never let decorating a span break the call itself
             logger.debug("could not add tool call details", exc_info=True)
 
-        result = await call_next(ctx)
+        try:
+            result = await call_next(ctx)
+        except Exception as exc:
+            span.set_status(StatusCode.ERROR, str(exc)[:200])
+            raise
 
         try:
+            failed = bool(getattr(result, "isError", False) or getattr(result, "is_error", False) or
+                          (isinstance(result, dict) and result.get("isError")))
             text, rows = _serialize(result)
+            meta = {k: v for k, v in (("client", client.get("name")), ("rows", rows)) if v is not None}
+            if meta:
+                span.set_attribute("metadata", json.dumps(meta))
+            if failed:
+                span.set_status(StatusCode.ERROR, text[:200])
+            else:
+                span.set_status(StatusCode.OK)
             span.set_attribute("evil.result.bytes", len(text.encode()))
             if rows is not None:
                 span.set_attribute("evil.result.rows", rows)
