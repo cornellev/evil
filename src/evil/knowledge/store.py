@@ -1,10 +1,13 @@
-"""knowledge.db: the filtered copy of the `cev` space, one SQLite file on the NUC's local disk.
+"""knowledge.db: the filtered copy of the `cev` space and the team's shared Drive, one SQLite file on the NUC's disk.
 
 One writer (the indexer), readers open it read-only (the server), WAL so a reindex never blocks a search.
 Tables: pages, chunks, chunks_fts (FTS5 over title / heading / text, porter stemming), restricted (ids of pages
 with their own view restriction, so children are skipped on incremental runs too), meta, index_runs.
 Confluence attachments are rows of `pages` too (kind attachment / attachment_link_only, `parent` = their page).
 embeddings holds one vector per section for the current embedding model (embeddings.py); it goes with its section.
+Drive files are rows of `pages` with source = 'drive' (drive_index.py; user 11-18, reversing 11-06's "never copied"):
+every file has a row (name, folder path, type, size, dates, last editor), and Docs / Slides / Sheets / PDF / Office /
+text files have their text as sections too.
 """
 
 from __future__ import annotations
@@ -28,9 +31,16 @@ CREATE TABLE IF NOT EXISTS pages (
     version INTEGER NOT NULL,
     labels TEXT NOT NULL,            -- JSON list
     kind TEXT NOT NULL,              -- page | work_log | meeting_notes | credentials_link_only | attachment[_link_only]
+                                     -- | drive_doc | drive_link_only | drive_media | drive_folder
     parent TEXT,                     -- attachments: the page they are attached to (deleted with it)
     chunker_version TEXT NOT NULL,
-    indexed_at TEXT NOT NULL
+    indexed_at TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'confluence',     -- confluence | drive
+    created TEXT,
+    last_editor TEXT,                -- display name
+    mime_type TEXT,
+    size INTEGER,                    -- bytes (files; Google Docs have none)
+    folder TEXT                      -- Drive: the parent folder's id
 );
 CREATE TABLE IF NOT EXISTS chunks (
     id INTEGER PRIMARY KEY,
@@ -73,10 +83,16 @@ def connect(path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
-    if "parent" not in {r[1] for r in conn.execute("PRAGMA table_info(pages)")}:      # index from before phase 6
-        conn.execute("ALTER TABLE pages ADD COLUMN parent TEXT")
-        conn.commit()
+    have = {r[1] for r in conn.execute("PRAGMA table_info(pages)")}
+    for name, decl in _ADDED_COLUMNS:                 # an index from before the column existed
+        if name not in have:
+            conn.execute(f"ALTER TABLE pages ADD COLUMN {name} {decl}")
+    conn.commit()
     return conn
+
+
+_ADDED_COLUMNS = [("parent", "TEXT"), ("source", "TEXT NOT NULL DEFAULT 'confluence'"), ("created", "TEXT"),
+                  ("last_editor", "TEXT"), ("mime_type", "TEXT"), ("size", "INTEGER"), ("folder", "TEXT")]
 
 
 def connect_readonly(path: str | Path) -> sqlite3.Connection:
@@ -101,8 +117,8 @@ def page_state(conn: sqlite3.Connection, page_id: str) -> tuple[int, str] | None
 
 
 def page_ids(conn: sqlite3.Connection) -> set[str]:
-    """Pages only (not attachments)."""
-    return {r[0] for r in conn.execute("SELECT id FROM pages WHERE parent IS NULL")}
+    """Confluence pages only (not attachments, not Drive)."""
+    return {r[0] for r in conn.execute("SELECT id FROM pages WHERE parent IS NULL AND source = 'confluence'")}
 
 
 def _delete_rows(conn: sqlite3.Connection, page_id: str) -> bool:
@@ -125,13 +141,16 @@ def attachment_ids(conn: sqlite3.Connection) -> set[str]:
 
 def upsert_page(conn: sqlite3.Connection, *, page_id: str, title: str, url: str, space: str, breadcrumb: list[str],
                 updated: str, version: int, labels: list[str], kind: str, chunker_version: str, indexed_at: str,
-                chunks: Iterable[Chunk], parent: str | None = None) -> int:
+                chunks: Iterable[Chunk], parent: str | None = None, source: str = "confluence",
+                created: str | None = None, last_editor: str | None = None, mime_type: str | None = None,
+                size: int | None = None, folder: str | None = None) -> int:
     _delete_rows(conn, page_id)           # its attachments stay: they have their own versions
     conn.execute(
         "INSERT INTO pages (id, title, url, space, breadcrumb, updated, version, labels, kind, chunker_version,"
-        " indexed_at, parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " indexed_at, parent, source, created, last_editor, mime_type, size, folder)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (page_id, title, url, space, json.dumps(breadcrumb), updated, version, json.dumps(labels), kind,
-         chunker_version, indexed_at, parent),
+         chunker_version, indexed_at, parent, source, created, last_editor, mime_type, size, folder),
     )
     n = 0
     for c in chunks:
@@ -139,6 +158,24 @@ def upsert_page(conn: sqlite3.Connection, *, page_id: str, title: str, url: str,
             "INSERT INTO chunks (page_id, ordinal, heading, text, drive_links) VALUES (?, ?, ?, ?, ?)",
             (page_id, c.ordinal, c.heading, c.text, json.dumps(c.drive_links)),
         )
+        conn.execute("INSERT INTO chunks_fts (rowid, title, heading, text) VALUES (?, ?, ?, ?)",
+                     (cur.lastrowid, title, c.heading, c.text))
+        n += 1
+    return n
+
+
+def replace_chunks(conn: sqlite3.Connection, page_id: str, title: str, chunks: Iterable[Chunk], *, kind: str,
+                   chunker_version: str, indexed_at: str) -> int:
+    """New sections for a row whose other columns stay (a Drive file whose text was just read)."""
+    ids = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE page_id = ?", (page_id,))]
+    conn.executemany("DELETE FROM chunks_fts WHERE rowid = ?", [(i,) for i in ids])
+    conn.execute("DELETE FROM chunks WHERE page_id = ?", (page_id,))
+    conn.execute("UPDATE pages SET kind = ?, chunker_version = ?, indexed_at = ? WHERE id = ?",
+                 (kind, chunker_version, indexed_at, page_id))
+    n = 0
+    for c in chunks:
+        cur = conn.execute("INSERT INTO chunks (page_id, ordinal, heading, text, drive_links) VALUES (?, ?, ?, ?, ?)",
+                           (page_id, c.ordinal, c.heading, c.text, json.dumps(c.drive_links)))
         conn.execute("INSERT INTO chunks_fts (rowid, title, heading, text) VALUES (?, ?, ?, ?)",
                      (cur.lastrowid, title, c.heading, c.text))
         n += 1
@@ -155,7 +192,11 @@ def replace_restricted(conn: sqlite3.Connection, ids: set[str]) -> None:
 
 
 def stats(conn: sqlite3.Connection) -> dict:
-    pages = conn.execute("SELECT count(*) FROM pages WHERE parent IS NULL").fetchone()[0]
+    try:
+        pages = conn.execute("SELECT count(*) FROM pages WHERE parent IS NULL AND source = 'confluence'").fetchone()[0]
+        drive = dict(conn.execute("SELECT kind, count(*) FROM pages WHERE source = 'drive' GROUP BY kind").fetchall())
+    except sqlite3.OperationalError:      # read-only server on an index from before Drive
+        pages, drive = conn.execute("SELECT count(*) FROM pages WHERE parent IS NULL").fetchone()[0], {}
     try:
         attachments = conn.execute("SELECT count(*) FROM pages WHERE parent IS NOT NULL").fetchone()[0]
     except sqlite3.OperationalError:      # read-only server on an index from before phase 6
@@ -171,6 +212,7 @@ def stats(conn: sqlite3.Connection) -> dict:
     return {
         "pages": pages,
         "attachments": attachments,
+        "drive": drive,
         "chunks": chunks,
         "embedded": {m: n for m, n in embedded},
         "last_run": dict(last) if last else None,

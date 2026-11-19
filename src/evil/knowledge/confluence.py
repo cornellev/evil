@@ -30,7 +30,7 @@ BROWSER_USER_AGENT = (
 )
 
 EXPAND = ",".join([
-    "body.storage", "version", "ancestors", "metadata.labels", "space",
+    "body.storage", "version", "history", "ancestors", "metadata.labels", "space",
     "restrictions.read.restrictions.user", "restrictions.read.restrictions.group",
 ])
 
@@ -56,6 +56,7 @@ class Page:
     restricted: bool                   # the page itself carries a view restriction
     storage: str                       # body in storage format (XHTML)
     raw_links: dict[str, Any] = field(default_factory=dict)
+    created: str | None = None         # ISO 8601 (history.createdDate)
 
 
 @dataclass
@@ -70,9 +71,11 @@ class Attachment:
     updated: str
     page_id: str | None                # the page it is attached to
     comment: str = ""
+    updated_by: str | None = None
+    created: str | None = None
 
 
-ATTACHMENT_EXPAND = "version,container,metadata.mediaType,extensions"
+ATTACHMENT_EXPAND = "version,history,container,metadata.mediaType,extensions"
 
 Fetch = Callable[[str, dict[str, str]], tuple[int, bytes]]
 
@@ -122,6 +125,7 @@ def parse_page(content: dict, base_url: str) -> Page:
         restricted=_is_restricted(content),
         storage=((content.get("body") or {}).get("storage") or {}).get("value") or "",
         raw_links=links,
+        created=(content.get("history") or {}).get("createdDate"),
     )
 
 
@@ -142,6 +146,8 @@ def parse_attachment(content: dict, base_url: str) -> Attachment:
         updated=version.get("when") or "",
         page_id=str(container["id"]) if container.get("id") else None,
         comment=(ext.get("comment") or "").strip(),
+        updated_by=(version.get("by") or {}).get("displayName"),
+        created=(content.get("history") or {}).get("createdDate"),
     )
 
 

@@ -403,12 +403,12 @@ def test_get_document_whole_page_section_and_unknown(indexed):
 
 # ---------------------------------------------------------------- server
 
-def test_server_exposes_exactly_two_tools(indexed):
+def test_server_exposes_exactly_three_tools(indexed):
     from evil.knowledge.server import create_knowledge_server
     _, path = indexed
     server = create_knowledge_server(str(path))
     names = {t.name for t in asyncio.run(server.list_tools())}
-    assert names == {"search_team_knowledge", "get_document"}
+    assert names == {"search_team_knowledge", "get_document", "knowledge_sql"}
 
     result = asyncio.run(server.call_tool("search_team_knowledge", {"query": "joulemeter specs"}))
     assert "Joulemeter" in result.content[0].text
@@ -691,12 +691,23 @@ class FakeDrive:
         if self.down:
             raise ConnectionError("no route to googleapis")
         tail = url[len(drive_mod.API):].strip("/")
-        if not tail:
+        if not tail:                                       # files.list: the indexer's listing
             q = params["q"]
-            terms = [t for t in re.findall(r"fullText contains '([^']+)'", q)]
-            hits = [f for f in self.files.values() if f["mimeType"] != G + "folder"
-                    and all(t in f["name"].lower() for t in terms)]
-            return _Resp(body={"files": hits})
+            files = [dict({"version": "1", "createdTime": f.get("modifiedTime", "2019-01-01T00:00:00Z"),
+                           "lastModifyingUser": {"displayName": "Someone"}}, **f) for f in self.files.values()]
+            if f"mimeType = '{G}folder'" in q:
+                files = [f for f in files if f["mimeType"] == G + "folder"]
+            if f"mimeType != '{G}folder'" in q:
+                files = [f for f in files if f["mimeType"] != G + "folder"]
+            m = re.search(r"modifiedTime > '([^']+)'", q)
+            if m:
+                files = [f for f in files if f.get("modifiedTime", "") > m.group(1)]
+            start = int(params.get("pageToken") or 0)
+            size = int(params["pageSize"])
+            body = {"files": files[start:start + size]}
+            if start + size < len(files):
+                body["nextPageToken"] = str(start + size)
+            return _Resp(body=body)
         fid, _, op = tail.partition("/")
         if fid not in self.files:
             return _Resp(404)
@@ -708,26 +719,6 @@ class FakeDrive:
 
 
 import re  # noqa: E402
-
-
-def test_drive_search_collapses_copies_and_marks_what_can_be_read():
-    fake = FakeDrive()
-    hits = drive_mod.DriveClient(session=fake).search("joulemeter", limit=5)
-    names = [h["title"] for h in hits]
-    assert "FA18 Joulemeter Report" in names and "FA18 Joulemeter Report.pdf(1)" not in names     # one copy
-    kinds = {h["title"]: h["kind"] for h in hits}
-    assert kinds["Joulemeter PDR"] == "drive_doc"
-    assert kinds["joulemeter enclosure.SLDPRT"] == "drive_link_only"
-    assert kinds["Huge joulemeter datasheet.pdf"] == "drive_link_only"
-    assert hits[0]["breadcrumb"] == ["Electrical", "Joulemeter"] and hits[0]["source"] == "drive"
-    q = [p["q"] for u, p in fake.calls if "q" in p][0]
-    assert "fullText contains 'joulemeter'" in q and "trashed = false" in q
-
-
-def test_drive_query_escapes_quotes_and_drops_stopwords():
-    assert drive_mod._terms("where is the BMS doc for the car?") == ["bms", "car"]
-    assert drive_mod.drive_query(["o'brien", "a\\b"]) == (
-        "fullText contains 'o\\'brien' and fullText contains 'a\\\\b' and trashed = false")
 
 
 def test_drive_read_filters_credentials_like_confluence():
@@ -763,38 +754,11 @@ def test_drive_down_backs_off_instead_of_failing_every_call():
     fake = FakeDrive(down=True)
     client = drive_mod.DriveClient(session=fake)
     with pytest.raises(drive_mod.DriveUnavailable):
-        client.search("joulemeter")
+        client.read("d1")
     n = len(fake.calls)
     with pytest.raises(drive_mod.DriveUnavailable, match="recently"):
-        client.search("joulemeter")
+        client.read("d1")
     assert len(fake.calls) == n                                  # no second network call within the minute
-
-
-def test_server_merges_drive_after_confluence_and_upgrades_linked_files(indexed):
-    from evil.knowledge.server import create_knowledge_server
-    _, path = indexed
-    server = create_knowledge_server(str(path), drive=drive_mod.DriveClient(session=FakeDrive()))
-    hits = asyncio.run(server.call_tool("search_team_knowledge", {"query": "joulemeter"})).structured_content["result"]
-    sources = [h["source"] for h in hits]
-    assert sources[0] == "confluence" and hits[0]["title"] == "Joulemeter"
-    assert sources == sorted(sources, key=lambda s: s == "drive")             # all Drive hits after Confluence
-    drive_hits = [h for h in hits if h["source"] == "drive"]
-    assert len(drive_hits) <= 3
-    assert drive_hits[0]["id"] == DECK_ID and drive_hits[0]["title"] == "Joulemeter PDR"     # linked deck, real name
-    assert drive_hits[0]["via"]["title"] == "Joulemeter" and drive_hits[0]["kind"] == "drive_doc"
-    doc = asyncio.run(server.call_tool("get_document", {"source": "drive", "id": "d1"}))
-    assert "10 Hz" in doc.content[0].text and "hunter22" not in doc.content[0].text
-
-
-def test_server_search_survives_drive_being_down(indexed):
-    from evil.knowledge.server import create_knowledge_server
-    _, path = indexed
-    server = create_knowledge_server(str(path), drive=drive_mod.DriveClient(session=FakeDrive(down=True)))
-    hits = asyncio.run(server.call_tool("search_team_knowledge", {"query": "joulemeter"})).structured_content["result"]
-    assert hits[0]["title"] == "Joulemeter"
-    assert [h for h in hits if h["source"] == "drive" and h["kind"] == "drive_link_only"]    # the page's link stays
-    with pytest.raises(Exception, match="link"):
-        asyncio.run(server.call_tool("get_document", {"source": "drive", "id": "d1"}))
 
 
 def test_drive_read_writes_nothing_to_disk(monkeypatch, tmp_path):
@@ -808,13 +772,12 @@ def test_drive_read_writes_nothing_to_disk(monkeypatch, tmp_path):
     monkeypatch.setattr(builtins, "open", guarded)
     monkeypatch.chdir(tmp_path)
     client = drive_mod.DriveClient(session=FakeDrive())
-    client.search("joulemeter")
     client.read("d1")
     client.read("sheet")
     assert list(tmp_path.iterdir()) == []
 
 
-def test_drive_reads_uploaded_powerpoint_by_slide_and_merges_copy_of():
+def test_drive_reads_uploaded_powerpoint_by_slide():
     import io as _io
     import zipfile as _zip
     buf = _io.BytesIO()
@@ -838,8 +801,6 @@ def test_drive_reads_uploaded_powerpoint_by_slide_and_merges_copy_of():
     t = doc["text"]
     assert t.index("## Slide 1") < t.index("## Slide 2") < t.index("## Slide 10")       # numeric slide order
     assert "Shunt: 100 A" in t and "hunter22" not in t
-    names = [h["title"] for h in client.search("pdr", limit=5)]
-    assert len([n for n in names if "PDR/CDR" in n]) == 1
 
 
 def test_drive_slow_download_becomes_a_link_not_a_timeout(monkeypatch):
@@ -856,7 +817,7 @@ def test_drive_slow_download_becomes_a_link_not_a_timeout(monkeypatch):
     client = drive_mod.DriveClient(session=fake)
     doc = client.read("d1pdf")
     assert doc["kind"] == "drive_link_only" and "too slow" in doc["text"]
-    assert client.search("joulemeter")                    # a slow file doesn't mark Drive as down
+    assert client.read("d1")["kind"] == "drive_doc"       # a slow file doesn't mark Drive as down
 
 
 def test_drive_links_drop_google_tracking_params():
@@ -994,3 +955,281 @@ def test_page_update_keeps_its_attachments_and_old_index_gets_the_column(kdb):
     again = store.connect(path.parent / "old.db")
     assert "parent" in {r[1] for r in again.execute("PRAGMA table_info(pages)")}
     again.close()
+
+
+# ---------------------------------------------------------------- Drive in the index (11-18)
+
+from evil.knowledge import drive_index  # noqa: E402
+from evil.knowledge import sql as sql_mod  # noqa: E402
+
+
+def _drive_fake():
+    fake = FakeDrive()
+    fake.files["photo"] = {"id": "photo", "name": "IMG_2041.jpg", "mimeType": "image/jpeg", "size": "3000000",
+                           "parents": ["fJ"], "modifiedTime": "2026-11-17T12:00:00Z"}
+    fake.files["d1"]["modifiedTime"] = "2026-11-16T15:00:00Z"
+    fake.exports[DECK_ID] = b"Joulemeter PDR\n\nShunt rated 100 A.\n"
+    return fake
+
+
+def _drive_client(fake):
+    return drive_mod.DriveClient(session=fake, retry_after_sec=0)
+
+
+def test_drive_full_listing_indexes_every_file_and_reads_text(indexed):
+    conn, _ = indexed
+    fake = _drive_fake()
+    r = drive_index.sync_drive(conn, _drive_client(fake), now=datetime(2026, 11, 18, tzinfo=timezone.utc))
+    assert r.mode == "full" and r.error is None and r.pending == 0
+    kinds = dict(conn.execute("SELECT id, kind FROM pages WHERE source = 'drive'").fetchall())
+    assert kinds["d1"] == "drive_doc" and kinds["sheet"] == "drive_doc" and kinds["photo"] == "drive_media"
+    assert kinds["cad"] == "drive_link_only" and kinds["big"] == "drive_link_only" and kinds["fJ"] == "drive_folder"
+    assert kinds["pw"] == "credentials_link_only"
+    text = " ".join(t for (t,) in conn.execute("SELECT text FROM chunks WHERE page_id IN ('d1', 'sheet')"))
+    assert "10 Hz" in text and "VBAT" in text and "hunter22" not in text            # scrubbed like Confluence
+    row = conn.execute("SELECT breadcrumb, last_editor FROM pages WHERE id = 'd1'").fetchone()
+    assert json.loads(row["breadcrumb"]) == ["Electrical", "Joulemeter"] and row["last_editor"] == "Someone"
+    assert not conn.execute("SELECT 1 FROM chunks WHERE page_id = 'photo'").fetchone()   # never in search
+    downloaded = {u.split("/files/")[1].split("/")[0] for u, p in fake.calls if u.endswith("/export") or p.get("alt")}
+    assert "pw" not in downloaded and "cad" not in downloaded and "big" not in downloaded
+    assert store.page_ids(conn) == {"1", "2", "3", "4"}                 # Confluence's own set is untouched
+
+
+def test_confluence_full_pass_keeps_drive_rows(indexed):
+    conn, _ = indexed
+    drive_index.sync_drive(conn, _drive_client(_drive_fake()))
+    index_once(conn, client_for(FakeConfluence(corpus())), "cev", full=True)
+    assert conn.execute("SELECT count(*) FROM pages WHERE source = 'drive'").fetchone()[0] == 10
+
+
+def test_drive_incremental_rereads_changed_files_and_full_removes_gone_ones(indexed):
+    conn, _ = indexed
+    fake = _drive_fake()
+    client = _drive_client(fake)
+    drive_index.sync_drive(conn, client, now=datetime(2026, 11, 18, tzinfo=timezone.utc))
+    fake.files["d1"].update(version="2", modifiedTime="2026-11-18T13:00:00Z")
+    fake.exports["d1"] = b"# Joulemeter report\n\nNow sampled at 50 Hz.\n"
+    r = drive_index.sync_drive(conn, client, now=datetime(2026, 11, 18, 14, tzinfo=timezone.utc))
+    assert r.mode == "incremental" and r.indexed == 1 and r.read == 1
+    assert "50 Hz" in " ".join(t for (t,) in conn.execute("SELECT text FROM chunks WHERE page_id = 'd1'"))
+    del fake.files["cad"]
+    fake.files["fJ"]["name"] = "Joulemeter 2"
+    r = drive_index.sync_drive(conn, client, full=True)
+    assert r.removed == 1 and not conn.execute("SELECT 1 FROM pages WHERE id = 'cad'").fetchone()
+    assert json.loads(conn.execute("SELECT breadcrumb FROM pages WHERE id = 'sheet'").fetchone()[0])[-1] == "Joulemeter 2"
+
+
+def test_drive_text_budget_leaves_files_pending_and_the_server_reads_them_live(indexed):
+    conn, path = indexed
+    fake = _drive_fake()
+    r = drive_index.sync_drive(conn, _drive_client(fake), text_budget_sec=-1)
+    assert r.pending == 4 and r.read == 0                     # deck, d1, d1pdf, sheet: names only for now
+    conn.commit()
+    from evil.knowledge.server import create_knowledge_server
+    server = create_knowledge_server(str(path), drive=drive_mod.DriveClient(session=fake))
+    doc = asyncio.run(server.call_tool("get_document", {"source": "drive", "id": "d1"}))
+    assert "10 Hz" in doc.content[0].text and any(u.endswith("/d1/export") for u, _ in fake.calls)   # live
+
+
+def test_server_reads_an_indexed_drive_file_from_the_index(indexed):
+    conn, path = indexed
+    drive_index.sync_drive(conn, _drive_client(_drive_fake()))
+    conn.commit()
+    from evil.knowledge.server import create_knowledge_server
+    live = FakeDrive(down=True)                               # any live call would fail
+    server = create_knowledge_server(str(path), drive=drive_mod.DriveClient(session=live))
+    doc = json.loads(asyncio.run(server.call_tool("get_document", {"source": "drive", "id": "d1"})).content[0].text)
+    assert "10 Hz" in doc["text"] and doc["source"] == "drive" and not live.calls
+
+
+def test_search_ranks_drive_files_with_pages_and_collapses_copies(indexed):
+    conn, _ = indexed
+    drive_index.sync_drive(conn, _drive_client(_drive_fake()))
+    hits = search(conn, "joulemeter report", limit=10)
+    titles = [h["title"] for h in hits]
+    assert "FA18 Joulemeter Report" in titles and "FA18 Joulemeter Report.pdf(1)" not in titles
+    drive_hit = next(h for h in hits if h["title"] == "FA18 Joulemeter Report")
+    assert drive_hit["source"] == "drive" and drive_hit["kind"] == "drive_doc"
+    assert drive_hit["breadcrumb"] == ["Electrical", "Joulemeter"]
+    assert all(h["source"] == "drive" for h in search(conn, "joulemeter", sources=["drive"]))
+    assert all(h["source"] == "confluence" for h in search(conn, "joulemeter", sources=["confluence"]))
+    titles = [h["title"] for h in search(conn, "joulemeter specs", limit=10)]
+    assert titles.count("Joulemeter PDR") == 1 and "PDR deck" not in titles   # the page's link is the indexed deck
+    only_page = [h for h in search(conn, "joulemeter specs", limit=1, sources=["confluence", "drive"])
+                 + search(conn, "shunt calibrated bench supply", limit=1) if h.get("via")]
+    assert only_page and only_page[0]["title"] == "Joulemeter PDR" and only_page[0]["kind"] == "drive_doc"
+
+
+def test_drive_rows_without_text_are_not_embedded(indexed):
+    conn, _ = indexed
+    drive_index.sync_drive(conn, _drive_client(_drive_fake()))
+    kinds = {r["kind"] for r in conn.execute(
+        "SELECT DISTINCT p.kind FROM chunks c JOIN pages p ON p.id = c.page_id WHERE c.id IN "
+        "(SELECT id FROM chunks) AND p.source = 'drive' AND c.id IN ({})".format(
+            ",".join(str(r["id"]) for r in emb.pending(conn, "fake-embed"))))}
+    assert kinds == {"drive_doc"}
+
+
+def test_knowledge_sql_answers_what_changed_and_who(indexed):
+    conn, path = indexed
+    drive_index.sync_drive(conn, _drive_client(_drive_fake()))
+    conn.commit()
+    ro = store.connect_readonly(path)
+    rows = sql_mod.run(ro, "SELECT title, modified_local, last_editor, kind, path FROM docs WHERE source = 'drive' "
+                           "AND kind != 'folder' AND modified >= '2026-11-15' ORDER BY modified DESC")
+    assert [r["title"] for r in rows] == ["IMG_2041.jpg", "FA18 Joulemeter Report"]
+    assert rows[0]["kind"] == "photo" and rows[1]["kind"] == "file" and rows[1]["path"] == "Electrical > Joulemeter"
+    assert rows[1]["modified_local"] == "2026-11-16 10:00:00" and rows[1]["last_editor"] == "Someone"
+    conf = sql_mod.run(ro, "SELECT title, type, last_editor, created FROM docs WHERE source = 'confluence' "
+                           "AND kind = 'page'")
+    assert {r["title"] for r in conf} == {"Joulemeter", "Ordering Guide"} and conf[0]["last_editor"] == "Someone"
+    hits = sql_mod.run(ro, "SELECT d.title FROM sections s JOIN docs d ON d.id = s.doc_id WHERE s.text LIKE '%VBAT%'")
+    assert hits == [{"title": "Pinout"}]
+    assert not sql_mod.run(ro, "SELECT * FROM sections s JOIN docs d ON d.id = s.doc_id WHERE d.kind = 'credentials'")
+    with pytest.raises(ValueError):
+        sql_mod.run(ro, "DELETE FROM pages")
+    ro.close()
+
+
+def test_knowledge_sql_tool_explains_a_bad_column(indexed):
+    from evil.knowledge.server import create_knowledge_server
+    _, path = indexed
+    server = create_knowledge_server(str(path))
+    with pytest.raises(Exception, match="View docs"):
+        asyncio.run(server.call_tool("knowledge_sql", {"query": "SELECT updated_at FROM docs"}))
+    ok = asyncio.run(server.call_tool("knowledge_sql", {"query": "SELECT COUNT(*) AS n FROM docs"}))
+    assert '"n"' in ok.content[0].text
+
+
+def test_drive_docs_inline_pictures_are_dropped_not_counted_as_credentials():
+    # seen 11-18: Docs' markdown export inlines every picture as base64; the key redactor counted 194k "credentials"
+    fake = FakeDrive()
+    fake.exports["d1"] = (b"# Report\n\n![][image1]\n\nShunt rated 100 A.\n\n[image1]: <data:image/png;base64,"
+                          + b"iVBORw0KGgo" * 2000 + b">\n")
+    blocks = drive_mod.DriveClient(session=fake).blocks(fake.files["d1"])
+    clean, stats = scrub(blocks)
+    text = " ".join(b.render() for b in clean)
+    assert "100 A" in text and "base64" not in text and "image1" not in text and stats.total == 0
+
+
+def test_one_file_too_big_to_export_does_not_stop_drive(indexed):
+    conn, _ = indexed
+    fake = _drive_fake()
+    real_get = fake.get
+    big = _Resp(403, {"error": {"errors": [{"reason": "exportSizeLimitExceeded"}]}})
+    fake.get = lambda url, params=None, timeout=None, **kw: (
+        big if url.endswith("/sheet/export") else real_get(url, params, timeout))
+    r = drive_index.sync_drive(conn, _drive_client(fake))
+    assert r.pending == 0 and r.unreadable == 2 and r.read == 2           # the sheet, and a fake PDF
+    assert "too large for Google to export" in conn.execute(
+        "SELECT text FROM chunks WHERE page_id = 'sheet'").fetchone()[0]
+
+
+def test_drive_rate_limits_back_off_and_reading_goes_on(indexed, monkeypatch):
+    conn, _ = indexed
+    monkeypatch.setattr(drive_index.time, "sleep", lambda s: None)
+    fake = _drive_fake()
+    real_get = fake.get
+    refusals = [3]
+
+    def get(url, params=None, timeout=None, **kw):
+        if url.endswith("/export") and refusals[0]:
+            refusals[0] -= 1
+            return _Resp(429, {"error": {"errors": [{"reason": "rateLimitExceeded"}]}})
+        return real_get(url, params, timeout)
+    fake.get = get
+    client = _drive_client(fake)
+    monkeypatch.setattr(drive_index, "READ_BATCH", 1)
+    r = drive_index.sync_drive(conn, client)
+    assert r.read == 3 and r.pending == 0              # deck, d1, sheet all read after the refusals
+
+
+def test_resumes_and_rosters_rank_below_project_docs_unless_asked_for(indexed):
+    # seen 11-18: a member's name returned their resume first, and "what does he work on" was answered from it
+    conn, _ = indexed
+    fake = _drive_fake()
+    fake.files["cv"] = {"id": "cv", "name": "Jo_Smith_Resume.pdf", "mimeType": "application/pdf", "size": "5000",
+                        "parents": ["fR"], "modifiedTime": "2026-11-01T00:00:00Z"}
+    fake.files["fR"] = {"id": "fR", "name": "Resume Book", "mimeType": G + "folder", "parents": ["fE"]}
+    fake.files["proj"] = {"id": "proj", "name": "SP27 Telemetry Projects", "mimeType": G + "document",
+                          "parents": ["fJ"], "modifiedTime": "2026-11-01T00:00:00Z"}
+    fake.exports["proj"] = b"# Projects\n\nCAN logger rewrite: Jo Smith.\n"
+    real_get = fake.get
+    fake.get = lambda url, params=None, timeout=None, **kw: (
+        _Resp(content=b"Jo Smith Jo Smith resume, CAN logger, Jo Smith") if url.endswith("/cv")
+        and (params or {}).get("alt") else real_get(url, params, timeout))
+    orig = drive_mod._pdf_text
+    drive_mod._pdf_text = lambda data: data.decode()
+    try:
+        drive_index.sync_drive(conn, _drive_client(fake))
+    finally:
+        drive_mod._pdf_text = orig
+    titles = [h["title"] for h in search(conn, "Jo Smith")]
+    assert titles.index("SP27 Telemetry Projects") < titles.index("Jo_Smith_Resume.pdf")
+    assert search(conn, "Jo Smith resume")[0]["title"] == "Jo_Smith_Resume.pdf"
+
+
+def test_a_drive_file_opens_by_title_and_when_asked_for_as_confluence(indexed):
+    # seen 11-18: get_document(id="FA26 Fullstack Onboarding", source="drive") and then source="confluence" both
+    # failed, and the answer said it could only see an excerpt
+    conn, path = indexed
+    drive_index.sync_drive(conn, _drive_client(_drive_fake()))
+    conn.commit()
+    from evil.knowledge.server import create_knowledge_server
+    server = create_knowledge_server(str(path), drive=drive_mod.DriveClient(session=FakeDrive(down=True)))
+    for source in ("drive", "confluence"):
+        doc = json.loads(asyncio.run(server.call_tool(
+            "get_document", {"source": source, "id": "FA18 Joulemeter Report"})).content[0].text)
+        assert doc["id"] == "d1" and "10 Hz" in doc["text"]
+    rows = sql_mod.run(store.connect_readonly(path), "SELECT title FROM docs WHERE type IN ('Google Slides', "
+                       "'PowerPoint') AND kind = 'file' AND path LIKE '%Electrical > Joulemeter%'")
+    assert rows == [{"title": "Joulemeter PDR"}]
+
+
+def test_a_shortcut_lists_as_the_type_it_points_to(indexed):
+    conn, path = indexed
+    fake = _drive_fake()
+    fake.files["sc"] = {"id": "sc", "name": "Workshop Template", "mimeType": G + "shortcut", "parents": ["fJ"],
+                        "shortcutDetails": {"targetMimeType": G + "presentation"}}
+    drive_index.sync_drive(conn, _drive_client(fake))
+    conn.commit()
+    rows = sql_mod.run(store.connect_readonly(path), "SELECT title FROM docs WHERE type = 'Google Slides' AND "
+                       "path LIKE '%Joulemeter' ORDER BY title")
+    assert [r["title"] for r in rows] == ["Joulemeter PDR", "Workshop Template"]
+    assert conn.execute("SELECT kind FROM pages WHERE id = 'sc'").fetchone()[0] == "drive_link_only"   # never read
+
+
+def test_a_drive_file_opens_by_its_folder_path_and_title(indexed):
+    # seen 11-18: get_document(id="Electrical > Onboarding > 2026 > FA26 Freshmen Project Specs")
+    conn, path = indexed
+    drive_index.sync_drive(conn, _drive_client(_drive_fake()))
+    conn.commit()
+    from evil.knowledge.server import create_knowledge_server
+    server = create_knowledge_server(str(path), drive=drive_mod.DriveClient(session=FakeDrive(down=True)))
+    doc = json.loads(asyncio.run(server.call_tool(
+        "get_document", {"source": "drive", "id": "Electrical > Joulemeter > FA18 Joulemeter Report"})).content[0].text)
+    assert doc["id"] == "d1"
+
+
+def test_team_word_variants_match_each_other():
+    q = fts_query("electrical freshman projects")
+    assert '"freshmen"' in q and '"freshman"' in q
+    assert '"electrical"' in fts_query("elec onboarding")
+
+
+def test_the_folder_path_and_recency_lift_the_right_doc():
+    from evil.knowledge.search import path_factor, recency_factor, _content_stems
+    q = set(_content_stems("electrical freshman projects"))
+    assert path_factor(q, json.dumps(["Electrical", "Onboarding", "2026"])) > path_factor(q, json.dumps(["Mechanical"]))
+    now = datetime(2026, 11, 18, tzinfo=timezone.utc)
+    assert recency_factor("2026-11-01T00:00:00Z", now) / recency_factor("2019-01-01T00:00:00Z", now) > 1.25
+
+
+def test_a_named_subteam_pushes_down_other_subteams_docs():
+    from evil.knowledge.search import subteam_factor
+    mech = json.dumps(["Mechanical", "Onboarding", "Frosh Projects 2027"])
+    elec = json.dumps(["Electrical", "Onboarding", "2026"])
+    assert subteam_factor("electrical freshman projects", "UC27 Freshman Project Master Doc", mech) < 1.0
+    assert subteam_factor("electrical freshman projects", "FA26 Freshmen Project Specs", elec) == 1.0
+    assert subteam_factor("freshman projects", "UC27 Freshman Project Master Doc", mech) == 1.0     # none named
+    assert subteam_factor("elec freshman projects", "General Team", json.dumps(["CEV Home"])) == 1.0   # no subteam

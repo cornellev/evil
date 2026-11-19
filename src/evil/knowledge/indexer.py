@@ -1,4 +1,4 @@
-"""The index job: Confluence `cev` space -> knowledge.db (the `knowledge-indexer` service).
+"""The index job: Confluence `cev` space and the team's shared Drive -> knowledge.db (the `knowledge-indexer` service).
 
 - **Full pass** (first run, nightly, or after a chunker change): fetches every page of the space (~12 requests
   for ~560 pages), rebuilds the set of restricted pages from scratch, removes pages that were deleted, became
@@ -20,6 +20,10 @@
   Tern's /embed on thor (embeddings.py). thor down -> they stay pending until the next pass; search is keyword-only
   for them meanwhile. The first run embeds everything (~2k sections, about a minute).
 
+- **Drive** (after Confluence, drive_index.py, user 11-18): every file's metadata, and the text of the readable ones,
+  on the same schedule (full listing with the nightly full pass). Needs the Drive key (KNOWLEDGE_DRIVE_KEY_FILE,
+  mounted read-only like the server's); no key = Confluence only.
+
 Only this process has the Confluence token (KNOWLEDGE_CONFLUENCE_TOKEN, from the NUC's knowledge.env). Logs carry
 ids, titles and counts, never page text.
 
@@ -39,7 +43,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from evil.knowledge import drive_index
 from evil.knowledge import embeddings as emb
+from evil.knowledge.drive import READ_BUDGET_SEC, DriveClient
 from evil.knowledge import store
 from evil.knowledge.chunker import CHUNKER_VERSION, LINK_ONLY_KIND, Chunk, chunk, page_kind
 from evil.knowledge.confluence import Attachment, ConfluenceClient, ConfluenceError, Page, force_ipv4
@@ -89,6 +95,7 @@ def _index_page(conn, page: Page, now: datetime) -> tuple[int, int]:
         breadcrumb=[t for _, t in page.ancestors], updated=page.updated, version=page.version,
         labels=page.labels, kind=page_kind(page.title, page.labels), chunker_version=CHUNKER_VERSION,
         indexed_at=now.isoformat(), chunks=chunks,
+        created=page.created, last_editor=page.updated_by,
     )
     if scrub_stats.total:
         logger.info("page %s %r: removed %d credential item(s)", page.id, page.title, scrub_stats.total)
@@ -101,6 +108,7 @@ def _index_link_only(conn, page: Page, now: datetime) -> None:
         breadcrumb=[t for _, t in page.ancestors], updated=page.updated, version=page.version,
         labels=page.labels, kind=LINK_ONLY_KIND, chunker_version=CHUNKER_VERSION,
         indexed_at=now.isoformat(), chunks=[Chunk(0, "", "", [])],
+        created=page.created, last_editor=page.updated_by,
     )
     logger.info("page %s %r: credentials page, stored as a link only", page.id, page.title)
 
@@ -179,7 +187,8 @@ def sync_attachments(conn, client: ConfluenceClient, space: str, full: bool, sin
         store.upsert_page(
             conn, page_id=att.id, title=att.title, url=att.url, space=space.lower(), breadcrumb=breadcrumb,
             updated=att.updated, version=version, labels=[], kind=kind, chunker_version=state,
-            indexed_at=now.isoformat(), chunks=chunks, parent=att.page_id,
+            indexed_at=now.isoformat(), chunks=chunks, parent=att.page_id, created=att.created,
+            last_editor=att.updated_by, mime_type=att.media_type, size=att.size,
         )
         result.attachments_indexed += 1
     if listing_full:
@@ -290,6 +299,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--interval-sec", type=int, default=int(os.getenv("KNOWLEDGE_INTERVAL_SEC", "3600")))
     parser.add_argument("--full-hour", type=int, default=int(os.getenv("KNOWLEDGE_FULL_HOUR", "3")),
                         help="local hour for the nightly full pass")
+    parser.add_argument("--drive-budget-sec", type=float, default=drive_index.TEXT_BUDGET_SEC,
+                        help="time for reading Drive files' text per pass (the first fill takes a few hours)")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -298,6 +309,10 @@ def main(argv: list[str] | None = None) -> int:
         force_ipv4()
     conn = store.connect(args.db)
     embedder = emb.EmbedClient()
+    # the indexer backs off and retries on its own; a slow file gets longer than a live question would give it
+    drive = DriveClient(retry_after_sec=0, read_budget_sec=max(READ_BUDGET_SEC, 120))
+    if not drive.enabled:
+        logger.info("no Drive key (KNOWLEDGE_DRIVE_KEY_FILE): Confluence only")
     if not embedder.enabled:
         logger.info("KNOWLEDGE_EMBED_URL not set: no embeddings, search stays keyword-only")
 
@@ -316,11 +331,17 @@ def main(argv: list[str] | None = None) -> int:
                     "attachments indexed %d, removed %d, pending %d; %d request(s)%s", r.mode, r.fetched,
                     r.indexed, r.unchanged, r.removed, r.skipped, r.scrubbed, r.attachments_indexed,
                     r.attachments_removed, r.attachments_pending, r.requests, f", error: {r.error}" if r.error else "")
+        if drive.enabled:
+            d = drive_index.sync_drive(conn, drive, full=full, now=now, text_budget_sec=args.drive_budget_sec)
+            logger.info("drive %s pass: listed %d, indexed %d, unchanged %d, moved %d, removed %d; text read %d, "
+                        "unreadable %d, pending %d, scrubbed %d; %d request(s)%s", d.mode, d.listed, d.indexed,
+                        d.unchanged, d.moved, d.removed, d.read, d.unreadable, d.pending, d.scrubbed, d.requests,
+                        f", error: {d.error}" if d.error else "")
         if embedder.enabled:
             done, left = emb.embed_pending(conn, embedder)
             logger.info("embeddings (%s): %d section(s) embedded, %d pending", embedder.model, done, left)
         if args.once:
-            return 1 if r.error else 0
+            return 1 if r.error or (drive.enabled and d.error) else 0
         time.sleep(args.interval_sec)
 
 

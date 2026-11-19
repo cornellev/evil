@@ -130,14 +130,14 @@ services:
       # turn them off; thor down -> keyword-only by itself. Same model in both services.
       KNOWLEDGE_EMBED_URL: ${KNOWLEDGE_EMBED_URL-http://thor.tail4ccb95.ts.net:8000/embed}
       KNOWLEDGE_EMBED_MODEL: ${KNOWLEDGE_EMBED_MODEL:-embeddinggemma}
-      # Live Google Drive (drive.py): the service account key, root-owned mode 600 in ./secrets (not in git). No key
-      # file = Drive off. Only this service mounts it; the indexer never sees it.
+      # Google Drive (drive.py): the service account key, root-owned mode 600 in ./secrets (not in git). No key file =
+      # Drive off. Here it reads a file live whose text the indexer hasn't read yet; the indexer mounts it too (11-18).
       KNOWLEDGE_DRIVE_KEY_FILE: /run/secrets/knowledge/drive-key.json
     volumes:
       - knowledge-data:/knowledge
       - ./secrets:/run/secrets/knowledge:ro
     command: ["python", "-m", "evil.knowledge.server"]
-    mem_limit: 512m
+    mem_limit: 1g            # Drive's sections' vectors in memory (~30k x 768 floats, 11-18)
     read_only: true
     tmpfs:
       - /tmp
@@ -178,10 +178,13 @@ services:
       # nightly full pass at KNOWLEDGE_FULL_HOUR (default 3) in KNOWLEDGE_TZ (default America/New_York)
       KNOWLEDGE_EMBED_URL: ${KNOWLEDGE_EMBED_URL-http://thor.tail4ccb95.ts.net:8000/embed}
       KNOWLEDGE_EMBED_MODEL: ${KNOWLEDGE_EMBED_MODEL:-embeddinggemma}
+      # The shared Drive into the index (drive_index.py, user 11-18): the same key, read-only
+      KNOWLEDGE_DRIVE_KEY_FILE: /run/secrets/knowledge/drive-key.json
     volumes:
       - knowledge-data:/knowledge
+      - ./secrets:/run/secrets/knowledge:ro
     command: ["python", "-m", "evil.knowledge.indexer"]
-    mem_limit: 512m
+    mem_limit: 1g
     read_only: true
     tmpfs:
       - /tmp

@@ -14,8 +14,12 @@
 - One section per page by default: a page's best section represents it, so one long page can't fill the list.
 - Confluence attachments (PDFs, decks, docs on a page) are results like pages: kind "attachment" (text indexed,
   readable with get_document) or "attachment_link_only" (name, type, size, link); breadcrumb ends with their page.
-- Basic Drive fallback: Drive links found in the returned sections are listed after them as link-only hits (title =
-  the link text). No Google access; nothing about the file is known beyond its link.
+- Drive files (indexed since 11-18, drive_index.py) rank with the pages: kind "drive_doc" (text indexed, readable with
+  get_document), "drive_link_only" (CAD, archives, big files: name, type, folder, link) or "drive_folder"; photos and
+  video have no sections, so search never returns them (knowledge_sql lists them). Copies of one file ("X", "X.pdf",
+  "X.pdf(1)", "Copy of X") collapse to the best-ranked one.
+- Drive links found in the returned sections are listed after them (the file's indexed name and kind when it's in
+  the index, else the link text), unless the file is already a hit.
 """
 
 from __future__ import annotations
@@ -29,12 +33,16 @@ from typing import Any
 TITLE_WEIGHT, HEADING_WEIGHT, TEXT_WEIGHT = 8.0, 3.0, 1.0
 # attachments a little below pages, so a page usually ranks above the files attached to it
 KIND_FACTOR = {"page": 1.0, "work_log": 0.5, "meeting_notes": 0.6, "credentials_link_only": 1.0,
-               "attachment": 0.9, "attachment_link_only": 0.9}
+               "attachment": 0.9, "attachment_link_only": 0.9, "drive_doc": 0.95, "drive_link_only": 0.7,
+               "drive_folder": 0.7}
 LINK_ONLY_NOTE = ("This page holds team credentials, so its contents are not available here. Give the user the "
                   "link; Confluence decides who can open it.")
 TITLE_BOOST = 0.5           # x(1 + TITLE_BOOST * share of query words in the title)
 TITLE_EXACT_BOOST = 0.25    # and this much more when the title is just the query's words
-RECENCY_BOOST = 0.1         # x(1 + RECENCY_BOOST * 0.5 ** (age / half-life)): at most +10%
+# x(1 + RECENCY_BOOST * 0.5 ** (age / half-life)): at most +30%. Was +10%; with Drive in the index, 2019-2023 docs
+# on the same topic outranked this semester's (seen 11-18: "electrical freshman projects" put FA26 Specs 8th).
+RECENCY_BOOST = 0.3
+PATH_BOOST = 0.4            # x(1 + PATH_BOOST * share of query words in the folder path / breadcrumb)
 RECENCY_HALF_LIFE_DAYS = 365
 EMPTY_PAGE_FACTOR = 0.3     # title-only entries are tiny, so BM25 overrates them on a single title word
 CANDIDATES = 200
@@ -60,6 +68,12 @@ _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
 _DRIVE_ID = re.compile(r"/(?:d|folders)/([A-Za-z0-9_-]{10,})|[?&]id=([A-Za-z0-9_-]{10,})")
 
 
+# Words the team writes two ways, which porter stemming doesn't join (seen 11-18: "electrical freshman projects"
+# missed "FA26 Freshmen Project Specs").
+TEAM_WORDS = {"freshman": ["freshmen", "frosh"], "freshmen": ["freshman", "frosh"], "frosh": ["freshman", "freshmen"],
+              "elec": ["electrical"], "mech": ["mechanical"], "telem": ["telemetry"]}
+
+
 def fts_query(query: str, glossary: dict[str, list[str]] | None = None) -> str | None:
     words = []
     for w in _TOKEN.findall(query.lower()):
@@ -67,7 +81,7 @@ def fts_query(query: str, glossary: dict[str, list[str]] | None = None) -> str |
         if len(w) < 2 or w in STOPWORDS:
             continue
         words.append(w)
-        for syn in (glossary or {}).get(w, []):
+        for syn in [*TEAM_WORDS.get(w, []), *(glossary or {}).get(w, [])]:
             words.append(syn.lower())
     seen, terms = set(), []
     for w in words:
@@ -108,6 +122,36 @@ def title_factor(query_stems: set[str], title: str) -> float:
     return 1.0 + TITLE_BOOST * share + exact
 
 
+SUBTEAMS = {"electrical": "electrical", "elec": "electrical", "mechanical": "mechanical", "mech": "mechanical",
+            "telemetry": "telemetry", "telem": "telemetry", "software": "software", "autonomy": "autonomy",
+            "operations": "operations", "ops": "operations", "business": "business"}
+OTHER_SUBTEAM_FACTOR = 0.6
+
+
+def subteam_factor(query: str, title: str, breadcrumb: str) -> float:
+    """A question that names a subteam pushes down docs that live under a different one (seen 11-18: "electrical
+    freshman projects" ranked Mechanical's "UC27 Freshman Project Master Doc" first on its title)."""
+    asked = {SUBTEAMS[w] for w in _TOKEN.findall(query.lower()) if w in SUBTEAMS}
+    if not asked:
+        return 1.0
+    try:
+        where = " ".join(json.loads(breadcrumb or "[]")[:3]) + " " + title
+    except ValueError:
+        return 1.0
+    have = {SUBTEAMS[w] for w in _TOKEN.findall(where.lower()) if w in SUBTEAMS}
+    return OTHER_SUBTEAM_FACTOR if have and not (have & asked) else 1.0
+
+
+def path_factor(query_stems: set[str], breadcrumb: str) -> float:
+    """The folder path / parent pages say the subteam and the term ("Electrical > Onboarding > 2026"), which the
+    text often doesn't (seen 11-18: "electrical freshman projects")."""
+    try:
+        path = " ".join(json.loads(breadcrumb or "[]"))
+    except ValueError:
+        return 1.0
+    return 1.0 + PATH_BOOST * title_share(query_stems, path)
+
+
 def recency_factor(updated: str, now: datetime) -> float:
     try:
         when = datetime.fromisoformat(updated.replace("Z", "+00:00"))
@@ -124,8 +168,36 @@ def drive_file_id(url: str) -> str:
     return (m.group(1) or m.group(2)) if m else url
 
 
+# Resumes, rosters and finance sheets mention everyone, so a name search ranked a resume first and "what does X work
+# on" was answered from it (seen 11-18). Ranked lower, never left out: a query that names them ("sam's resume",
+# "the roster") ranks them as usual.
+ADMIN_FACTOR = 0.4
+_ADMIN = re.compile(r"\b(resumes?|cv|roster|procurement|professional development|finances?|alumni)\b", re.I)
+
+
+def admin_factor(query: str, title: str, breadcrumb: str) -> float:
+    if not _ADMIN.search(f"{title} {breadcrumb}") or _ADMIN.search(query):
+        return 1.0
+    return ADMIN_FACTOR
+
+
 _ROW_COLS = """c.id, c.page_id, c.ordinal, c.heading, c.drive_links, c.text = '' AS empty,
-               p.title, p.url, p.updated, p.breadcrumb, p.kind"""
+               p.title, p.url, p.updated, p.breadcrumb, p.kind, p.source"""
+
+_COPY_SUFFIX = re.compile(r"(\s*\(\d+\))+$")
+_COPY_PREFIX = re.compile(r"^(copy of\s+)+", re.I)
+_EXT = re.compile(r"\.(pdf|docx?|pptx?|xlsx?|txt|md)$", re.I)
+
+
+def base_name(name: str) -> str:
+    """"Copy of X.pdf(1)" -> "x": copies of one file share it."""
+    n = _COPY_SUFFIX.sub("", _COPY_PREFIX.sub("", name.strip()))
+    while True:
+        m = _EXT.search(n)
+        if not m:
+            break
+        n = _COPY_SUFFIX.sub("", n[: m.start()])
+    return n.lower()
 
 
 def _keyword_ranked(conn: sqlite3.Connection, query: str, glossary, now: datetime) -> list[tuple[float, Any]]:
@@ -155,12 +227,14 @@ def _keyword_ranked(conn: sqlite3.Connection, query: str, glossary, now: datetim
             best[r["page_id"]] = (score, dict(r))
     scored = []
     for score, r in best.values():          # page-level edges: the same for every section of a page
-        score *= title_factor(query_stems, r["title"]) * recency_factor(r["updated"], now)
+        score *= (title_factor(query_stems, r["title"]) * recency_factor(r["updated"], now)
+                  * path_factor(query_stems, r["breadcrumb"]) * admin_factor(query, r["title"], r["breadcrumb"])
+                  * subteam_factor(query, r["title"], r["breadcrumb"]))
         scored.append((round(score, 6), r))
     return _sorted(scored)
 
 
-def _vector_ranked(conn: sqlite3.Connection, vectors, query_vec) -> list[tuple[float, Any]]:
+def _vector_ranked(conn: sqlite3.Connection, vectors, query_vec, query: str = "") -> list[tuple[float, Any]]:
     """Pages by their most similar section (cosine x kind, best first)."""
     top = vectors.top(query_vec, VECTOR_CANDIDATES)
     if not top:
@@ -171,7 +245,8 @@ def _vector_ranked(conn: sqlite3.Connection, vectors, query_vec) -> list[tuple[f
                         f"WHERE c.id IN ({placeholders})", list(sims)).fetchall()
     best: dict[str, tuple[float, Any]] = {}
     for r in rows:
-        score = sims[r["id"]] * KIND_FACTOR.get(r["kind"], 1.0)
+        score = (sims[r["id"]] * KIND_FACTOR.get(r["kind"], 1.0) * admin_factor(query, r["title"], r["breadcrumb"])
+                 * subteam_factor(query, r["title"], r["breadcrumb"]))
         if r["page_id"] not in best or score > best[r["page_id"]][0]:
             d = dict(r)
             words = d.pop("text").split()
@@ -228,71 +303,94 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 5, sources: list[s
     now = now or datetime.now(timezone.utc)
     ranked = _keyword_ranked(conn, query, glossary, now)
     if vectors is not None and query_vec is not None:
-        ranked = fuse(ranked, _vector_ranked(conn, vectors, query_vec), keyword_coverage(conn, query, ranked))
-    ranked = ranked[:limit]
+        ranked = fuse(ranked, _vector_ranked(conn, vectors, query_vec, query), keyword_coverage(conn, query, ranked))
+    picked, copies = [], set()
+    for score, r in ranked:
+        if r["source"] not in sources:
+            continue
+        if r["source"] == "drive":
+            key = base_name(r["title"])
+            if key in copies:
+                continue
+            copies.add(key)
+        picked.append((score, r))
+        if len(picked) >= limit:
+            break
 
     hits: list[dict[str, Any]] = []
     drive: list[dict[str, Any]] = []
-    seen_drive: set[str] = set()
-    for score, r in ranked:
-        if "confluence" in sources:
-            hits.append({
-                "source": "confluence",
-                "id": r["page_id"],
-                "title": r["title"],
-                "url": r["url"],
-                "updated": r["updated"],
-                "breadcrumb": json.loads(r["breadcrumb"]),
-                "section": r["heading"],
-                "section_id": r["ordinal"],
-                "excerpt": (LINK_ONLY_NOTE if r["kind"] == "credentials_link_only"
-                            else r["excerpt"] or "(no text of its own: likely a parent page, or attachments only)"),
-                "score": round(score, 3),
-                "kind": r["kind"],
-            })
+    seen_drive: set[str] = {r["page_id"] for _, r in picked if r["source"] == "drive"}
+    for score, r in picked:
+        hits.append({
+            "source": r["source"],
+            "id": r["page_id"],
+            "title": r["title"],
+            "url": r["url"],
+            "updated": r["updated"],
+            "breadcrumb": json.loads(r["breadcrumb"]),
+            "section": r["heading"],
+            "section_id": r["ordinal"],
+            "excerpt": (LINK_ONLY_NOTE if r["kind"] == "credentials_link_only"
+                        else r["excerpt"] or "(no text of its own: likely a parent page, or attachments only)"),
+            "score": round(score, 3),
+            "kind": r["kind"],
+        })
         if "drive" in sources:
             for url, text in json.loads(r["drive_links"]):
                 fid = drive_file_id(url)
                 if fid in seen_drive or len(drive) >= MAX_DRIVE_LINKS:
                     continue
                 seen_drive.add(fid)
+                known = conn.execute("SELECT title, url, updated, breadcrumb, kind FROM pages WHERE id = ? AND "
+                                     "source = 'drive'", (fid,)).fetchone()
                 drive.append({
                     "source": "drive",
                     "id": fid,
-                    "title": text if text and text != url else "Google Drive file",
-                    "url": url,
-                    "updated": None,
+                    "title": known["title"] if known else (text if text and text != url else "Google Drive file"),
+                    "url": known["url"] if known else url,
+                    "updated": known["updated"] if known else None,
+                    "breadcrumb": json.loads(known["breadcrumb"]) if known else [],
                     "excerpt": "",
-                    "kind": "drive_link_only",
+                    "kind": known["kind"] if known else "drive_link_only",
                     "via": {"source": "confluence", "id": r["page_id"], "title": r["title"]},
                 })
     return hits + drive
 
 
-def _page_by_title(conn: sqlite3.Connection, title: str) -> sqlite3.Row | None:
+def _page_by_title(conn: sqlite3.Connection, title: str, source: str = "confluence") -> sqlite3.Row | None:
     """A page asked for by its title instead of its id (seen 11-17: get_document(id="Tailscale") failed, and the
     answer came from a search excerpt): the exact title, else the one title that contains it."""
     title = title.strip()
     if not title or title.isdigit():
         return None
-    exact = conn.execute("SELECT * FROM pages WHERE lower(title) = lower(?)", (title,)).fetchall()
+    if " > " in title:                     # "Electrical > Onboarding > 2026 > FA26 Specs" (seen 11-18): path + title
+        path, _, name = title.rpartition(" > ")
+        rows = [r for r in conn.execute("SELECT * FROM pages WHERE lower(trim(title)) = lower(?) AND source = ?",
+                                        (name.strip(), source)).fetchall()
+                if " > ".join(json.loads(r["breadcrumb"])).lower().endswith(path.strip().lower())]
+        if len(rows) == 1:
+            return rows[0]
+        title = name
+    exact = conn.execute("SELECT * FROM pages WHERE lower(trim(title)) = lower(?) AND source = ?",
+                         (title.strip(), source)).fetchall()
     if len(exact) == 1:
         return exact[0]
     if exact:
         return None
-    like = conn.execute("SELECT * FROM pages WHERE lower(title) LIKE '%' || lower(?) || '%' LIMIT 2", (title,)).fetchall()
+    like = conn.execute("SELECT * FROM pages WHERE lower(title) LIKE '%' || lower(?) || '%' AND source = ? LIMIT 2",
+                        (title, source)).fetchall()
     return like[0] if len(like) == 1 else None
 
 
 def get_document(conn: sqlite3.Connection, page_id: str, section: str | int | None = None,
-                 max_chars: int = DOCUMENT_MAX_CHARS) -> dict[str, Any] | None:
+                 max_chars: int = DOCUMENT_MAX_CHARS, source: str = "confluence") -> dict[str, Any] | None:
     page = conn.execute("SELECT * FROM pages WHERE id = ?", (str(page_id),)).fetchone()
     if page is None:
-        page = _page_by_title(conn, str(page_id))
-    if page is None:
+        page = _page_by_title(conn, str(page_id), source)
+    if page is None or page["source"] != source:
         return None
     if page["kind"] == "credentials_link_only":
-        return {"source": "confluence", "id": page["id"], "title": page["title"], "url": page["url"],
+        return {"source": source, "id": page["id"], "title": page["title"], "url": page["url"],
                 "updated": page["updated"], "breadcrumb": json.loads(page["breadcrumb"]), "kind": page["kind"],
                 "sections": [], "text": LINK_ONLY_NOTE, "truncated": False, "drive_links": []}
     chunks = conn.execute("SELECT ordinal, heading, text, drive_links FROM chunks WHERE page_id = ? ORDER BY ordinal",
@@ -316,7 +414,7 @@ def get_document(conn: sqlite3.Connection, page_id: str, section: str | int | No
         for url, label in json.loads(c["drive_links"]):
             links.append({"url": url, "title": label})
     return {
-        "source": "confluence",
+        "source": source,
         "id": page["id"],
         "title": page["title"],
         "url": page["url"],

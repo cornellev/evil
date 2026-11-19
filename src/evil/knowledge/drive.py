@@ -1,17 +1,18 @@
-"""Live Google Drive search for cev-knowledge (phase 4). Nothing from Drive is ever written anywhere.
+"""Google Drive for cev-knowledge: listing and reading the team's shared drive (phase 4; indexed since 11-18).
 
 - Access: a service account (`tern-drive@cev-tern.iam.gserviceaccount.com`, created by the user, 11-11) that was given
   Viewer on the team's shared drive. It sees only what is shared with it, so no folder list is configured: everything
-  it can see is in scope. Scope `drive.readonly`. The JSON key is mounted read-only into the `knowledge` server only
-  (`secrets/drive-key.json` on the NUC, root-owned, mode 600); the indexer never has it.
-- Search: Drive's own full-text search, live, per question (~0.5-1 s on the ~69k-file drive). Results keep Drive's
-  order; copies like "X", "X.pdf", "X.pdf(1)", "Copy of X" collapse to one. Folder names for the breadcrumb come
-  from a small in-memory id -> name map (names only).
+  it can see is in scope. Scope `drive.readonly`. The JSON key (`secrets/drive-key.json` on the NUC, root-owned, mode
+  600) is mounted read-only into the `knowledge` server and, since 11-18, the indexer.
+- Index (drive_index.py, user 11-18: reversing 11-06's "searched live, never copied", so "what changed", "who edited"
+  and "list everything about X" can be answered): the indexer lists every file and reads the text of the readable ones
+  into knowledge.db on the NUC. Search runs on that index; nothing goes anywhere else.
 - Read: Google Docs (as markdown), Slides (text), Sheets (first sheet as CSV, row cap), and PDF / Word / PowerPoint /
-  text files up to MAX_READ_BYTES are fetched into memory, turned into text, run through the same credential filter as
-  Confluence (filters.scrub) and returned in parts. Everything else (photos, CAD, video, big files) is a link + metadata only.
-  Files whose name looks like credentials are link-only and never read, like the Confluence password pages.
-- Down or slow (timeouts, a revoked key): search returns Confluence alone and stops trying Drive for a minute.
+  text files up to MAX_READ_BYTES are fetched into memory, turned into text and run through the same credential filter
+  as Confluence (filters.scrub). Everything else (photos, CAD, video, big files) is a link + metadata only. Files whose
+  name looks like credentials are link-only and never read, like the Confluence password pages. The server reads a
+  file live only when the index doesn't have its text yet.
+- Down or slow (timeouts, a revoked key): calls stop for a minute (the server) or back off and retry (the indexer).
 """
 
 from __future__ import annotations
@@ -23,11 +24,10 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, Iterator
 
 from evil.knowledge.filters import CREDENTIAL_TITLE, scrub
-from evil.knowledge.search import LINK_ONLY_NOTE, STOPWORDS
+from evil.knowledge.search import LINK_ONLY_NOTE
 from evil.knowledge.extract import DOCX, PPTX, _docx_text, _lines_to_blocks, _pdf_text, _pptx_text
 from evil.knowledge.textify import Block
 
@@ -45,9 +45,14 @@ READ_BUDGET_SEC = float(os.getenv("KNOWLEDGE_DRIVE_READ_BUDGET_SEC", "25"))
 MAX_READ_BYTES = int(os.getenv("KNOWLEDGE_DRIVE_MAX_BYTES", str(10 * 1024 * 1024)))
 MAX_SHEET_ROWS = 300
 PART_CHARS = 12_000
-MAX_TERMS = 4
 RETRY_AFTER_SEC = 60.0
 _FIELDS = "id, name, mimeType, size, modifiedTime, webViewLink, parents, description, trashed"
+# what the indexer keeps of every file (names only for people: lastModifyingUser.displayName)
+LIST_FIELDS = ("id, name, mimeType, size, createdTime, modifiedTime, version, webViewLink, parents, trashed, "
+               "lastModifyingUser(displayName), shortcutDetails(targetMimeType)")
+LIST_PAGE_SIZE = 1000
+LIST_RETRIES = 4
+LIST_BACKOFF_SEC = 15.0
 _COMMON = {"supportsAllDrives": "true", "includeItemsFromAllDrives": "true", "corpora": "allDrives"}
 
 G = "application/vnd.google-apps."
@@ -55,12 +60,22 @@ FOLDER = G + "folder"
 _EXPORT = {G + "document": "text/markdown", G + "presentation": "text/plain", G + "spreadsheet": "text/csv"}
 _DOWNLOAD = {"application/pdf", DOCX, PPTX, "text/plain", "text/markdown", "text/csv"}
 _KIND_LABEL = {G + "document": "Google Doc", G + "presentation": "Google Slides", G + "spreadsheet": "Google Sheet",
-               FOLDER: "folder", "application/pdf": "PDF", DOCX: "Word document", PPTX: "PowerPoint"}
+               FOLDER: "folder", "application/pdf": "PDF", DOCX: "Word document", PPTX: "PowerPoint",
+               G + "form": "Google Form", G + "shortcut": "shortcut", "text/plain": "text file", "text/csv": "CSV",
+               "text/markdown": "Markdown file"}
+_EXT_LABEL = re.compile(r"\.([A-Za-z0-9]{1,6})$")
 
-_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
-_COPY_SUFFIX = re.compile(r"(\s*\(\d+\))+$")
-_COPY_PREFIX = re.compile(r"^(copy of\s+)+", re.I)
-_EXT = re.compile(r"\.(pdf|docx?|pptx?|xlsx?|txt|md)$", re.I)
+
+def kind_label(mime: str | None, name: str = "") -> str:
+    """'Google Doc', 'PDF', 'photo', 'video', 'SLDPRT file' ... for people and SQL, not the raw MIME type."""
+    mime = mime or ""
+    if mime in _KIND_LABEL:
+        return _KIND_LABEL[mime]
+    for prefix, label in (("image/", "photo"), ("video/", "video"), ("audio/", "audio")):
+        if mime.startswith(prefix):
+            return label
+    m = _EXT_LABEL.search(name or "")
+    return f"{m.group(1).upper()} file" if m else "file"
 
 
 class DriveUnavailable(RuntimeError):
@@ -69,33 +84,6 @@ class DriveUnavailable(RuntimeError):
 
 class NotReadable(Exception):
     """This one file can't be read now (too big or too slow to fetch); Drive itself is fine."""
-
-
-def _terms(query: str) -> list[str]:
-    out = []
-    for w in _TOKEN.findall(query.lower()):
-        w = w.strip("._+-")
-        if len(w) >= 2 and w not in STOPWORDS and w not in out:
-            out.append(w)
-    return out[:MAX_TERMS]
-
-
-def _q_literal(term: str) -> str:
-    return "'" + term.replace("\\", "\\\\").replace("'", "\\'") + "'"
-
-
-def drive_query(terms: list[str]) -> str:
-    return " and ".join([f"fullText contains {_q_literal(t)}" for t in terms] + ["trashed = false"])
-
-
-def _base_name(name: str) -> str:
-    n = _COPY_SUFFIX.sub("", _COPY_PREFIX.sub("", name.strip()))
-    while True:
-        m = _EXT.search(n)
-        if not m:
-            break
-        n = _COPY_SUFFIX.sub("", n[: m.start()])
-    return n.lower()
 
 
 def file_url(meta: dict) -> str:
@@ -115,16 +103,40 @@ def is_link_only(meta: dict) -> bool:
     return True
 
 
+# 403s about one file, not about Drive (seen 11-18: two big Sheets' "exportSizeLimitExceeded" stopped a whole pass)
+_FILE_REASONS = {"exportSizeLimitExceeded": "too large for Google to export as text",
+                 "cannotExportFile": "not exportable as text", "cannotDownloadFile": "not downloadable",
+                 "fileNotDownloadable": "not downloadable"}
+
+
+def _reason(r) -> str:
+    try:
+        return ((r.json().get("error") or {}).get("errors") or [{}])[0].get("reason", "")
+    except Exception:
+        return ""
+
+
+# Google Docs' markdown export carries every picture inline as base64 ("[image1]: <data:image/png;base64,...>"):
+# megabytes of it, which the key redactor then counted as 194k "credentials" (11-18). Pictures aren't text: dropped.
+_INLINE_IMAGE = re.compile(r"^\[image\d+\]:\s*<data:[^>]*>\s*$|!\[[^\]]*\]\[image\d+\]|!\[[^\]]*\]\(data:[^)]*\)", re.M)
+# an export holds those pictures until they're dropped, so it may be bigger than a file read as is
+MAX_EXPORT_BYTES = 4 * MAX_READ_BYTES
+
+
 class DriveClient:
     """`session` is anything with requests' .get(url, params=, timeout=) (tests pass a fake). Without one, the
     service account key at `key_file` makes a google-auth AuthorizedSession; no key file = Drive off."""
 
-    def __init__(self, key_file: str = DEFAULT_KEY_FILE, session: Any = None):
+    def __init__(self, key_file: str = DEFAULT_KEY_FILE, session: Any = None, retry_after_sec: float = RETRY_AFTER_SEC,
+                 read_budget_sec: float = READ_BUDGET_SEC):
         self._session = session
         self._key_file = key_file
         self._names: dict[str, tuple[str, str | None]] = {}       # folder id -> (name, parent id)
         self._down_until = 0.0
         self._lock = threading.Lock()
+        self.retry_after_sec = retry_after_sec
+        self.read_budget_sec = read_budget_sec
+        self.requests_made = 0
 
     @property
     def enabled(self) -> bool:
@@ -143,6 +155,7 @@ class DriveClient:
         with self._lock:
             if time.monotonic() < self._down_until:
                 raise DriveUnavailable("Drive failed recently; Confluence only for now")
+        self.requests_made += 1
         try:
             r = self._sess().get(url, params=params, timeout=timeout, **({"stream": True} if stream else {}))
         except Exception as exc:                       # network, auth (revoked key), timeouts
@@ -151,14 +164,17 @@ class DriveClient:
         if r.status_code == 404:
             return None
         if r.status_code >= 400:
+            reason = _reason(r)
+            if r.status_code == 403 and reason in _FILE_REASONS:       # this file only; Drive is fine
+                raise NotReadable(_FILE_REASONS[reason])
             if r.status_code >= 500 or r.status_code in (401, 403, 429):
                 self._mark_down()
-            raise DriveUnavailable(f"Drive API {r.status_code}")
+            raise DriveUnavailable(f"Drive API {r.status_code}" + (f" {reason}" if reason else ""))
         return r
 
     def _mark_down(self) -> None:
         with self._lock:
-            self._down_until = time.monotonic() + RETRY_AFTER_SEC
+            self._down_until = time.monotonic() + self.retry_after_sec
 
     # --- metadata ---------------------------------------------------------------------------------------------
 
@@ -195,51 +211,29 @@ class DriveClient:
             parent = entry[1]
         return path
 
-    def hit(self, meta: dict, via: dict | None = None) -> dict:
-        link_only = is_link_only(meta)
-        credentials = bool(CREDENTIAL_TITLE.search(meta.get("name", "")))
-        label = _KIND_LABEL.get(meta.get("mimeType", ""), meta.get("mimeType", "file"))
-        h = {
-            "source": "drive",
-            "id": meta["id"],
-            "title": meta.get("name") or "Google Drive file",
-            "url": file_url(meta),
-            "updated": meta.get("modifiedTime"),
-            "breadcrumb": self.breadcrumb(meta),
-            "excerpt": (LINK_ONLY_NOTE if credentials else
-                        f"{label}" + (" (link only: not readable as text)" if link_only else
-                                      "; read it with get_document")),
-            "kind": "credentials_link_only" if credentials else ("drive_link_only" if link_only else "drive_doc"),
-        }
-        if via:
-            h["via"] = via
-        return h
+    # --- listing (the indexer) --------------------------------------------------------------------------------
 
-    # --- search -----------------------------------------------------------------------------------------------
-
-    def search(self, query: str, limit: int = 3) -> list[dict]:
-        terms = _terms(query)
-        if not terms:
-            return []
-        files = self._list(drive_query(terms), limit * 3)
-        if not files and len(terms) > 2:            # a long question rarely has every word in one file
-            files = self._list(drive_query(sorted(terms, key=len, reverse=True)[:2]), limit * 3)
-        picked, seen = [], set()
-        for f in files:
-            key = _base_name(f.get("name", ""))
-            if key in seen:
-                continue
-            seen.add(key)
-            picked.append(f)
-            if len(picked) >= limit:
-                break
-        with ThreadPoolExecutor(max_workers=max(1, len(picked))) as pool:    # folder names: one lookup per level
-            return list(pool.map(self.hit, picked))
-
-    def _list(self, q: str, page_size: int) -> list[dict]:
-        r = self._get(API, dict(_COMMON, q=q, pageSize=str(page_size), fields=f"files({_FIELDS})"),
-                      SEARCH_TIMEOUT_SEC)
-        return [f for f in (r.json().get("files", []) if r is not None else []) if not f.get("trashed")]
+    def list_files(self, q: str = "trashed = false", page_size: int = LIST_PAGE_SIZE) -> Iterator[dict]:
+        """Every file matching `q` across the drives the account sees, LIST_FIELDS each (~70 requests for the
+        team's ~70k files)."""
+        token = None
+        while True:
+            params = dict(_COMMON, q=q, pageSize=str(page_size), fields=f"nextPageToken, files({LIST_FIELDS})")
+            if token:
+                params["pageToken"] = token
+            for attempt in range(LIST_RETRIES + 1):
+                try:
+                    r = self._get(API, params, READ_TIMEOUT_SEC)
+                    break
+                except DriveUnavailable:                 # rate limits (403/429) mid-listing clear in seconds
+                    if attempt == LIST_RETRIES:
+                        raise
+                    time.sleep(LIST_BACKOFF_SEC * (attempt + 1))
+            data = r.json() if r is not None else {}
+            yield from (f for f in data.get("files", []) if not f.get("trashed"))
+            token = data.get("nextPageToken")
+            if not token:
+                return
 
     # --- read -------------------------------------------------------------------------------------------------
 
@@ -259,7 +253,7 @@ class DriveClient:
                    if meta.get("mimeType") in _DOWNLOAD else f"not a text document ({meta.get('mimeType')})")
             return dict(doc, kind="drive_link_only", text=f"This file is {why}. Give the user the link.")
         try:
-            blocks = self._blocks(meta)
+            blocks = self.blocks(meta)
         except NotReadable as exc:
             return dict(doc, kind="drive_link_only", text=f"This file is {exc}. Give the user the link.")
         clean, stats = scrub(blocks)
@@ -288,15 +282,16 @@ class DriveClient:
             raise NotReadable("it was deleted or moved while being read")
         if not hasattr(r, "iter_content"):
             return r.content
-        deadline = time.monotonic() + READ_BUDGET_SEC
+        deadline = time.monotonic() + self.read_budget_sec
+        limit = MAX_EXPORT_BYTES if mime in _EXPORT else MAX_READ_BYTES
         buf = bytearray()
         try:
             for piece in r.iter_content(64 * 1024):
                 buf += piece
-                if len(buf) > MAX_READ_BYTES:                  # exports have no size until they are made
-                    raise NotReadable(f"too large to read (over {MAX_READ_BYTES / 1e6:.0f} MB)")
+                if len(buf) > limit:                           # exports have no size until they are made
+                    raise NotReadable(f"too large to read (over {limit / 1e6:.0f} MB)")
                 if time.monotonic() > deadline:
-                    raise NotReadable(f"too slow to fetch right now (over {READ_BUDGET_SEC:.0f} s)")
+                    raise NotReadable(f"too slow to fetch right now (over {self.read_budget_sec:.0f} s)")
         except NotReadable:
             raise
         except Exception as exc:
@@ -307,7 +302,8 @@ class DriveClient:
                 close()
         return bytes(buf)
 
-    def _blocks(self, meta: dict) -> list[Block]:
+    def blocks(self, meta: dict) -> list[Block]:
+        """The file's text as blocks, not yet scrubbed (raises NotReadable / DriveUnavailable)."""
         data = self._content(meta)
         mime = meta["mimeType"]
         if mime == G + "spreadsheet" or mime == "text/csv":
@@ -320,19 +316,4 @@ class DriveClient:
             return _lines_to_blocks(_docx_text(data))
         if mime == PPTX:
             return _lines_to_blocks(_pptx_text(data))
-        return _lines_to_blocks(data.decode("utf-8", "replace"))
-
-
-def merge(confluence_hits: list[dict], linked: list[dict], found: list[dict], max_drive: int) -> list[dict]:
-    """Confluence hits first, then Drive: files linked from those pages, then Drive's own search hits; each file
-    once, at most `max_drive` of them."""
-    out = [h for h in confluence_hits if h["source"] != "drive"]
-    seen: set[str] = set()
-    drive: list[dict] = []
-    for h in linked + found:
-        if h["id"] in seen or len(drive) >= max_drive:
-            continue
-        seen.add(h["id"])
-        drive.append(h)
-    return out + drive
-
+        return _lines_to_blocks(_INLINE_IMAGE.sub("", data.decode("utf-8", "replace")))

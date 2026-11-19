@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 
 from evil.knowledge.textify import Block, drive_links
 
-CHUNKER_VERSION = "4"      # bump to re-chunk every page on the next pass (4: merged sections keep every heading)
+CHUNKER_VERSION = "5"      # bump to re-chunk every page on the next pass (4: merged sections keep every heading;
+                           # 5: rows carry created + last editor, so every page is read again)
 # credentials pages: title + link only, never their text (filters.skip_reason "credentials title")
 LINK_ONLY_KIND = "credentials_link_only"
 
