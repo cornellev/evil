@@ -1249,3 +1249,29 @@ def test_sql_matches_finds_topics_in_the_text_with_team_spellings(indexed):
     assert rows == [{"title": "UC27 Master Doc"}]
     assert sql_mod.matches("Freshmen Project Specs", "freshman project") == 1
     assert sql_mod.matches("Freshmen Specs", "freshman project") == 0
+
+
+def test_a_missing_alias_error_says_how_to_fix_it(indexed):
+    # seen 11-18: "SELECT title FROM docs WHERE d.id IN (...)" -> "no such column: d.id" plus the whole schema
+    from evil.knowledge.server import create_knowledge_server
+    _, path = indexed
+    server = create_knowledge_server(str(path))
+    fixed = asyncio.run(server.call_tool("knowledge_sql", {"query": "SELECT title FROM docs WHERE d.id = '1'"}))
+    assert "Joulemeter" in fixed.content[0].text                       # d. without docs d: added for it
+    with pytest.raises(Exception, match="write FROM docs x"):
+        asyncio.run(server.call_tool("knowledge_sql", {"query": "SELECT title FROM docs WHERE x.id = '1'"}))
+    ok = asyncio.run(server.call_tool("knowledge_sql", {"query": (
+        "SELECT d.id, d.source, d.title, d.path FROM docs d WHERE d.id IN (SELECT doc_id FROM sections WHERE "
+        "matches(text, 'joulemeter specs'))")}))
+    assert "Joulemeter" in ok.content[0].text
+
+
+def test_undefined_d_and_s_aliases_are_added():
+    # seen 11-18: FROM docs with d.id, three times in a row, until it ran out of steps
+    w = sql_mod.with_aliases
+    assert w("SELECT title FROM docs WHERE d.id = '1'") == "SELECT title FROM docs d WHERE d.id = '1'"
+    assert w("SELECT d.title, s.heading FROM docs JOIN sections ON s.doc_id = d.id") == (
+        "SELECT d.title, s.heading FROM docs d JOIN sections s ON s.doc_id = d.id")
+    for q in ("SELECT d.title FROM docs AS d JOIN sections s ON s.doc_id = d.id", "SELECT title FROM docs",
+              "SELECT d.title FROM docs d"):
+        assert w(q) == q

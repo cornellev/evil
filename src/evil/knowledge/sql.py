@@ -10,6 +10,7 @@ EVIL's read_only_sql guard (one SELECT, a step budget, a row cap); long text val
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime
 from typing import Any
@@ -41,9 +42,10 @@ NOTES = (
     "shortcuts, files), not words of titles.\n"
     "What a doc is about is in its text more than its title (a deck titled 'Onboarding 2' lists the freshman "
     "projects): filter topics with matches(text, 'words'), which ignores case and plurals and knows the team's "
-    "spellings (freshman / freshmen / frosh, elec / electrical): WHERE d.id IN (SELECT doc_id FROM sections WHERE "
-    "matches(text, 'freshman projects')) OR matches(d.title || ' ' || d.path, 'freshman projects'). Never LIKE "
-    "on title words alone for a topic.\n"
+    "spellings (freshman / freshmen / frosh, elec / electrical): SELECT d.id, d.source, d.title, d.path FROM docs d "
+    "WHERE d.path LIKE '%Electrical%' AND (d.id IN (SELECT doc_id FROM sections WHERE matches(text, 'freshman "
+    "projects')) OR matches(d.title || ' ' || d.path, 'freshman projects')). Never LIKE on title words alone for "
+    "a topic.\n"
     "To open a row afterwards with get_document, select its id and source (get_document(source, id)).\n"
     "View sections: doc_id (= docs.id), section_id, heading, text.\n"
     "Compare times with datetime('now', '-14 days'). Examples: what changed on Confluence in the last 2 weeks: SELECT "
@@ -112,6 +114,9 @@ def matches(text: str | None, query: str | None) -> int:
             if len(w) >= 2 and w not in STOPWORDS:
                 need.append({_stem(v) for v in [w, *TEAM_WORDS.get(w, [])]})
         _QUERY_CACHE[query] = need
+    low = text.lower()
+    if not all(any(v in low for v in alts) for alts in need):     # most sections fail here, in C (11-18: 9 s -> <1 s)
+        return 0
     have = _words(text)
     return int(all(alts & have for alts in need))
 
@@ -140,14 +145,40 @@ def _cut(value: Any) -> Any:
     return value
 
 
+def with_aliases(query: str) -> str:
+    """`d.` / `s.` used without defining them get docs d / sections s (seen 11-18: the model wrote FROM docs with
+    d.id three times in a row, error hint and all, and ran out of steps)."""
+    for alias, view in (("d", "docs"), ("s", "sections")):
+        if not re.search(rf"\b{alias}\.\w", query):
+            continue
+        if re.search(rf"\b\w+\s+(?:AS\s+)?{alias}\b(?!\.)", query, re.I) and \
+                re.search(rf"\b{view}\s+(?:AS\s+)?{alias}\b", query, re.I):
+            continue                                  # already defined
+        if re.search(rf"\b(?:FROM|JOIN)\s+\w+\s+(?:AS\s+)?{alias}\b(?!\.)", query, re.I):
+            continue                                  # the alias names something else: leave it to SQLite
+        query, n = re.subn(rf"\b(FROM|JOIN)\s+{view}\b(?!\s+(?:AS\s+)?\w+\s*(?:,|WHERE|JOIN|ON|GROUP|ORDER|"
+                           rf"LIMIT|$))", rf"\1 {view} {alias}", query, count=1, flags=re.I)
+    return query
+
+
 def run(conn: sqlite3.Connection, query: str) -> list[dict[str, Any]]:
     add_views(conn)
+    query = with_aliases(query)
     rows = read_only_sql(conn, query=query, row_limit=ROW_LIMIT)
     return [{k: _cut(v) for k, v in r.items()} for r in rows]
 
 
-def explain(exc: Exception) -> str:
+_ALIAS = re.compile(r"no such column: (\w+)\.\w+")
+
+
+def explain(exc: Exception, query: str = "") -> str:
+    """SQLite's reason, plus what to change: a missing alias names the fix (seen 11-18: "d.id" with FROM docs and no
+    `d`); another unknown name gets the views' columns."""
     msg = str(exc)
+    m = _ALIAS.search(msg)
+    if m and not re.search(rf"\b(?:docs|sections)\s+(?:AS\s+)?{m.group(1)}\b", query, re.I):
+        return (f"{msg}: the query uses the alias {m.group(1)}. but never defines it; write FROM docs {m.group(1)} "
+                f"(or sections {m.group(1)}), or drop the {m.group(1)}. prefix.")
     if "no such table" in msg or "no such column" in msg:
         msg += "\n" + NOTES
     return msg

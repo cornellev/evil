@@ -146,7 +146,7 @@ def create_knowledge_server(db_path: str | None = None, embedder: emb.EmbedClien
             try:
                 return sql_mod.run(conn, query)
             except (ValueError, sqlite3.Error) as exc:   # the reason, so the query can be fixed in one more step
-                raise ToolError(sql_mod.explain(exc)) from exc
+                raise ToolError(sql_mod.explain(exc, query)) from exc
         return await asyncio.to_thread(_with_index, path, run)
 
     @server.custom_route("/healthz", methods=["GET"])
