@@ -7,7 +7,8 @@ Confluence attachments are rows of `pages` too (kind attachment / attachment_lin
 embeddings holds one vector per section for the current embedding model (embeddings.py); it goes with its section.
 Drive files are rows of `pages` with source = 'drive' (drive_index.py; user 11-18, reversing 11-06's "never copied"):
 every file has a row (name, folder path, type, size, dates, last editor), and Docs / Slides / Sheets / PDF / Office /
-text files have their text as sections too.
+text files have their text as sections too. GitHub repos and their docs / readable files are rows with source =
+'github' (github_index.py, 11-19): kind repo (one per repo) and repo_doc (READMEs, docs, text / data files).
 """
 
 from __future__ import annotations
@@ -31,16 +32,17 @@ CREATE TABLE IF NOT EXISTS pages (
     version INTEGER NOT NULL,
     labels TEXT NOT NULL,            -- JSON list
     kind TEXT NOT NULL,              -- page | work_log | meeting_notes | credentials_link_only | attachment[_link_only]
-                                     -- | drive_doc | drive_link_only | drive_media | drive_folder
+                                     -- | drive_doc | drive_link_only | drive_media | drive_folder | repo | repo_doc
     parent TEXT,                     -- attachments: the page they are attached to (deleted with it)
     chunker_version TEXT NOT NULL,
     indexed_at TEXT NOT NULL,
-    source TEXT NOT NULL DEFAULT 'confluence',     -- confluence | drive
+    source TEXT NOT NULL DEFAULT 'confluence',     -- confluence | drive | github
     created TEXT,
     last_editor TEXT,                -- display name
     mime_type TEXT,
     size INTEGER,                    -- bytes (files; Google Docs have none)
-    folder TEXT                      -- Drive: the parent folder's id
+    folder TEXT,                     -- Drive: the parent folder's id
+    sha TEXT                         -- GitHub: the file's blob sha / the repo's head commit (what changed)
 );
 CREATE TABLE IF NOT EXISTS chunks (
     id INTEGER PRIMARY KEY,
@@ -92,7 +94,8 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 
 _ADDED_COLUMNS = [("parent", "TEXT"), ("source", "TEXT NOT NULL DEFAULT 'confluence'"), ("created", "TEXT"),
-                  ("last_editor", "TEXT"), ("mime_type", "TEXT"), ("size", "INTEGER"), ("folder", "TEXT")]
+                  ("last_editor", "TEXT"), ("mime_type", "TEXT"), ("size", "INTEGER"), ("folder", "TEXT"),
+                  ("sha", "TEXT")]
 
 
 def connect_readonly(path: str | Path) -> sqlite3.Connection:
@@ -143,14 +146,14 @@ def upsert_page(conn: sqlite3.Connection, *, page_id: str, title: str, url: str,
                 updated: str, version: int, labels: list[str], kind: str, chunker_version: str, indexed_at: str,
                 chunks: Iterable[Chunk], parent: str | None = None, source: str = "confluence",
                 created: str | None = None, last_editor: str | None = None, mime_type: str | None = None,
-                size: int | None = None, folder: str | None = None) -> int:
+                size: int | None = None, folder: str | None = None, sha: str | None = None) -> int:
     _delete_rows(conn, page_id)           # its attachments stay: they have their own versions
     conn.execute(
         "INSERT INTO pages (id, title, url, space, breadcrumb, updated, version, labels, kind, chunker_version,"
-        " indexed_at, parent, source, created, last_editor, mime_type, size, folder)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " indexed_at, parent, source, created, last_editor, mime_type, size, folder, sha)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (page_id, title, url, space, json.dumps(breadcrumb), updated, version, json.dumps(labels), kind,
-         chunker_version, indexed_at, parent, source, created, last_editor, mime_type, size, folder),
+         chunker_version, indexed_at, parent, source, created, last_editor, mime_type, size, folder, sha),
     )
     n = 0
     for c in chunks:
@@ -195,8 +198,10 @@ def stats(conn: sqlite3.Connection) -> dict:
     try:
         pages = conn.execute("SELECT count(*) FROM pages WHERE parent IS NULL AND source = 'confluence'").fetchone()[0]
         drive = dict(conn.execute("SELECT kind, count(*) FROM pages WHERE source = 'drive' GROUP BY kind").fetchall())
+        github = dict(conn.execute("SELECT kind, count(*) FROM pages WHERE source = 'github' GROUP BY kind").fetchall())
     except sqlite3.OperationalError:      # read-only server on an index from before Drive
         pages, drive = conn.execute("SELECT count(*) FROM pages WHERE parent IS NULL").fetchone()[0], {}
+        github = {}
     try:
         attachments = conn.execute("SELECT count(*) FROM pages WHERE parent IS NOT NULL").fetchone()[0]
     except sqlite3.OperationalError:      # read-only server on an index from before phase 6
@@ -213,6 +218,7 @@ def stats(conn: sqlite3.Connection) -> dict:
         "pages": pages,
         "attachments": attachments,
         "drive": drive,
+        "github": github,
         "chunks": chunks,
         "embedded": {m: n for m, n in embedded},
         "last_run": dict(last) if last else None,

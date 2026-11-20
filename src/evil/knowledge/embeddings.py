@@ -104,7 +104,7 @@ def normalize(m: np.ndarray) -> np.ndarray:
 def pending(conn: sqlite3.Connection, model: str, limit: int | None = None) -> list[sqlite3.Row]:
     sql = """SELECT c.id, c.heading, c.text, p.title, p.breadcrumb FROM chunks c JOIN pages p ON p.id = c.page_id
              LEFT JOIN embeddings e ON e.chunk_id = c.id AND e.model = ?
-             WHERE e.chunk_id IS NULL AND (p.source = 'confluence' OR p.kind = 'drive_doc') ORDER BY c.id"""
+             WHERE e.chunk_id IS NULL AND (p.source = 'confluence' OR p.kind IN ('drive_doc', 'repo', 'repo_doc')) ORDER BY c.id"""
     # Drive rows without text (a file's name, type and folder) are found by keyword only: 10k+ names like
     # "IMG_2041.jpg" or "chassis v3.SLDPRT" would crowd the meaning-based matches
     rows = conn.execute(sql + (f" LIMIT {int(limit)}" if limit else ""), (model,)).fetchall()

@@ -133,6 +133,10 @@ services:
       # Google Drive (drive.py): the service account key, root-owned mode 600 in ./secrets (not in git). No key file =
       # Drive off. Here it reads a file live whose text the indexer hasn't read yet; the indexer mounts it too (11-18).
       KNOWLEDGE_DRIVE_KEY_FILE: /run/secrets/knowledge/drive-key.json
+      # GitHub (github.py): the read-only App's ids (not secret) and its key, root-owned mode 600 in ./secrets
+      KNOWLEDGE_GITHUB_APP_ID: ${KNOWLEDGE_GITHUB_APP_ID:-}
+      KNOWLEDGE_GITHUB_INSTALLATION_ID: ${KNOWLEDGE_GITHUB_INSTALLATION_ID:-}
+      KNOWLEDGE_GITHUB_KEY_FILE: /run/secrets/knowledge/github-app.pem
     volumes:
       - knowledge-data:/knowledge
       - ./secrets:/run/secrets/knowledge:ro
@@ -180,6 +184,10 @@ services:
       KNOWLEDGE_EMBED_MODEL: ${KNOWLEDGE_EMBED_MODEL:-embeddinggemma}
       # The shared Drive into the index (drive_index.py, user 11-18): the same key, read-only
       KNOWLEDGE_DRIVE_KEY_FILE: /run/secrets/knowledge/drive-key.json
+      # GitHub (github.py): the read-only App's ids (not secret) and its key, root-owned mode 600 in ./secrets
+      KNOWLEDGE_GITHUB_APP_ID: ${KNOWLEDGE_GITHUB_APP_ID:-}
+      KNOWLEDGE_GITHUB_INSTALLATION_ID: ${KNOWLEDGE_GITHUB_INSTALLATION_ID:-}
+      KNOWLEDGE_GITHUB_KEY_FILE: /run/secrets/knowledge/github-app.pem
     volumes:
       - knowledge-data:/knowledge
       - ./secrets:/run/secrets/knowledge:ro

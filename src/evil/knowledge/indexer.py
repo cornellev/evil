@@ -23,6 +23,9 @@
 - **Drive** (after Confluence, drive_index.py, user 11-18): every file's metadata, and the text of the readable ones,
   on the same schedule (full listing with the nightly full pass). Needs the Drive key (KNOWLEDGE_DRIVE_KEY_FILE,
   mounted read-only like the server's); no key = Confluence only.
+- **GitHub** (after Drive, github_index.py, 11-19): the org's repos and their READMEs / docs / readable files, through
+  the read-only GitHub App (KNOWLEDGE_GITHUB_APP_ID, KNOWLEDGE_GITHUB_INSTALLATION_ID, KNOWLEDGE_GITHUB_KEY_FILE);
+  per repo only when its default branch moved. No App = no repos.
 
 Only this process has the Confluence token (KNOWLEDGE_CONFLUENCE_TOKEN, from the NUC's knowledge.env). Logs carry
 ids, titles and counts, never page text.
@@ -44,6 +47,8 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from evil.knowledge import drive_index
+from evil.knowledge import github_index
+from evil.knowledge.github import GitHubClient
 from evil.knowledge import embeddings as emb
 from evil.knowledge.drive import READ_BUDGET_SEC, DriveClient
 from evil.knowledge import store
@@ -313,6 +318,9 @@ def main(argv: list[str] | None = None) -> int:
     drive = DriveClient(retry_after_sec=0, read_budget_sec=max(READ_BUDGET_SEC, 120))
     if not drive.enabled:
         logger.info("no Drive key (KNOWLEDGE_DRIVE_KEY_FILE): Confluence only")
+    github = GitHubClient()
+    if not github.enabled:
+        logger.info("no GitHub App (KNOWLEDGE_GITHUB_APP_ID / _INSTALLATION_ID / _KEY_FILE): no repos")
     if not embedder.enabled:
         logger.info("KNOWLEDGE_EMBED_URL not set: no embeddings, search stays keyword-only")
 
@@ -337,11 +345,17 @@ def main(argv: list[str] | None = None) -> int:
                         "unreadable %d, pending %d, scrubbed %d; %d request(s)%s", d.mode, d.listed, d.indexed,
                         d.unchanged, d.moved, d.removed, d.read, d.unreadable, d.pending, d.scrubbed, d.requests,
                         f", error: {d.error}" if d.error else "")
+        if github.enabled:
+            g = github_index.sync_github(conn, github, full=full, now=now)
+            logger.info("github %s pass: %d repo(s) (%d unchanged, %d forks skipped), %d readable file(s): indexed %d, "
+                        "unchanged %d, removed %d, scrubbed %d; %d request(s)%s%s", g.mode, g.repos, g.repos_unchanged,
+                        g.forks_skipped, g.files, g.indexed, g.unchanged, g.removed, g.scrubbed, g.requests,
+                        f", truncated trees: {g.truncated}" if g.truncated else "", f", error: {g.error}" if g.error else "")
         if embedder.enabled:
             done, left = emb.embed_pending(conn, embedder)
             logger.info("embeddings (%s): %d section(s) embedded, %d pending", embedder.model, done, left)
         if args.once:
-            return 1 if r.error or (drive.enabled and d.error) else 0
+            return 1 if r.error or (drive.enabled and d.error) or (github.enabled and g.error) else 0
         time.sleep(args.interval_sec)
 
 

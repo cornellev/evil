@@ -18,6 +18,9 @@
   get_document), "drive_link_only" (CAD, archives, big files: name, type, folder, link) or "drive_folder"; photos and
   video have no sections, so search never returns them (knowledge_sql lists them). Copies of one file ("X", "X.pdf",
   "X.pdf(1)", "Copy of X") collapse to the best-ranked one.
+- GitHub (indexed since 11-19, github_index.py) ranks with them too, plain for now (roadmap 3a: measured with probe
+  questions before any tuning): kind "repo" (one per repo: description, language, topics) and "repo_doc" (READMEs at
+  every level, docs, text / data files); the breadcrumb is [repo, folders...].
 - Drive links found in the returned sections are listed after them (the file's indexed name and kind when it's in
   the index, else the link text), unless the file is already a hit.
 """
@@ -34,7 +37,7 @@ TITLE_WEIGHT, HEADING_WEIGHT, TEXT_WEIGHT = 8.0, 3.0, 1.0
 # attachments a little below pages, so a page usually ranks above the files attached to it
 KIND_FACTOR = {"page": 1.0, "work_log": 0.5, "meeting_notes": 0.6, "credentials_link_only": 1.0,
                "attachment": 0.9, "attachment_link_only": 0.9, "drive_doc": 0.95, "drive_link_only": 0.7,
-               "drive_folder": 0.7}
+               "drive_folder": 0.7, "repo": 1.0, "repo_doc": 0.95}
 LINK_ONLY_NOTE = ("This page holds team credentials, so its contents are not available here. Give the user the "
                   "link; Confluence decides who can open it.")
 TITLE_BOOST = 0.5           # x(1 + TITLE_BOOST * share of query words in the title)
@@ -298,7 +301,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 5, sources: list[s
            vectors=None, query_vec=None) -> list[dict[str, Any]]:
     """Keyword search, fused with meaning-based matches when `vectors` (embeddings.VectorIndex) and the query's
     `query_vec` are given; without them (embedder off or down) it is the keyword ranking alone."""
-    sources = [s.lower() for s in (sources or ["confluence", "drive"])]
+    sources = [s.lower() for s in (sources or ["confluence", "drive", "github"])]
     limit = max(1, min(int(limit), MAX_LIMIT))
     now = now or datetime.now(timezone.utc)
     ranked = _keyword_ranked(conn, query, glossary, now)

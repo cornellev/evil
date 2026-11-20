@@ -26,12 +26,13 @@ VALUE_MAX_CHARS = 600
 
 NOTES = (
     "One read-only SQL SELECT (SQLite) over the team's docs index: Confluence (the cev space: pages and files attached "
-    "to them) and the team's shared Google Drive (every file and folder). Use it for lists, counts, dates and people: "
+    "to them), the team's shared Google Drive (every file and folder) and the team's GitHub repos (one row per repo, "
+    "and their READMEs, docs and text / data files; not code: use search_code / get_document for code). Use it for lists, counts, dates and people: "
     "what changed or is new in a time window, who last edited something, everything in a folder or about a topic, "
     "how many. For how / why questions use search_team_knowledge instead.\n"
-    "View docs: id, source ('confluence' | 'drive'), title, url, path (folders or parent pages, 'A > B'), kind "
+    "View docs: id, source ('confluence' | 'drive' | 'github'), title, url, path (folders or parent pages, 'A > B'), kind "
     "('page', 'work_log', 'meeting_notes', 'attachment', 'credentials' on Confluence; 'file', 'photo', 'video', "
-    "'folder' on Drive), type ('Google Doc', 'Google Slides', 'PDF', 'photo', 'SLDPRT file', ...), "
+    "'folder' on Drive; 'repo', 'repo_file' on GitHub), repo (GitHub: the repo name), private (1 = a private repo), type ('Google Doc', 'Google Slides', 'PDF', 'photo', 'SLDPRT file', ...), "
     "created, modified (UTC 'YYYY-MM-DD HH:MM:SS'), created_local, modified_local (America/New_York), last_editor "
     "(a person's name), size_bytes, sections (how many text sections).\n"
     "type says what a file is: slides / decks = type IN ('Google Slides', 'PowerPoint'), sheets = 'Google Sheet', "
@@ -46,6 +47,13 @@ NOTES = (
     "WHERE d.path LIKE '%Electrical%' AND (d.id IN (SELECT doc_id FROM sections WHERE matches(text, 'freshman "
     "projects')) OR matches(d.title || ' ' || d.path, 'freshman projects')). Never LIKE on title words alone for "
     "a topic.\n"
+    "GitHub: modified / last_editor of a repo_file are its last commit; of a repo, its last commit on the default branch. "
+    "Repos and their docs: SELECT title, modified_local, url FROM docs WHERE kind = 'repo' ORDER BY modified DESC; repos "
+    "about a topic (their names, descriptions and READMEs; docs has no text column): SELECT DISTINCT d.repo, r.url FROM "
+    "docs d JOIN docs r ON r.kind = 'repo' AND r.title = d.repo WHERE d.source = 'github' AND (matches(d.title, 'lidar') "
+    "OR d.id IN (SELECT doc_id FROM sections WHERE matches(text, 'lidar'))); a repo's "
+    "READMEs: SELECT title, url FROM docs WHERE repo = 'evil' AND title LIKE '%README%'. For commits, pull requests and "
+    "issues use repo_activity.\n"
     "To open a row afterwards with get_document, select its id and source (get_document(source, id)).\n"
     "View sections: doc_id (= docs.id), section_id, heading, text.\n"
     "Compare times with datetime('now', '-14 days'). Examples: what changed on Confluence in the last 2 weeks: SELECT "
@@ -67,6 +75,7 @@ _KIND = """CASE p.kind
     WHEN 'attachment_link_only' THEN 'attachment' WHEN 'credentials_link_only' THEN 'credentials'
     WHEN 'drive_doc' THEN 'file' WHEN 'drive_link_only' THEN 'file' WHEN 'drive_folder' THEN 'folder'
     WHEN 'drive_media' THEN CASE WHEN p.mime_type LIKE 'video/%' THEN 'video' ELSE 'photo' END
+    WHEN 'repo_doc' THEN 'repo_file'
     ELSE p.kind END"""
 
 
@@ -90,6 +99,8 @@ def _path(breadcrumb: str | None) -> str:
 def _type(mime: str | None, name: str | None, source: str) -> str | None:
     if source == "confluence" and not mime:
         return "Confluence page"
+    if source == "github":
+        return "GitHub repo" if "/" not in (name or "") else kind_label(None, name or "")
     return kind_label(mime, name or "")
 
 
@@ -132,6 +143,9 @@ def add_views(conn: sqlite3.Connection) -> None:
                datetime(p.created) AS created, datetime(p.updated) AS modified,
                local_time(p.created) AS created_local, local_time(p.updated) AS modified_local,
                p.last_editor, p.size AS size_bytes,
+               CASE WHEN p.source = 'github' THEN
+                   CASE WHEN p.kind = 'repo' THEN p.title ELSE json_extract(p.breadcrumb, '$[0]') END END AS repo,
+               CASE WHEN p.labels LIKE '%"private"%' THEN 1 ELSE 0 END AS private,
                (SELECT COUNT(*) FROM chunks c WHERE c.page_id = p.id AND c.text != '') AS sections
         FROM pages p""")
     conn.execute("""CREATE TEMP VIEW IF NOT EXISTS sections AS
