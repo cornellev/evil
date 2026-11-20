@@ -131,6 +131,35 @@ class GitHubClient:
                 time.sleep(self.retry_sec * 2 ** attempt)
         raise GitHubUnavailable(f"GET {path}: {last}")
 
+    def graphql(self, query: str, variables: dict) -> dict:
+        """One GraphQL query (blame has no REST endpoint). Read-only: queries only, never mutations."""
+        if query.lstrip().lower().startswith("mutation"):
+            raise ValueError("read-only: no mutations")
+        headers = {**_HEADERS, "Authorization": f"Bearer {self._installation_token()}"}
+        last = ""
+        for attempt in range(RETRIES):
+            try:
+                r = self._sess().post(f"{API}/graphql", json={"query": query, "variables": variables},
+                                      headers=headers, timeout=TIMEOUT_SEC)
+            except Exception as exc:
+                last = f"{type(exc).__name__}: {exc}"
+            else:
+                self.requests_made += 1
+                if r.status_code < 300:
+                    body = r.json()
+                    if body.get("errors"):
+                        msg = "; ".join(str(e.get("message")) for e in body["errors"])[:200]
+                        if "Could not resolve" in msg or "NOT_FOUND" in str(body["errors"]):
+                            raise NotFound(msg)
+                        raise GitHubUnavailable(f"GraphQL: {msg}")
+                    return body.get("data") or {}
+                last = str(r.status_code)
+                if r.status_code < 500 and r.status_code not in (403, 429):
+                    raise GitHubUnavailable(f"GraphQL: {last}")
+            if attempt + 1 < RETRIES:
+                time.sleep(self.retry_sec * 2 ** attempt)
+        raise GitHubUnavailable(f"GraphQL: {last}")
+
     def get_text_matches(self, path: str, params: dict) -> Any:
         """A search with the matching fragments (code search)."""
         return self.get(path, params, accept="application/vnd.github.text-match+json")

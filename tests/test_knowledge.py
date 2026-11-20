@@ -403,12 +403,13 @@ def test_get_document_whole_page_section_and_unknown(indexed):
 
 # ---------------------------------------------------------------- server
 
-def test_server_exposes_exactly_five_tools(indexed):
+def test_server_exposes_exactly_six_tools(indexed):
     from evil.knowledge.server import create_knowledge_server
     _, path = indexed
     server = create_knowledge_server(str(path))
     names = {t.name for t in asyncio.run(server.list_tools())}
-    assert names == {"search_team_knowledge", "get_document", "knowledge_sql", "repo_activity", "search_code"}
+    assert names == {"search_team_knowledge", "get_document", "knowledge_sql", "repo_activity", "search_code",
+                     "repo_changes"}
 
     result = asyncio.run(server.call_tool("search_team_knowledge", {"query": "joulemeter specs"}))
     assert "Joulemeter" in result.content[0].text
