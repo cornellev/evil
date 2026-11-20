@@ -62,7 +62,10 @@ class FakeGitHub:
 
 def test_which_files_are_indexed():
     assert gi.readable("README.md", 10) and gi.readable("a/b/readme.rst", 10) and gi.readable("docs/x.md", 10)
-    assert gi.readable("data/laps.csv", 10) and gi.readable("config/robot.yaml", 10)
+    assert gi.readable("data/laps.csv", 10) and gi.readable("docs/api.yaml", 10) and gi.readable("notes.txt", 10)
+    for path in ("config/robot.yaml", "chuds/examples/CMakeLists.txt", "Cargo.toml", "package.json", "pyproject.toml",
+                 "requirements-dev.txt", ".github/copilot-instructions.md", "tsconfig.base.json"):
+        assert not gi.readable(path, 10), path       # build / config manifests (11-19: they outranked real docs)
     assert not gi.readable("src/evil/telemetry.py", 10)                  # code: the live tools read it
     for path in ("node_modules/x/README.md", "build/notes.md", "package-lock.json", "LICENSE.txt", "app.min.json",
                  ".eslintrc.json"):
@@ -289,3 +292,41 @@ def test_code_search_falls_back_to_the_repos_own_files_when_githubs_index_misses
     assert [h["path"] for h in hits] == ["src/evil/telemetry.py"] and "def setup_tracing" in hits[0]["fragments"][0]
     note = _data(_call(server, "search_code", {"query": "setup_tracing"}))
     assert "repo set" in note[0]["note"]
+
+
+def test_a_left_out_repo_is_never_indexed_or_read(gdb, tmp_path, monkeypatch):
+    monkeypatch.setattr(gh, "SKIP_REPOS", frozenset({"evil"}))
+    r = gi.sync_github(gdb, FakeGitHub(), now=NOW)
+    assert r.repos == 0 and gdb.execute("SELECT count(*) FROM pages WHERE source = 'github'").fetchone()[0] == 0
+    server = server_mod.create_knowledge_server(str(tmp_path / "k.db"), github=LiveFake())
+    for tool, args in (("repo_activity", {"repo": "evil"}), ("get_document", {"source": "github", "id": "evil/README.md"}),
+                       ("search_code", {"query": "x", "repo": "cornellev/evil"})):
+        with pytest.raises(Exception, match="left out"):
+            _call(server, tool, args)
+    hits = _data(_call(server, "search_code", {"query": "parse_can"}))
+    assert all(h.get("repo") != "cornellev/evil" for h in hits)   # org-wide hits in it are dropped
+
+
+def test_one_repo_folder_cant_fill_the_results(gdb):
+    fake = FakeGitHub()
+    for name in ("a.md", "b.md", "c.md", "d.md"):
+        fake.files[f"lib/chuds/{name}"] = b"# chuds\n\nchuds serialization notes\n"
+        fake.shas[f"lib/chuds/{name}"] = name
+    gi.sync_github(gdb, fake, now=NOW)
+    gdb.commit()
+    hits = search_mod.search(gdb, "chuds serialization", limit=5)
+    assert sum(1 for h in hits if h["breadcrumb"][:3] == ["evil", "lib", "chuds"]) == 2
+
+
+def test_activity_with_no_repo_names_every_repo_pushed(tmp_path):
+    import re as re_mod
+
+    class Many(LiveFake):
+        def repos(self):
+            return iter([dict(REPO, name=f"r{i}", full_name=f"cornellev/r{i}", html_url=f"u{i}",
+                              pushed_at="2099-01-01T00:00:00Z") for i in range(12)])
+
+        def get(self, path, params=None, raw=False, accept=None):       # every repo answers like evil
+            return LiveFake.get(self, re_mod.sub(r"^/repos/cornellev/r\d+", "/repos/cornellev/evil", path), params)
+    out = _data(_call(server_mod.create_knowledge_server(str(tmp_path / "k.db"), github=Many()), "repo_activity", {}))
+    assert len(out["all_repos_pushed"]) == 12 and out["detailed"] == server_mod.MAX_ACTIVE_REPOS

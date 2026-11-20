@@ -564,9 +564,13 @@ def get_recording(conn: sqlite3.Connection, recording_id: str) -> dict | None:
 def list_recordings(conn: sqlite3.Connection, *, since: float | None = None, until: float | None = None,
                     category: str | None = None, car: str | None = None, parse_status: str | None = None,
                     source: str | None = None, kind: str | None = None, location_id: int | None = None,
-                    limit: int = 100, offset: int = 0) -> list[dict]:
-    """kind: 'upload' | 'live_capture' (None = both)."""
+                    limit: int = 100, offset: int = 0, name: str | None = None) -> list[dict]:
+    """kind: 'upload' | 'live_capture' (None = both). name: part of the label, file name or run id (any case)."""
     where, args = [], []
+    if name and name.strip():
+        like = f"%{name.strip().lower()}%"
+        where.append("(lower(label) LIKE ? OR lower(original_name) LIKE ? OR lower(COALESCE(run_id, '')) LIKE ?)")
+        args += [like, like, like]
     when = "COALESCE(recorded_start, uploaded_at)"
     if since is not None:
         where.append(f"{when} >= ?"); args.append(since)

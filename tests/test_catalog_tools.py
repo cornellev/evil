@@ -73,6 +73,15 @@ def test_list_recordings_gives_enough_detail_to_tell_candidates_apart(cat, popul
     assert catalog_tools.list_recordings(None) == []
 
 
+def test_list_recordings_finds_one_by_name(cat, populated):
+    # 11-19: "the run3_power test bag" was past the newest 50 once live captures piled up
+    rows = catalog_tools.list_recordings(cat)
+    label = rows[-1]["label"]
+    found = catalog_tools.list_recordings(cat, name=label[1:-1].upper())
+    assert [r["recording_id"] for r in found] == [rows[-1]["recording_id"]]
+    assert catalog_tools.list_recordings(cat, name="no-such-recording") == []
+
+
 def test_list_recordings_filters_by_location_name(cat, populated):
     run, _, later = populated
     blot = catalog.add_location(cat, "B Lot", 42.446254, -76.46319, 300.0, default_category="b_lot")

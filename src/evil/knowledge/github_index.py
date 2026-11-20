@@ -8,7 +8,8 @@ and nested readmes, and other readable files like reasonable sized txt/csv").
   = [repo, dirs...], so a nested README ranks by where it sits; url = the file on GitHub at the default branch;
   modified / last editor = the last commit that touched it. Same credential scrub and chunker as Confluence / Drive.
 - **Left out:** source code (3b's live tools read it), vendored / generated / build folders, lockfiles, minified
-  files, licenses, anything over the size cap, and forks (copies of other people's projects, not team docs).
+  files, licenses, anything over the size cap, forks (copies of other people's projects, not team docs), and the
+  repos in KNOWLEDGE_GITHUB_SKIP_REPOS (CEVWiki, user 11-19).
 - **Incremental:** per repo, the default branch's head commit. When it moved, the tree says which files changed (blob
   sha); only those are read. A full pass (nightly with Confluence and Drive, or after GITHUB_VERSION / the chunker
   changes) re-lists everything and removes repos and files that are gone.
@@ -34,11 +35,12 @@ from evil.knowledge.chunker import CHUNKER_VERSION, LINK_ONLY_KIND, Chunk, chunk
 from evil.knowledge.extract import _lines_to_blocks
 from evil.knowledge.filters import CREDENTIAL_TITLE, scrub
 from evil.knowledge.github import MAX_FILE_BYTES, GitHubClient, GitHubUnavailable, NotFound
+from evil.knowledge.github import skipped as gh_skipped
 from evil.knowledge.textify import Block
 
 logger = logging.getLogger("evil.knowledge.github_index")
 
-GITHUB_VERSION = "1"        # bump to re-read every repo file on the next pass
+GITHUB_VERSION = "2"        # bump to re-read every repo file on the next pass (2: build / config manifests dropped)
 BUDGET_SEC = float(os.getenv("KNOWLEDGE_GITHUB_BUDGET_SEC", "900"))
 MAX_ROWS = 300              # CSV / TSV rows kept, like Drive sheets
 README = re.compile(r"^readme(\.[a-z0-9]+)?$", re.I)
@@ -49,6 +51,15 @@ SKIP_DIRS = {"node_modules", "vendor", "vendors", "third_party", "third-party", 
 LOCKFILES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "cargo.lock", "uv.lock",
              "pipfile.lock", "composer.lock", "gemfile.lock", "go.sum", "flake.lock", "npm-shrinkwrap.json"}
 NOISE = re.compile(r"(\.min\.\w+$|^(license|licence|copying|notice)(\.\w+)?$|^\.)", re.I)
+# Build and config manifests carry the folder's name in their path but say nothing a person asks about (seen 11-19:
+# three chuds CMakeLists.txt files outranked the Confluence CHUDS page and became the answer's sources).
+MANIFESTS = re.compile(r"^(cmakelists\.txt|requirements([-_.].*)?\.txt|constraints\.txt|.*\.cmake|"
+                       r"(cargo|pyproject|poetry|setup|tsconfig|jsconfig|package|composer|deno|bunfig|"
+                       r"\.?eslintrc|\.?prettierrc|renovate|dependabot|codecov|mkdocs|netlify|vercel|"
+                       r"docker-compose|compose|pnpm-workspace|turbo|nx|lerna|angular|firebase)([-_.].*)?\."
+                       r"(json|toml|ya?ml|cfg|txt))$", re.I)
+CONFIG_EXT = {".json", ".yaml", ".yml", ".toml"}      # kept only in docs folders: elsewhere they are config
+DOC_DIRS = {"docs", "doc", "documentation", "wiki", "guides", "manual"}
 
 
 @dataclass
@@ -74,15 +85,17 @@ def state() -> str:
 def readable(path: str, size: int | None) -> bool:
     """A file worth indexing: a README anywhere, or a docs / text / data file, outside vendored and build folders."""
     p = PurePosixPath(path)
-    if any(part.lower() in SKIP_DIRS for part in p.parts[:-1]):
+    if any(part.lower() in SKIP_DIRS or part.startswith(".") for part in p.parts[:-1]):   # .github/, .devcontainer/
         return False
     name = p.name.lower()
     if name in LOCKFILES or (size or 0) > MAX_FILE_BYTES or not size:
         return False
     if README.match(p.name):
         return True
-    if NOISE.search(p.name):
+    if NOISE.search(p.name) or MANIFESTS.match(p.name):
         return False
+    if p.suffix.lower() in CONFIG_EXT:
+        return any(part.lower() in DOC_DIRS for part in p.parts[:-1])
     return p.suffix.lower() in TEXT_EXT
 
 
@@ -245,7 +258,7 @@ def sync_github(conn, client: GitHubClient, full: bool | None = None, now: datet
         listed = set()
         finished = True
         for repo in sorted(repos, key=lambda r: r.get("pushed_at") or "", reverse=True):   # active repos first
-            if repo.get("fork"):
+            if repo.get("fork") or gh_skipped(repo["full_name"]):
                 result.forks_skipped += 1
                 continue
             listed.add(repo_id(repo["full_name"]))

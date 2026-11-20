@@ -90,10 +90,13 @@ PART_CHARS = 12_000
 
 
 def _repo_name(repo: str) -> str:
-    """"evil", "cornellev/evil" or a GitHub URL -> "cornellev/evil"."""
+    """"evil", "cornellev/evil" or a GitHub URL -> "cornellev/evil". A left-out repo is refused."""
     repo = repo.strip().removeprefix("https://github.com/").strip("/")
     parts = repo.split("/")
-    return "/".join(parts[:2]) if len(parts) >= 2 else f"{ORG}/{repo}"
+    full = "/".join(parts[:2]) if len(parts) >= 2 else f"{ORG}/{repo}"
+    if gh.skipped(full):
+        raise ToolError(f"{full} is left out of what the assistant reads")
+    return full
 
 
 def _clean(text: str) -> str:
@@ -120,7 +123,7 @@ def _live_github(client: gh.GitHubClient, file_id: str, section) -> dict | None:
     target = str(file_id).strip().removeprefix("gh:").removeprefix("https://github.com/")
     m = re.match(r"^([^/:]+/[^/:]+)[:/](?:blob/([^/]+)/)?(.+)$", target)
     if m and m.group(1).lower().startswith(ORG.lower() + "/"):
-        full, ref, rel = m.group(1), m.group(2), m.group(3)
+        full, ref, rel = _repo_name(m.group(1)), m.group(2), m.group(3)
     else:
         repo, _, rel = target.partition("/")
         full = _repo_name(repo)
@@ -188,6 +191,10 @@ def _activity(client: gh.GitHubClient, repo: str | None, days: int) -> dict:
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         out = list(pool.map(one, names))
+    if not repo:     # every repo pushed in the window, not only the ones detailed (seen 11-19: 5 named of ~20)
+        return {"since": since, "days": days, "all_repos_pushed": [{"repo": r["full_name"], "pushed": r.get("pushed_at"),
+                                                                     "url": r["html_url"]} for r in repos],
+                "detailed": len(out), "repos": out}
     return {"since": since, "days": days, "repos": out}
 
 
@@ -245,6 +252,8 @@ def _code_search(client: gh.GitHubClient, query: str, repo: str | None) -> list[
     body = client.get_text_matches("/search/code", {"q": q, "per_page": 10})
     hits = []
     for item in body.get("items", []):
+        if gh.skipped(item["repository"]["full_name"]):
+            continue
         frags = [_clean(m.get("fragment") or "") for m in item.get("text_matches") or []]
         hits.append({"repo": item["repository"]["full_name"], "path": item["path"], "url": item["html_url"],
                      "fragments": [f for f in frags if f.strip()][:3]})
@@ -357,7 +366,8 @@ def create_knowledge_server(db_path: str | None = None, embedder: emb.EmbedClien
         """What happened on the team's GitHub lately: for `repo` ("evil" or "cornellev/evil"), or with no repo for
         every repo pushed in the window (most active first): commits on the default branch (date, author, message),
         pull requests merged in the window, open pull requests and open issues, each with its link. `days`: the
-        window (default 14, at most 90). For "what changed", "open PRs", "what is X working on in code"."""
+        window (default 14, at most 90). For "what changed", "open PRs", "what is X working on in code". With no repo,
+        all_repos_pushed lists every repo pushed in the window; the most active ones are detailed in repos."""
         if not github.enabled:
             raise ToolError("GitHub is not connected here")
         try:

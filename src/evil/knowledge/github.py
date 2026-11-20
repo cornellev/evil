@@ -28,6 +28,15 @@ RETRIES = 3
 BACKOFF_SEC = 5.0
 TOKEN_MARGIN_SEC = 300          # refresh the installation token this long before it expires
 PER_PAGE = 100
+# Repos left out of everything (index and live tools), by name, comma-separated (user 11-19: CEVWiki, an old wiki
+# that overlaps Confluence).
+SKIP_REPOS = frozenset(n.strip().lower() for n in os.getenv("KNOWLEDGE_GITHUB_SKIP_REPOS", "").split(",") if n.strip())
+
+
+def skipped(full_name: str) -> bool:
+    return full_name.split("/")[-1].lower() in SKIP_REPOS
+
+
 MAX_FILE_BYTES = int(os.getenv("KNOWLEDGE_GITHUB_MAX_BYTES", str(200 * 1024)))
 _HEADERS = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "cev-knowledge"}
@@ -140,7 +149,7 @@ class GitHubClient:
     # ---- what the indexer and the live tools use -----------------------------------------------------------------
 
     def repos(self) -> Iterator[dict]:
-        return self.pages("/installation/repositories", key="repositories")
+        return (r for r in self.pages("/installation/repositories", key="repositories") if not skipped(r["full_name"]))
 
     def head(self, full_name: str, branch: str) -> dict:
         """The default branch's head commit: {sha, date, tree}."""

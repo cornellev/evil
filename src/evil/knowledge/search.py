@@ -57,6 +57,7 @@ KEYWORD_WEIGHT_FLOOR = 0.2
 COVERAGE_POWER = 2.0
 MAX_LIMIT = 10
 MAX_DRIVE_LINKS = 3
+GITHUB_PER_FOLDER = 2
 DOCUMENT_MAX_CHARS = 12_000
 
 STOPWORDS = set("""
@@ -308,6 +309,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 5, sources: list[s
     if vectors is not None and query_vec is not None:
         ranked = fuse(ranked, _vector_ranked(conn, vectors, query_vec, query), keyword_coverage(conn, query, ranked))
     picked, copies = [], set()
+    folders: dict[str, int] = {}
     for score, r in ranked:
         if r["source"] not in sources:
             continue
@@ -316,6 +318,13 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 5, sources: list[s
             if key in copies:
                 continue
             copies.add(key)
+        if r["source"] == "github":
+            # at most GITHUB_PER_FOLDER files of one repo folder (seen 11-19: five car/cev-lib/chuds files filled
+            # the list and pushed out the Confluence CHUDS page)
+            folder = " > ".join(json.loads(r["breadcrumb"])[:3])
+            if folders.get(folder, 0) >= GITHUB_PER_FOLDER:
+                continue
+            folders[folder] = folders.get(folder, 0) + 1
         picked.append((score, r))
         if len(picked) >= limit:
             break

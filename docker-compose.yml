@@ -136,6 +136,7 @@ services:
       # GitHub (github.py): the read-only App's ids (not secret) and its key, root-owned mode 600 in ./secrets
       KNOWLEDGE_GITHUB_APP_ID: ${KNOWLEDGE_GITHUB_APP_ID:-}
       KNOWLEDGE_GITHUB_INSTALLATION_ID: ${KNOWLEDGE_GITHUB_INSTALLATION_ID:-}
+      KNOWLEDGE_GITHUB_SKIP_REPOS: ${KNOWLEDGE_GITHUB_SKIP_REPOS:-}
       KNOWLEDGE_GITHUB_KEY_FILE: /run/secrets/knowledge/github-app.pem
     volumes:
       - knowledge-data:/knowledge
@@ -187,6 +188,7 @@ services:
       # GitHub (github.py): the read-only App's ids (not secret) and its key, root-owned mode 600 in ./secrets
       KNOWLEDGE_GITHUB_APP_ID: ${KNOWLEDGE_GITHUB_APP_ID:-}
       KNOWLEDGE_GITHUB_INSTALLATION_ID: ${KNOWLEDGE_GITHUB_INSTALLATION_ID:-}
+      KNOWLEDGE_GITHUB_SKIP_REPOS: ${KNOWLEDGE_GITHUB_SKIP_REPOS:-}
       KNOWLEDGE_GITHUB_KEY_FILE: /run/secrets/knowledge/github-app.pem
     volumes:
       - knowledge-data:/knowledge

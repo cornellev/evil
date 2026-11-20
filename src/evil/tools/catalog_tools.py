@@ -28,6 +28,7 @@ def list_recordings(
     location: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    name: str | None = None,
 ) -> list[dict[str, Any]]:
     """Recordings, newest first, with enough detail to tell them apart. Several
     candidates are returned on purpose: the caller should list them and ask
@@ -45,7 +46,7 @@ def list_recordings(
         location_id = matches[0]
     rows = catalog.list_recordings(
         conn, since=since, until=until, category=category, car=car, parse_status=parse_status,
-        location_id=location_id, limit=limit, offset=offset,
+        location_id=location_id, limit=limit, offset=offset, name=name,
     )
     out = []
     for row in rows:

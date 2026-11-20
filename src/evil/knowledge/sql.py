@@ -54,6 +54,8 @@ NOTES = (
     "OR d.id IN (SELECT doc_id FROM sections WHERE matches(text, 'lidar'))); a repo's "
     "READMEs: SELECT title, url FROM docs WHERE repo = 'evil' AND title LIKE '%README%'. For commits, pull requests and "
     "issues use repo_activity.\n"
+    "A question about one source filters on it: Confluence = source = 'confluence', Drive = source = 'drive', GitHub = "
+    "source = 'github' (seen 11-19: \"what changed in Drive\" without it listed GitHub folders as Drive ones).\n"
     "To open a row afterwards with get_document, select its id and source (get_document(source, id)).\n"
     "View sections: doc_id (= docs.id), section_id, heading, text.\n"
     "Compare times with datetime('now', '-14 days'). Examples: what changed on Confluence in the last 2 weeks: SELECT "

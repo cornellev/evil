@@ -296,14 +296,16 @@ def create_server(db_path: str | None = None, catalog_path: str | None = None,
         location: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        name: str | None = None,
     ) -> list[dict]:
         """List uploaded recordings, newest first (since/until are epoch seconds;
         category is competition/testing/bench/sim/b_lot/other; location is a place name such as
-        'IMS' or 'B Lot'). Returns every candidate with its date, category, car, location and parse
+        'IMS' or 'B Lot'; name is part of a recording's label or file name, for one people name, like
+        'run3_power': without it, older recordings may be past the newest 50). Returns every candidate with its date, category, car, location and parse
         state so similar ones can be told apart; if several match, list them and ask which one is meant."""
         return await asyncio.to_thread(
             _run_catalog, cat_path, list_recordings, since=since, until=until, category=category,
-            car=car, parse_status=parse_status, location=location, limit=limit, offset=offset,
+            car=car, parse_status=parse_status, location=location, limit=limit, offset=offset, name=name,
         )
 
     @server.tool(name="describe_recording")
