@@ -125,7 +125,9 @@ services:
       EVIL_KNOWLEDGE_PORT: "8768"
       OTEL_EXPORTER_OTLP_ENDPOINT: ${EVIL_OTLP_ENDPOINT:-}
       EVIL_WHOIS_URL: ${EVIL_WHOIS_URL:-}
-      PHOENIX_PROJECT_NAME: cev-knowledge
+      # Same Phoenix project as everything else: Phoenix files a whole trace under the first span's project, so a
+      # separate one here split Tern's Discord answers across two projects (11-20: ~1/3 were in cev-knowledge).
+      PHOENIX_PROJECT_NAME: evil
       # Meaning-based matches: Tern's /embed on thor (embeddings.py). Set KNOWLEDGE_EMBED_URL= (empty) in .env to
       # turn them off; thor down -> keyword-only by itself. Same model in both services.
       KNOWLEDGE_EMBED_URL: ${KNOWLEDGE_EMBED_URL-http://thor.tail4ccb95.ts.net:8000/embed}
