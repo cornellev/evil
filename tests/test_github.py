@@ -459,3 +459,17 @@ def test_people_sums_lines_per_person_in_the_window(monkeypatch):
 def test_graphql_never_sends_a_mutation():
     with pytest.raises(ValueError):
         gh.GitHubClient("1", "2", session=FakeSession([])).graphql("mutation { x }", {})
+
+
+def test_left_out_repos_are_named_as_left_out_not_missing(monkeypatch, tmp_path):
+    # seen 11-21: "what's in the CEVWiki repo?" got "I couldn't find a GitHub repository named CEVWiki"
+    monkeypatch.setattr(gh, "SKIP_REPO_NAMES", ("CEVWiki",))
+    monkeypatch.setattr(gh, "SKIP_REPOS", frozenset({"cevwiki"}))
+    assert "CEVWiki" in gh.left_out_note() and "don't say it doesn't exist" in gh.left_out_note()
+    server = server_mod.create_knowledge_server(str(tmp_path / "k.db"), github=LiveFake())
+    tools = {t.name: t for t in asyncio.run(server.list_tools())}
+    assert "Left out on purpose" in tools["knowledge_sql"].description
+    with pytest.raises(Exception, match="left out of what the assistant can read, on purpose"):
+        server_mod._repo_name("CEVWiki")
+    monkeypatch.setattr(gh, "SKIP_REPO_NAMES", ())
+    assert gh.left_out_note() == ""

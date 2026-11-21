@@ -30,7 +30,17 @@ TOKEN_MARGIN_SEC = 300          # refresh the installation token this long befor
 PER_PAGE = 100
 # Repos left out of everything (index and live tools), by name, comma-separated (user 11-19: CEVWiki, an old wiki
 # that overlaps Confluence).
-SKIP_REPOS = frozenset(n.strip().lower() for n in os.getenv("KNOWLEDGE_GITHUB_SKIP_REPOS", "").split(",") if n.strip())
+SKIP_REPO_NAMES = tuple(n.strip() for n in os.getenv("KNOWLEDGE_GITHUB_SKIP_REPOS", "").split(",") if n.strip())
+SKIP_REPOS = frozenset(n.lower() for n in SKIP_REPO_NAMES)
+
+
+def left_out_note() -> str:
+    """For the tool descriptions: the left-out repos exist but can't be read (seen 11-21: "what's in CEVWiki" got
+    "I couldn't find a repo named CEVWiki")."""
+    if not SKIP_REPO_NAMES:
+        return ""
+    return (f" Left out on purpose (they exist on GitHub but nothing here can read them): {', '.join(SKIP_REPO_NAMES)}."
+            " Asked about one, say it's left out of what you can read; don't say it doesn't exist.")
 
 
 def skipped(full_name: str) -> bool:

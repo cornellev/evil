@@ -99,7 +99,8 @@ def _repo_name(repo: str) -> str:
     parts = repo.split("/")
     full = "/".join(parts[:2]) if len(parts) >= 2 else f"{ORG}/{repo}"
     if gh.skipped(full):
-        raise ToolError(f"{full} is left out of what the assistant reads")
+        raise ToolError(f"{full} exists but is left out of what the assistant can read, on purpose: say so (it isn't "
+                        "missing)")
     return full
 
 
@@ -402,7 +403,7 @@ def create_knowledge_server(db_path: str | None = None, embedder: emb.EmbedClien
             raise ToolError(f"no Confluence page {id!r} in the index (it may be restricted, labelled no-tern, or deleted)")
         return doc
 
-    @server.tool(name="knowledge_sql", description=sql_mod.NOTES)
+    @server.tool(name="knowledge_sql", description=sql_mod.NOTES + gh.left_out_note())
     async def knowledge_sql(query: str) -> list[dict]:
         def run(conn):
             try:
