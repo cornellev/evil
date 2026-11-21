@@ -327,9 +327,35 @@ def test_activity_with_no_repo_names_every_repo_pushed(tmp_path):
                               pushed_at="2099-01-01T00:00:00Z") for i in range(12)])
 
         def get(self, path, params=None, raw=False, accept=None):       # every repo answers like evil
+            if path == "/search/issues":
+                return {"items": []}
             return LiveFake.get(self, re_mod.sub(r"^/repos/cornellev/r\d+", "/repos/cornellev/evil", path), params)
     out = _data(_call(server_mod.create_knowledge_server(str(tmp_path / "k.db"), github=Many()), "repo_activity", {}))
     assert len(out["all_repos_pushed"]) == 12 and out["detailed"] == server_mod.MAX_ACTIVE_REPOS
+
+
+def test_activity_with_no_repo_leads_with_every_open_pr_in_the_org(tmp_path):
+    # seen 11-20: "any open pull requests across our repos?" got 47k characters of commits and asked which run
+    class Org(LiveFake):
+        def get(self, path, params=None, raw=False, accept=None):
+            if path == "/search/issues":
+                self.q = params["q"]
+                return {"items": [{"repository_url": "https://api.github.com/repos/cornellev/quiet", "number": 3,
+                                   "title": "Fix README", "user": {"login": "cy"}, "draft": False,
+                                   "updated_at": "2026-11-01", "html_url": "pq3"}]}
+            if path.endswith("/commits"):
+                return [{"sha": f"{i:07x}", "html_url": "u", "commit": {"committer": {"date": "2026-11-18"},
+                         "author": {"name": "Ann"}, "message": "m"}} for i in range(30)]
+            return LiveFake.get(self, path, params)
+
+        def repos(self):
+            return iter([dict(REPO, pushed_at="2099-01-01T00:00:00Z")])
+    fake = Org()
+    out = _data(_call(server_mod.create_knowledge_server(str(tmp_path / "k.db"), github=fake), "repo_activity", {}))
+    assert fake.q == "org:cornellev is:pr is:open archived:false"
+    assert out["open_pull_requests"] == [{"repo": "cornellev/quiet", "number": 3, "title": "Fix README", "author": "cy",
+                                          "draft": False, "updated": "2026-11-01", "url": "pq3"}]
+    assert len(out["repos"][0]["commits"]) == server_mod.OVERVIEW_COMMITS and out["repos"][0]["commits_in_window"] == 30
 
 
 # ---- repo_changes, blame, people (11-19: "understanding changes more deeply in a repo") ------------------------

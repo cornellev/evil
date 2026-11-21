@@ -88,6 +88,8 @@ ACTIVITY_DAYS = 14
 MAX_COMMITS = 30
 MAX_ITEMS = 20
 MAX_ACTIVE_REPOS = 8
+OVERVIEW_COMMITS = 5       # commits per detailed repo when no repo is named (11-20: 47k characters drowned the PRs)
+MAX_ORG_PRS = 50
 PART_CHARS = 12_000
 
 
@@ -209,9 +211,14 @@ def _activity(client: gh.GitHubClient, repo: str | None, days: int, people: bool
     with ThreadPoolExecutor(max_workers=4) as pool:
         out = list(pool.map(one, names))
     if not repo:     # every repo pushed in the window, not only the ones detailed (seen 11-19: 5 named of ~20)
-        return {"since": since, "days": days, "all_repos_pushed": [{"repo": r["full_name"], "pushed": r.get("pushed_at"),
-                                                                     "url": r["html_url"]} for r in repos],
-                "detailed": len(out), "repos": out}
+        # Open PRs across the whole org first, from one search: "any open PRs across our repos" saw only the detailed
+        # repos' PRs, under 47k characters of commits, and asked which run was meant (seen 11-20).
+        return {"since": since, "days": days, "open_pull_requests": _org_open_prs(client),
+                "all_repos_pushed": [{"repo": r["full_name"], "pushed": r.get("pushed_at"), "url": r["html_url"]}
+                                     for r in repos],
+                "detailed": len(out),
+                "repos": [dict(r, commits=r["commits"][:OVERVIEW_COMMITS], commits_shown=min(len(r["commits"]),
+                               OVERVIEW_COMMITS), commits_in_window=len(r["commits"])) for r in out]}
     return {"since": since, "days": days, "repos": out}
 
 
@@ -255,6 +262,24 @@ def _grep_repo(client: gh.GitHubClient, full: str, query: str) -> list[dict]:
             if len(hits) >= GREP_HITS:
                 break
     return hits
+
+
+def _org_open_prs(client: gh.GitHubClient) -> list[dict] | str:
+    """Every open pull request in the org (GitHub's issue search), newest first; forks and left-out repos dropped."""
+    try:
+        found = client.get("/search/issues", {"q": f"org:{ORG} is:pr is:open archived:false", "per_page": MAX_ORG_PRS,
+                                              "sort": "updated", "order": "desc"})
+    except (gh.NotFound, gh.GitHubUnavailable) as exc:
+        return f"couldn't list the org's open PRs ({exc}): see each repo's open_pull_requests"
+    out = []
+    for i in found.get("items") or []:
+        full = "/".join(str(i.get("repository_url") or "").rstrip("/").split("/")[-2:])
+        if gh.skipped(full):
+            continue
+        out.append({"repo": full, "number": i.get("number"), "title": i.get("title"),
+                    "author": (i.get("user") or {}).get("login"), "draft": i.get("draft"), "updated": i.get("updated_at"),
+                    "url": i.get("html_url")})
+    return out
 
 
 def _or_empty(get, path: str, params: dict) -> list:
@@ -392,7 +417,8 @@ def create_knowledge_server(db_path: str | None = None, embedder: emb.EmbedClien
         every repo pushed in the window (most active first): commits on the default branch (date, author, message),
         pull requests merged in the window, open pull requests and open issues, each with its link. `days`: the
         window (default 14, at most 90). For "what changed", "open PRs", "what is X working on in code". With no repo,
-        all_repos_pushed lists every repo pushed in the window; the most active ones are detailed in repos.
+        open_pull_requests lists every open PR in the org (any repo, however quiet), all_repos_pushed every repo pushed
+        in the window, and the most active ones are detailed in repos (their latest few commits).
         `people`: instead, per person (GitHub login) commits and lines added / removed in the window, across the repo or
         every repo pushed in it, most lines first: for "who changed the most", "top contributors", "how much has X done"."""
         if not github.enabled:
