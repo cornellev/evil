@@ -456,6 +456,19 @@ def test_people_sums_lines_per_person_in_the_window(monkeypatch):
     assert [(p["person"], p["lines_changed"], p["commits"]) for p in out["people"]] == [("ann", 500, 5), ("bo", 60, 2)]
 
 
+def test_people_all_time_counts_every_week(monkeypatch, tmp_path):
+    # seen 11-22: "tell me all time contributions of car repo" got the default 14 days (one person, 2 commits)
+    monkeypatch.setattr(gc, "STATS_WAIT_SEC", 0)
+    out = gc.people(ChangesFake(), ["cornellev/evil"], 0)
+    assert out["since"] == "all time" and out["days"] == "all time"
+    assert [(p["person"], p["commits"]) for p in out["people"]] == [("ann", 55), ("bo", 2)]       # the 400-day-old week too
+    server = server_mod.create_knowledge_server(str(tmp_path / "k.db"), github=ChangesFake())
+    via_tool = _data(_call(server, "repo_activity", {"repo": "evil", "people": True, "days": 0}))
+    assert via_tool["since"] == "all time" and via_tool["people"][0]["commits"] == 55
+    tools = {t.name: t for t in asyncio.run(server.list_tools())}
+    assert "days=0 is ALL TIME" in tools["repo_activity"].description
+
+
 def test_graphql_never_sends_a_mutation():
     with pytest.raises(ValueError):
         gh.GitHubClient("1", "2", session=FakeSession([])).graphql("mutation { x }", {})

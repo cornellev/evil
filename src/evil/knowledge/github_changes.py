@@ -168,9 +168,10 @@ def blame(client: gh.GitHubClient, full: str, path: str, lines: str | None, text
 
 def people(client: gh.GitHubClient, names: list[str], days: int) -> dict:
     """Per-author commits and lines added / removed in the window, summed over `names` (GitHub's weekly contributor
-    stats: the window is rounded to whole weeks; merge commits aren't counted)."""
-    days = max(7, min(int(days or 30), 365))
-    start = datetime.now(timezone.utc) - timedelta(days=days)
+    stats: the window is rounded to whole weeks; merge commits aren't counted). days=0: all time."""
+    all_time = int(days or 0) <= 0
+    days = 0 if all_time else max(7, min(int(days), 365))
+    start = None if all_time else datetime.now(timezone.utc) - timedelta(days=days)
     totals: dict[str, dict] = {}
     missing = []
     def fetch(full: str):
@@ -191,7 +192,7 @@ def people(client: gh.GitHubClient, names: list[str], days: int) -> dict:
             who = (s.get("author") or {}).get("login") or "unknown"
             t = totals.setdefault(who, {"person": who, "commits": 0, "lines_added": 0, "lines_removed": 0, "repos": set()})
             for w in s.get("weeks") or []:
-                if datetime.fromtimestamp(w["w"], timezone.utc) + timedelta(days=7) < start:
+                if start is not None and datetime.fromtimestamp(w["w"], timezone.utc) + timedelta(days=7) < start:
                     continue
                 if w.get("c"):
                     t["repos"].add(full.split("/")[1])
@@ -201,7 +202,8 @@ def people(client: gh.GitHubClient, names: list[str], days: int) -> dict:
     rows = [dict(t, repos=sorted(t["repos"]), lines_changed=t["lines_added"] + t["lines_removed"])
             for t in totals.values() if t["commits"]]
     rows.sort(key=lambda r: -r["lines_changed"])
-    out = {"since": start.strftime("%Y-%m-%d"), "days": days, "repos_counted": len(names) - len(missing),
+    out = {"since": "all time" if start is None else start.strftime("%Y-%m-%d"), "days": days or "all time",
+           "repos_counted": len(names) - len(missing),
            "people": rows, "note": "GitHub logins; weekly totals (the window is rounded to whole weeks); merge commits "
                                    "are not counted; lockfile and generated-file churn is included in the line counts."}
     if missing:

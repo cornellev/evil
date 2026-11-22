@@ -167,7 +167,10 @@ def _blamed(client: gh.GitHubClient, file_id: str, lines: str) -> dict:
 
 def _activity(client: gh.GitHubClient, repo: str | None, days: int, people: bool = False) -> dict:
     from datetime import datetime, timedelta, timezone
-    days = max(1, min(int(days or ACTIVITY_DAYS), 90))
+    if people and int(days or 0) <= 0:      # all time (seen 11-22: "all time contributions of car" got 14 days)
+        names = [_repo_name(repo)] if repo else [r["full_name"] for r in client.repos() if not r.get("fork")]
+        return github_changes.people(client, names, 0)
+    days = max(1, min(int(days or ACTIVITY_DAYS), 90 if not people else 365))
     since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     if repo:
         names = [_repo_name(repo)]
@@ -421,7 +424,9 @@ def create_knowledge_server(db_path: str | None = None, embedder: emb.EmbedClien
         open_pull_requests lists every open PR in the org (any repo, however quiet), all_repos_pushed every repo pushed
         in the window, and the most active ones are detailed in repos (their latest few commits).
         `people`: instead, per person (GitHub login) commits and lines added / removed in the window, across the repo or
-        every repo pushed in it, most lines first: for "who changed the most", "top contributors", "how much has X done"."""
+        every repo pushed in it, most lines first: for "who changed the most", "top contributors", "how much has X done".
+        With people, `days` goes up to 365, and days=0 is ALL TIME (since each repo began): "all time", "ever",
+        "overall", "total contributions" need days=0, never the default 14."""
         if not github.enabled:
             raise ToolError("GitHub is not connected here")
         try:
