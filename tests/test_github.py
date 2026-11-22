@@ -486,3 +486,16 @@ def test_left_out_repos_are_named_as_left_out_not_missing(monkeypatch, tmp_path)
         server_mod._repo_name("CEVWiki")
     monkeypatch.setattr(gh, "SKIP_REPO_NAMES", ())
     assert gh.left_out_note() == ""
+
+
+def test_windows_take_fractions_of_a_day_and_say_what_they_covered(tmp_path, monkeypatch):
+    # seen 11-22: "31.5 days" failed validation and became 31; "0.5 days" was run as 1 day and reported as 12 hours
+    assert [gc.window_text(d) for d in (0.5, 1, 2, 31.5)] == ["12 hours", "24 hours", "2 days", "31.5 days"]
+    server = server_mod.create_knowledge_server(str(tmp_path / "k.db"), github=LiveFake())
+    out = _data(_call(server, "repo_activity", {"repo": "evil", "days": 31.5}))
+    assert out["days"] == 31.5 and out["window"] == "31.5 days"
+    out = _data(_call(server, "repo_activity", {"repo": "evil", "days": 0.5}))
+    assert out["window"] == "12 hours"
+    monkeypatch.setattr(gc, "STATS_WAIT_SEC", 0)
+    weekly = gc.people(ChangesFake(), ["cornellev/evil"], 0.5)
+    assert weekly["days"] == 7 and "12 hours was asked" in weekly["window_note"]

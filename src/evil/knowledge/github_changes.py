@@ -87,8 +87,17 @@ def _commit_line(c: dict) -> dict:
             "message": _clean(c["commit"]["message"])[:600], "url": c.get("html_url")}
 
 
+def window_text(days: float) -> str:
+    """'12 hours', '31.5 days': what a window was, said back exactly (seen 11-22: 31.5 became 31, 0.5 became '12 hours'
+    over a day of data)."""
+    hours = days * 24
+    if hours < 48:
+        return f"{hours:g} hours"
+    return f"{days:g} days"
+
+
 def changes(client: gh.GitHubClient, full: str, commit: str | None = None, pr: int | None = None,
-            days: int | None = None, base: str | None = None, head: str | None = None,
+            days: float | None = None, base: str | None = None, head: str | None = None,
             path: str | None = None) -> dict:
     info = client.get(f"/repos/{full}")
     branch = info["default_branch"]
@@ -113,7 +122,7 @@ def changes(client: gh.GitHubClient, full: str, commit: str | None = None, pr: i
         c = client.get(f"/repos/{full}/commits/{commit}")
         return {"repo": full, "commit": _commit_line(c), **_files(c.get("files") or [], path)}
     if not (base and head):
-        days = max(1, min(int(days or 7), 90))
+        days = max(1 / 24, min(float(days or 7), 90))
         since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
         listed = client.get(f"/repos/{full}/commits", {"since": since, "sha": branch, "per_page": MAX_COMMITS,
                                                        **({"path": path} if path else {})})
@@ -166,11 +175,12 @@ def blame(client: gh.GitHubClient, full: str, path: str, lines: str | None, text
     return out
 
 
-def people(client: gh.GitHubClient, names: list[str], days: int) -> dict:
+def people(client: gh.GitHubClient, names: list[str], days: float) -> dict:
     """Per-author commits and lines added / removed in the window, summed over `names` (GitHub's weekly contributor
     stats: the window is rounded to whole weeks; merge commits aren't counted). days=0: all time."""
-    all_time = int(days or 0) <= 0
-    days = 0 if all_time else max(7, min(int(days), 365))
+    all_time = float(days or 0) <= 0
+    asked = None if all_time else float(days)
+    days = 0 if all_time else max(7, min(float(days), 365))
     start = None if all_time else datetime.now(timezone.utc) - timedelta(days=days)
     totals: dict[str, dict] = {}
     missing = []
@@ -203,9 +213,13 @@ def people(client: gh.GitHubClient, names: list[str], days: int) -> dict:
             for t in totals.values() if t["commits"]]
     rows.sort(key=lambda r: -r["lines_changed"])
     out = {"since": "all time" if start is None else start.strftime("%Y-%m-%d"), "days": days or "all time",
+           "window": "all time" if start is None else window_text(days),
            "repos_counted": len(names) - len(missing),
            "people": rows, "note": "GitHub logins; weekly totals (the window is rounded to whole weeks); merge commits "
                                    "are not counted; lockfile and generated-file churn is included in the line counts."}
+    if asked is not None and asked < 7:
+        out["window_note"] = (f"{window_text(asked)} was asked; per-person stats are weekly, so this covers the last 7 "
+                              "days: say so")
     if missing:
         out["stats_not_ready"] = missing
     return out

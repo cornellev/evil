@@ -165,12 +165,12 @@ def _blamed(client: gh.GitHubClient, file_id: str, lines: str) -> dict:
             "blame": github_changes.blame(client, full, rel, None if lines == "all" else lines, text, ref)}
 
 
-def _activity(client: gh.GitHubClient, repo: str | None, days: int, people: bool = False) -> dict:
+def _activity(client: gh.GitHubClient, repo: str | None, days: float, people: bool = False) -> dict:
     from datetime import datetime, timedelta, timezone
-    if people and int(days or 0) <= 0:      # all time (seen 11-22: "all time contributions of car" got 14 days)
+    if people and float(days or 0) <= 0:      # all time (seen 11-22: "all time contributions of car" got 14 days)
         names = [_repo_name(repo)] if repo else [r["full_name"] for r in client.repos() if not r.get("fork")]
         return github_changes.people(client, names, 0)
-    days = max(1, min(int(days or ACTIVITY_DAYS), 90 if not people else 365))
+    days = max(1 / 24, min(float(days or ACTIVITY_DAYS), 90 if not people else 365))
     since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     if repo:
         names = [_repo_name(repo)]
@@ -217,13 +217,14 @@ def _activity(client: gh.GitHubClient, repo: str | None, days: int, people: bool
     if not repo:     # every repo pushed in the window, not only the ones detailed (seen 11-19: 5 named of ~20)
         # Open PRs across the whole org first, from one search: "any open PRs across our repos" saw only the detailed
         # repos' PRs, under 47k characters of commits, and asked which run was meant (seen 11-20).
-        return {"since": since, "days": days, "open_pull_requests": _org_open_prs(client),
+        return {"since": since, "days": days, "window": github_changes.window_text(days),
+                "open_pull_requests": _org_open_prs(client),
                 "all_repos_pushed": [{"repo": r["full_name"], "pushed": r.get("pushed_at"), "url": r["html_url"]}
                                      for r in repos],
                 "detailed": len(out),
                 "repos": [dict(r, commits=r["commits"][:OVERVIEW_COMMITS], commits_shown=min(len(r["commits"]),
                                OVERVIEW_COMMITS), commits_in_window=len(r["commits"])) for r in out]}
-    return {"since": since, "days": days, "repos": out}
+    return {"since": since, "days": days, "window": github_changes.window_text(days), "repos": out}
 
 
 GREP_MAX_REPO_KB = 50_000      # the fallback downloads the repo's archive: not for huge repos (data, models)
@@ -416,11 +417,12 @@ def create_knowledge_server(db_path: str | None = None, embedder: emb.EmbedClien
         return await asyncio.to_thread(_with_index, path, run)
 
     @server.tool(name="repo_activity")
-    async def repo_activity(repo: str | None = None, days: int = ACTIVITY_DAYS, people: bool = False) -> dict:
+    async def repo_activity(repo: str | None = None, days: float = ACTIVITY_DAYS, people: bool = False) -> dict:
         """What happened on the team's GitHub lately: for `repo` ("evil" or "cornellev/evil"), or with no repo for
         every repo pushed in the window (most active first): commits on the default branch (date, author, message),
         pull requests merged in the window, open pull requests and open issues, each with its link. `days`: the
-        window (default 14, at most 90). For "what changed", "open PRs", "what is X working on in code". With no repo,
+        window, any number (0.5 = 12 hours; default 14, at most 90); the result's `window` says what it covered: say
+        that back exactly. For "what changed", "open PRs", "what is X working on in code". With no repo,
         open_pull_requests lists every open PR in the org (any repo, however quiet), all_repos_pushed every repo pushed
         in the window, and the most active ones are detailed in repos (their latest few commits).
         `people`: instead, per person (GitHub login) commits and lines added / removed in the window, across the repo or
@@ -435,7 +437,7 @@ def create_knowledge_server(db_path: str | None = None, embedder: emb.EmbedClien
             raise ToolError(f"GitHub didn't answer right now ({exc})") from exc
 
     @server.tool(name="repo_changes")
-    async def repo_changes(repo: str, commit: str | None = None, pr: int | None = None, days: int | None = None,
+    async def repo_changes(repo: str, commit: str | None = None, pr: int | None = None, days: float | None = None,
                            base: str | None = None, head: str | None = None, path: str | None = None) -> dict:
         """What actually changed in a repo's code and docs, with the diffs: one `commit` (sha), one pull request
         (`pr` number: its description, reviews and comments too), the last `days` on the default branch (default 7),
