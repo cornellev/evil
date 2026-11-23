@@ -67,9 +67,19 @@ def valid_fix(lat: float | None, lon: float | None) -> bool:
     return lat is not None and lon is not None and math.isfinite(lat) and math.isfinite(lon) and lat != 0 and lon != 0
 
 
+# Below these, distance / energy is two near-zeros divided, not an efficiency (seen 11-23: a 1.8 s "run" of 0.42 m and
+# 0.0009 Wh was the team's "most efficient run" at 291.7 mi/kWh). Shorter than any track segment (58 m) and above GPS
+# jitter and the joulemeter's noise floor: only fragments are left out.
+MIN_EFFICIENCY_DISTANCE_M = 50.0
+MIN_EFFICIENCY_ENERGY_WH = 0.05
+
+
 def efficiency_mi_per_kwh(distance_m: float | None, energy_wh: float | None) -> float | None:
-    """None when there is no energy to divide by (RED shows 0 in that case)."""
+    """None when there is no energy to divide by (RED shows 0 in that case), or too little distance or energy for the
+    ratio to mean anything (a fragment: the car barely moved)."""
     if distance_m is None or energy_wh is None or energy_wh <= 0:
+        return None
+    if distance_m < MIN_EFFICIENCY_DISTANCE_M or energy_wh < MIN_EFFICIENCY_ENERGY_WH:
         return None
     return (distance_m / METERS_PER_MILE) / (energy_wh / 1000.0)
 

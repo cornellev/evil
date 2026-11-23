@@ -154,3 +154,11 @@ def test_an_incremental_run_summary_equals_a_full_rescan_exactly(conn):
     assert live == full and full["energy_wh"] and full["distance_m"]
     # a refresh with no new rows changes nothing
     assert metrics.store_run_summary(conn, "r", totals) == full
+
+
+def test_no_efficiency_for_a_fragment_the_car_barely_moved_in():
+    # seen 11-23: 0.42 m on 0.0009 Wh in 1.8 s was the "most efficient run" at 291.7 mi/kWh
+    assert metrics.efficiency_mi_per_kwh(0.4237, 0.000903) is None
+    assert metrics.efficiency_mi_per_kwh(9.69, 0.028) is None                      # 9.7 m: still a fragment
+    assert metrics.efficiency_mi_per_kwh(57.9, 0.113) == pytest.approx(318.4, rel=0.01)   # the shortest real turn
+    assert metrics.efficiency_mi_per_kwh(11280.5, 229.24) == pytest.approx(30.58, rel=0.01)

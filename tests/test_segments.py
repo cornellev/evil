@@ -2,6 +2,8 @@
 
 import pytest
 
+from evil.classifiers import metrics
+
 from evil import track
 from evil.classifiers.runner import tick
 from evil.classifiers.segments import SegmentsClassifier
@@ -75,7 +77,10 @@ def test_a_drive_is_cut_into_segments_that_match_the_geometry(conn, ring):
             assert r["distance_m"] == pytest.approx(lengths[name], rel=0.02)
             assert r["avg_speed"] == pytest.approx(10.0, rel=0.02)
             assert r["energy_wh"] == pytest.approx(0.5 * r["duration_s"] / 3600 * 1000, rel=0.01)   # 500 W, exactly
-            assert r["efficiency_mi_per_kwh"] == pytest.approx(10.0 * 2.23694 / 0.5, rel=0.03)      # mph / kW
+            if r["distance_m"] >= metrics.MIN_EFFICIENCY_DISTANCE_M:
+                assert r["efficiency_mi_per_kwh"] == pytest.approx(10.0 * 2.23694 / 0.5, rel=0.03)  # mph / kW
+            else:                                                     # this ring's short segments: a fragment
+                assert r["efficiency_mi_per_kwh"] is None
             assert r["entry_speed"] == 10.0 and r["exit_speed"] == 10.0
 
 
