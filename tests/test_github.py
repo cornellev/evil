@@ -541,3 +541,26 @@ def test_last_n_commits_ignore_the_date_and_an_empty_window_shows_the_latest(tmp
     assert "no commits in the last 14 days; the latest is from 2025-02-10" in repo["note"]
     tools = {t.name: t for t in asyncio.run(server.list_tools())}
     assert "whatever their date" in tools["repo_activity"].description
+
+
+def test_an_empty_response_body_is_nothing_not_an_error(monkeypatch):
+    # seen 11-23: an empty repo's stats came back 204 with no body; .json() raised and the org-wide lookup failed
+    class Resp:
+        status_code, headers, content = 204, {}, b""
+
+        def json(self):
+            raise ValueError("Expecting value")
+    session = FakeSession([])
+    session.get = lambda *a, **k: Resp()
+    client = gh.GitHubClient("1", "2", session=session)
+    monkeypatch.setattr(client, "_installation_token", lambda: "t")
+    assert client.get("/repos/cornellev/empty/stats/contributors") is None
+
+    class EmptyRepo(ChangesFake):
+        def get(self, path, params=None, raw=False, accept=None):
+            if path == "/repos/cornellev/empty/stats/contributors":
+                return None
+            return super().get(path, params, raw, accept)
+    monkeypatch.setattr(gc, "STATS_WAIT_SEC", 0)
+    out = gc.people(EmptyRepo(), ["cornellev/evil", "cornellev/empty"], 0)
+    assert out["people"] and "stats_not_ready" not in out

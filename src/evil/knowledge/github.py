@@ -129,7 +129,11 @@ class GitHubClient:
                 if r.status_code in (404, 409):          # 409: an empty repo has no commits (seen 11-19)
                     raise NotFound(path)
                 if r.status_code < 300:
-                    return r.content if raw else r.json()
+                    if raw:
+                        return r.content
+                    # 204 / an empty body is "nothing" (seen 11-23: an empty repo's contributor stats, and one bad repo
+                    # took down an org-wide all-time lookup with a JSON error)
+                    return r.json() if r.content.strip() else None
                 remaining = r.headers.get("X-RateLimit-Remaining")
                 last = f"{r.status_code}" + (" (rate limit)" if remaining == "0" or r.status_code == 429 else "")
                 if r.status_code in (401,):       # the token went bad early: get a new one once

@@ -196,6 +196,8 @@ def people(client: gh.GitHubClient, names: list[str], days: float) -> dict:
             stats = client.get(f"/repos/{full}/stats/contributors")
             if isinstance(stats, list):
                 return full, stats
+            if stats is None:                             # 204: an empty repo, no contributors
+                return full, []
             if time.monotonic() + STATS_WAIT_SEC > deadline:
                 break
             time.sleep(STATS_WAIT_SEC)                    # 202: GitHub is computing them
