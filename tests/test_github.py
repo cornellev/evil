@@ -499,3 +499,19 @@ def test_windows_take_fractions_of_a_day_and_say_what_they_covered(tmp_path, mon
     monkeypatch.setattr(gc, "STATS_WAIT_SEC", 0)
     weekly = gc.people(ChangesFake(), ["cornellev/evil"], 0.5)
     assert weekly["days"] == 7 and "12 hours was asked" in weekly["window_note"]
+
+
+def test_people_stops_waiting_for_stats_github_is_still_computing(monkeypatch):
+    # seen 11-23: 39 s on one repo's stats (202, 202, ...) and the question timed out
+    monkeypatch.setattr(gc, "STATS_WAIT_SEC", 0.05)
+    monkeypatch.setattr(gc, "STATS_BUDGET_SEC", 0.12)
+
+    class Computing(ChangesFake):
+        def get(self, path, params=None, raw=False, accept=None):
+            if path.endswith("/stats/contributors"):
+                return {}                                   # always 202
+            return super().get(path, params, raw, accept)
+    import time as t
+    t0 = t.monotonic()
+    out = gc.people(Computing(), ["cornellev/evil"], 0)
+    assert t.monotonic() - t0 < 1.0 and out["stats_not_ready"] == ["cornellev/evil"] and "again in a minute" in out["stats_note"]

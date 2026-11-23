@@ -32,6 +32,9 @@ MAX_REVIEWS = 15
 BLAME_MAX_LINES = 400
 STATS_TRIES = 5                  # GitHub computes contributor stats on first ask (202): wait and ask again
 STATS_WAIT_SEC = 1.5
+# Whole per-person lookup, all repos: past this, the repos GitHub is still computing are reported as not ready instead
+# of waited for (seen 11-23: 39 s on one repo's stats, and the question timed out at 60 s).
+STATS_BUDGET_SEC = 12.0
 STATS_WORKERS = 8
 _GENERATED = re.compile(r"(\.min\.\w+|\.map|\.lock|-lock\.json|\.pb\.go|_pb2\.py|\.snap|\.svg|\.ipynb)$|"
                         r"(^|/)(dist|build|vendor|node_modules|third_party|generated|__generated__)/", re.I)
@@ -184,11 +187,17 @@ def people(client: gh.GitHubClient, names: list[str], days: float) -> dict:
     start = None if all_time else datetime.now(timezone.utc) - timedelta(days=days)
     totals: dict[str, dict] = {}
     missing = []
+    deadline = time.monotonic() + STATS_BUDGET_SEC
+
     def fetch(full: str):
         for _ in range(STATS_TRIES):
+            if time.monotonic() > deadline:
+                break
             stats = client.get(f"/repos/{full}/stats/contributors")
             if isinstance(stats, list):
                 return full, stats
+            if time.monotonic() + STATS_WAIT_SEC > deadline:
+                break
             time.sleep(STATS_WAIT_SEC)                    # 202: GitHub is computing them
         return full, None
 
@@ -222,4 +231,6 @@ def people(client: gh.GitHubClient, names: list[str], days: float) -> dict:
                               "days: say so")
     if missing:
         out["stats_not_ready"] = missing
+        out["stats_note"] = ("GitHub is still computing contributor stats for these repos (it does on first ask): "
+                             "say so and suggest asking again in a minute; the numbers above leave them out")
     return out
