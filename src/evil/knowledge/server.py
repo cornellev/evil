@@ -22,6 +22,7 @@ only, and the span says so (`knowledge.ranking`).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import sqlite3
@@ -110,6 +111,26 @@ def _clean(text: str) -> str:
     return "\n".join(b.text for b in clean)
 
 
+def _is_listing(data: bytes) -> bool:
+    """GitHub's contents API on a folder: a JSON list of entries, not a file's bytes."""
+    if not data[:1] == b"[":
+        return False
+    try:
+        items = json.loads(data[:2_000_000])
+    except ValueError:
+        return False
+    return isinstance(items, list) and all(isinstance(i, dict) and "type" in i and "path" in i for i in items[:5])
+
+
+def _is_repo_root(file_id: str) -> bool:
+    """"infra", "cornellev/infra", its URL: the repo itself, not a file in it."""
+    target = str(file_id).strip().removeprefix("gh:").removeprefix("https://github.com/").strip("/")
+    parts = [p for p in target.split("/") if p]
+    if parts and parts[0].lower() == ORG.lower():
+        parts = parts[1:]
+    return len(parts) == 1 and ":" not in parts[0]
+
+
 def _indexed_github(conn, file_id: str, section) -> dict | None:
     """A repo doc from the index by id ("gh:cornellev/evil:README.md") or "repo/path" title."""
     fid = str(file_id).strip()
@@ -138,6 +159,8 @@ def _live_github(client: gh.GitHubClient, file_id: str, section) -> dict | None:
         data = client.file(full, rel, ref)
     except gh.NotFound:
         return None
+    if _is_listing(data):
+        return None                                  # a folder: GitHub lists it as JSON (get_document reads it as a tree)
     if b"\0" in data[:8000]:
         raise ToolError(f"{rel} is a binary file; give the user its link")
     text = _clean(data[: gh.MAX_FILE_BYTES * 2].decode("utf-8", "replace"))
@@ -150,6 +173,55 @@ def _live_github(client: gh.GitHubClient, file_id: str, section) -> dict | None:
             "text": parts[n - 1] + (f"\n\n[part {n} of {len(parts)}: ask for section {n + 1} for more]"
                                      if n < len(parts) else ""),
             "truncated": n < len(parts) or len(data) > gh.MAX_FILE_BYTES * 2}
+
+
+TREE_MAX_FILES = 2_000        # paths listed; the caller summarizes big lists (Tern: by folder and type)
+README_CHARS = 6_000
+
+
+def _tree(client: gh.GitHubClient, target: str) -> dict | None:
+    """A repo or a folder of one, read whole: its README's text and every file under it with its size (user 11-23:
+    "it should just be able to read in the first place"; seen 11-23: "what's in infra" / "what's it for" -> "I can't
+    see the full contents"). None when `target` isn't a repo or folder."""
+    target = target.strip().removeprefix("gh:").removeprefix("https://github.com/").strip("/")
+    parts = target.split("/")
+    if parts[0].lower() == ORG.lower():
+        parts = parts[1:]
+    if not parts or not parts[0]:
+        return None
+    full = _repo_name(parts[0])
+    folder = "/".join(p for p in parts[1:] if p not in ("tree", "blob"))
+    if len(parts) > 2 and parts[1] in ("tree", "blob"):
+        folder = "/".join(parts[3:])                   # .../tree/<branch>/<folder>
+    try:
+        info = client.get(f"/repos/{full}")
+        tree = client.get(f"/repos/{full}/git/trees/{info['default_branch']}", {"recursive": "1"}) or {}
+    except gh.NotFound:
+        return None
+    prefix = f"{folder}/" if folder else ""
+    items = [t for t in tree.get("tree") or [] if t.get("path", "").startswith(prefix)]
+    if folder and not items:
+        return None                                    # not a folder: let the caller say no such file
+    files = [{"path": t["path"][len(prefix):], "size": t.get("size")} for t in items if t.get("type") == "blob"]
+    readme = next((f["path"] for f in files if "/" not in f["path"] and f["path"].lower().startswith("readme")), None)
+    text = ""
+    if readme:
+        try:
+            text = _clean(client.file(full, prefix + readme, info["default_branch"]).decode("utf-8", "replace"))
+        except gh.NotFound:
+            text = ""
+    url = f"https://github.com/{full}" + (f"/tree/{info['default_branch']}/{folder}" if folder else "")
+    return {"source": "github", "id": f"gh:{full}:{prefix}", "title": f"{full.split('/')[1]}/{folder}".rstrip("/"),
+            "url": url, "kind": "repo_tree", "breadcrumb": [full.split("/")[1], *([folder] if folder else [])],
+            "description": info.get("description") if not folder else None,
+            "language": info.get("language") if not folder else None,
+            "readme": readme, "text": text[:README_CHARS] + ("\n[README continues]" if len(text) > README_CHARS else ""),
+            "file_count": len(files), "files": files[:TREE_MAX_FILES],
+            "note": ("The repo's README (text) and every file under it (files). Answer what was asked from these: "
+                     "what it's for from the README, the layout or a folder from the files, then open a file with "
+                     "get_document(repo/path) if needed."),
+            **({"files_cut": f"only the first {TREE_MAX_FILES} of {len(files)}"} if len(files) > TREE_MAX_FILES else {}),
+            **({"github_truncated": True} if tree.get("truncated") else {})}
 
 
 def _blamed(client: gh.GitHubClient, file_id: str, lines: str) -> dict:
@@ -387,7 +459,9 @@ def create_knowledge_server(db_path: str | None = None, embedder: emb.EmbedClien
         or part of a section heading. For github, `id` can also be any file of a repo, code included, as
         "repo/path" ("evil/src/evil/telemetry.py") or its GitHub URL, and `blame` ("40-80", or "all") adds who last
         changed each block of those lines (commit, date, author, message). Returns the text (capped; ask for one section
-        or part of a long document), the url, last updated, and the list of sections or parts."""
+        or part of a long document), the url, last updated, and the list of sections or parts.
+        A repo itself (id="infra") or a folder of one (id="infra/pi-image") returns its README's text and every file
+        under it with sizes: for "what's this repo for", "what's in it", "show me the tree", "what's in that folder"."""
         if source.lower() == "github" and blame:
             if not github.enabled:
                 raise ToolError("GitHub is not connected here")
@@ -395,6 +469,13 @@ def create_knowledge_server(db_path: str | None = None, embedder: emb.EmbedClien
                 return await asyncio.to_thread(_blamed, github, id, blame)
             except gh.GitHubUnavailable as exc:
                 raise ToolError(f"could not get the blame from GitHub right now ({exc})") from exc
+        if source.lower() == "github" and github.enabled and _is_repo_root(id):
+            try:                                     # a repo itself: its README and files, not its index row
+                tree = await asyncio.to_thread(_tree, github, id)
+            except gh.GitHubUnavailable as exc:
+                raise ToolError(f"could not read it from GitHub right now ({exc})") from exc
+            if tree is not None:
+                return tree
         if source.lower() == "github":
             doc = await asyncio.to_thread(_with_index, path, lambda c: _indexed_github(c, id, section))
             if doc is not None:
@@ -405,8 +486,14 @@ def create_knowledge_server(db_path: str | None = None, embedder: emb.EmbedClien
                 doc = await asyncio.to_thread(_live_github, github, id, section)
             except gh.GitHubUnavailable as exc:
                 raise ToolError(f"could not read it from GitHub right now ({exc})") from exc
+            if doc is None:                         # not a file: maybe a folder ("infra/pi-image")
+                try:
+                    doc = await asyncio.to_thread(_tree, github, id)
+                except gh.GitHubUnavailable as exc:
+                    raise ToolError(f"could not read it from GitHub right now ({exc})") from exc
             if doc is None:
-                raise ToolError(f"no file {id!r} in the team's repos (write it as repo/path, e.g. evil/README.md)")
+                raise ToolError(f"no file or folder {id!r} in the team's repos (write it as repo/path, e.g. "
+                                "evil/README.md, or just the repo, e.g. evil)")
             return doc
         if source.lower() == "drive":
             doc = await asyncio.to_thread(_with_index, path, lambda c: _indexed_drive(c, id, section))

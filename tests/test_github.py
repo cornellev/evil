@@ -564,3 +564,37 @@ def test_an_empty_response_body_is_nothing_not_an_error(monkeypatch):
     monkeypatch.setattr(gc, "STATS_WAIT_SEC", 0)
     out = gc.people(EmptyRepo(), ["cornellev/evil", "cornellev/empty"], 0)
     assert out["people"] and "stats_not_ready" not in out
+
+
+def test_a_repo_or_folder_reads_as_its_readme_and_files(gdb, tmp_path):
+    # user 11-23: "it should just be able to read in the first place"; seen 11-23: "what's in infra" -> "I can't see
+    # the full contents", "what's it for" -> "couldn't find any documentation or READMEs"
+    class Repo(LiveFake):
+        def get(self, path, params=None, raw=False, accept=None):
+            if path == "/repos/cornellev/evil/git/trees/main":
+                assert params == {"recursive": "1"}
+                return {"tree": [{"path": "README.md", "type": "blob", "size": 120},
+                                 {"path": "pi-image", "type": "tree"},
+                                 {"path": "pi-image/README.md", "type": "blob", "size": 80},
+                                 {"path": "pi-image/ansible/site.yml", "type": "blob", "size": 300}]}
+            return LiveFake.get(self, path, params, raw, accept)
+
+        def file(self, full, rel, ref=None):
+            files = {"README.md": b"# evil\nThe telemetry store.", "pi-image/README.md": b"Builds the Pi image."}
+            if rel == "pi-image":                       # GitHub lists a folder as JSON
+                return b'[{"name": "README.md", "path": "pi-image/README.md", "type": "file"}]'
+            if rel not in files:
+                raise gh.NotFound(rel)
+            return files[rel]
+    gi.sync_github(gdb, FakeGitHub(), now=NOW)
+    gdb.commit()
+    server = server_mod.create_knowledge_server(str(tmp_path / "k.db"), github=Repo())
+    whole = _data(_call(server, "get_document", {"source": "github", "id": "evil"}))
+    assert whole["kind"] == "repo_tree" and whole["text"].startswith("# evil") and whole["file_count"] == 3
+    assert [f["path"] for f in whole["files"]] == ["README.md", "pi-image/README.md", "pi-image/ansible/site.yml"]
+    folder = _data(_call(server, "get_document", {"source": "github", "id": "evil/pi-image"}))
+    assert folder["text"] == "Builds the Pi image." and [f["path"] for f in folder["files"]] == ["README.md",
+                                                                                                   "ansible/site.yml"]
+    assert folder["url"].endswith("/tree/main/pi-image")
+    with pytest.raises(Exception, match="no file or folder"):
+        _data(_call(server, "get_document", {"source": "github", "id": "evil/nope/missing.py"}))
