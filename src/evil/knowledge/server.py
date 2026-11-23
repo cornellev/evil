@@ -165,7 +165,18 @@ def _blamed(client: gh.GitHubClient, file_id: str, lines: str) -> dict:
             "blame": github_changes.blame(client, full, rel, None if lines == "all" else lines, text, ref)}
 
 
-def _activity(client: gh.GitHubClient, repo: str | None, days: float, people: bool = False) -> dict:
+LATEST_WHEN_EMPTY = 3      # an empty window still shows the latest commits, with their dates (11-23)
+MAX_LAST = 50
+
+
+def _commit_row(c: dict) -> dict:
+    return {"sha": c["sha"][:7], "date": c["commit"]["committer"]["date"],
+            "author": (c["commit"].get("author") or {}).get("name"),
+            "message": c["commit"]["message"].splitlines()[0][:200], "url": c["html_url"]}
+
+
+def _activity(client: gh.GitHubClient, repo: str | None, days: float, people: bool = False,
+              last: int | None = None) -> dict:
     from datetime import datetime, timedelta, timezone
     if people and float(days or 0) <= 0:      # all time (seen 11-22: "all time contributions of car" got 14 days)
         names = [_repo_name(repo)] if repo else [r["full_name"] for r in client.repos() if not r.get("fork")]
@@ -186,9 +197,10 @@ def _activity(client: gh.GitHubClient, repo: str | None, days: float, people: bo
         except gh.NotFound:
             raise ToolError(f"no repo {full!r} visible to the team's GitHub App") from None
         with ThreadPoolExecutor(max_workers=4) as pool:         # 4 lists per repo, fetched at once (11-19: 36 s)
+            window = ({"per_page": max(1, min(int(last), MAX_LAST))} if last      # the latest N, whenever (11-23)
+                      else {"since": since, "per_page": MAX_COMMITS})
             commits_f = pool.submit(lambda: _or_empty(client.get, f"/repos/{full}/commits",
-                                                      {"since": since, "per_page": MAX_COMMITS,
-                                                       "sha": info["default_branch"]}))
+                                                      {**window, "sha": info["default_branch"]}))
             pulls_f = pool.submit(client.get, f"/repos/{full}/pulls", {"state": "open", "per_page": MAX_ITEMS,
                                                                         "sort": "updated", "direction": "desc"})
             issues_f = pool.submit(client.get, f"/repos/{full}/issues", {"state": "open", "per_page": MAX_ITEMS,
@@ -198,11 +210,19 @@ def _activity(client: gh.GitHubClient, repo: str | None, days: float, people: bo
             commits, pulls, issues, closed = commits_f.result(), pulls_f.result(), issues_f.result(), closed_f.result()
         issues = [i for i in issues if "pull_request" not in i]
         merged = [p for p in closed if p.get("merged_at") and p["merged_at"] >= since]
+        quiet = {}
+        if not commits and not last:
+            # Nothing in the window: the latest commits anyway, so the answer isn't a dead end (seen 11-23: a repo last
+            # touched in Feb 2025 came back empty for every window, then "I can't list a history of commits").
+            latest = _or_empty(client.get, f"/repos/{full}/commits",
+                               {"per_page": LATEST_WHEN_EMPTY, "sha": info["default_branch"]})
+            if latest:
+                quiet = {"latest_commits": [_commit_row(c) for c in latest],
+                         "note": f"no commits in the last {github_changes.window_text(days)}; the latest is from "
+                                 f"{latest[0]['commit']['committer']['date'][:10]}: say that"}
         return {
             "repo": full, "url": info["html_url"], "private": info.get("private"), "default_branch": info["default_branch"],
-            "commits": [{"sha": c["sha"][:7], "date": c["commit"]["committer"]["date"],
-                         "author": (c["commit"].get("author") or {}).get("name"),
-                         "message": c["commit"]["message"].splitlines()[0][:200], "url": c["html_url"]} for c in commits],
+            "commits": [_commit_row(c) for c in commits], **quiet,
             "open_pull_requests": [{"number": p["number"], "title": p["title"], "author": (p.get("user") or {}).get("login"),
                                     "draft": p.get("draft"), "updated": p["updated_at"], "url": p["html_url"]}
                                    for p in pulls],
@@ -224,6 +244,9 @@ def _activity(client: gh.GitHubClient, repo: str | None, days: float, people: bo
                 "detailed": len(out),
                 "repos": [dict(r, commits=r["commits"][:OVERVIEW_COMMITS], commits_shown=min(len(r["commits"]),
                                OVERVIEW_COMMITS), commits_in_window=len(r["commits"])) for r in out]}
+    if last:
+        return {"latest": max(1, min(int(last), MAX_LAST)), "window": f"the latest {last} commits, any date",
+                "repos": out}
     return {"since": since, "days": days, "window": github_changes.window_text(days), "repos": out}
 
 
@@ -417,7 +440,8 @@ def create_knowledge_server(db_path: str | None = None, embedder: emb.EmbedClien
         return await asyncio.to_thread(_with_index, path, run)
 
     @server.tool(name="repo_activity")
-    async def repo_activity(repo: str | None = None, days: float = ACTIVITY_DAYS, people: bool = False) -> dict:
+    async def repo_activity(repo: str | None = None, days: float = ACTIVITY_DAYS, people: bool = False,
+                            last: int | None = None) -> dict:
         """What happened on the team's GitHub lately: for `repo` ("evil" or "cornellev/evil"), or with no repo for
         every repo pushed in the window (most active first): commits on the default branch (date, author, message),
         pull requests merged in the window, open pull requests and open issues, each with its link. `days`: the
@@ -428,11 +452,14 @@ def create_knowledge_server(db_path: str | None = None, embedder: emb.EmbedClien
         `people`: instead, per person (GitHub login) commits and lines added / removed in the window, across the repo or
         every repo pushed in it, most lines first: for "who changed the most", "top contributors", "how much has X done".
         With people, `days` goes up to 365, and days=0 is ALL TIME (since each repo began): "all time", "ever",
-        "overall", "total contributions" need days=0, never the default 14."""
+        "overall", "total contributions" need days=0, never the default 14.
+        `last`: instead of a window, the latest N commits on the default branch whatever their date (up to 50): "last
+        10 commits", "most recent commit", "what was the last change". A window with no commits shows the latest few
+        anyway (latest_commits, with dates)."""
         if not github.enabled:
             raise ToolError("GitHub is not connected here")
         try:
-            return await asyncio.to_thread(_activity, github, repo, days, people)
+            return await asyncio.to_thread(_activity, github, repo, days, people, last)
         except gh.GitHubUnavailable as exc:
             raise ToolError(f"GitHub didn't answer right now ({exc})") from exc
 

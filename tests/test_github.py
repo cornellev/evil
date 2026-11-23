@@ -515,3 +515,29 @@ def test_people_stops_waiting_for_stats_github_is_still_computing(monkeypatch):
     t0 = t.monotonic()
     out = gc.people(Computing(), ["cornellev/evil"], 0)
     assert t.monotonic() - t0 < 1.0 and out["stats_not_ready"] == ["cornellev/evil"] and "again in a minute" in out["stats_note"]
+
+
+def test_last_n_commits_ignore_the_date_and_an_empty_window_shows_the_latest(tmp_path):
+    # seen 11-23: Global-Planning-Algorithms (last commit Feb 2025) came back empty for every window, then "I can't list
+    # a history of commits"
+    class Quiet(LiveFake):
+        seen = []
+
+        def get(self, path, params=None, raw=False, accept=None):
+            if path.endswith("/commits"):
+                self.seen.append(dict(params or {}))
+                if "since" in (params or {}):
+                    return []                                # nothing in the window
+                return [{"sha": f"{i:07x}0", "html_url": f"c{i}", "commit": {"committer": {"date": f"2025-02-1{i}T10:00:00Z"},
+                         "author": {"name": "Ann"}, "message": f"change {i}"}} for i in range(int(params["per_page"]))]
+            return LiveFake.get(self, path, params, raw, accept)
+    fake = Quiet()
+    server = server_mod.create_knowledge_server(str(tmp_path / "k.db"), github=fake)
+    out = _data(_call(server, "repo_activity", {"repo": "evil", "last": 5}))
+    assert len(out["repos"][0]["commits"]) == 5 and "since" not in fake.seen[-1] and out["window"].startswith("the latest 5")
+    out = _data(_call(server, "repo_activity", {"repo": "evil"}))
+    repo = out["repos"][0]
+    assert repo["commits"] == [] and len(repo["latest_commits"]) == 3
+    assert "no commits in the last 14 days; the latest is from 2025-02-10" in repo["note"]
+    tools = {t.name: t for t in asyncio.run(server.list_tools())}
+    assert "whatever their date" in tools["repo_activity"].description
